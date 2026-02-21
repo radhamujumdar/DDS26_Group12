@@ -52,3 +52,13 @@ services:
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+
+  redisinsight:
+    image: redis/redisinsight:latest
+    ports:
+      - "5540:5540"
+    depends_on:
+      - order-db
+      - stock-db
+      - payment-db
