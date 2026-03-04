@@ -9,6 +9,22 @@ from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
 
+# ─────────────────────────────────────────────
+# Logging setup  (must come before app + db)
+# ─────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S"
+)
+logger = logging.getLogger("stock-service")
+
+
+# ─────────────────────────────────────────────
+# App + DB
+# ─────────────────────────────────────────────
+
 DB_ERROR_STR = "DB error"
 
 app = Flask("stock-service")
@@ -37,7 +53,7 @@ class StockValue(Struct):
 
 class Reservation(Struct):
     """
-    Persisted in Redis under key  txn:<txn_id>:<item_id>
+    Persisted in Redis under key  txn:<tx_id>:<item_id>
     Represents a prepared-but-not-yet-committed stock hold.
 
     state values:
@@ -45,7 +61,7 @@ class Reservation(Struct):
         "committed" – transaction finished, reservation record can be cleaned up
         "aborted"   – transaction rolled back, stock already restored
     """
-    txn_id: str
+    tx_id: str
     item_id: str
     amount: int
     state: str   # "prepared" | "committed" | "aborted"
@@ -55,8 +71,8 @@ class Reservation(Struct):
 # Redis key helpers
 # ─────────────────────────────────────────────
 
-def reservation_key(txn_id: str, item_id: str) -> str:
-    return f"txn:{txn_id}:{item_id}"
+def reservation_key(tx_id: str, item_id: str) -> str:
+    return f"txn:{tx_id}:{item_id}"
 
 
 # ─────────────────────────────────────────────
@@ -69,10 +85,9 @@ def recover_prepared_transactions():
     These are transactions whose coordinator crashed before sending commit/abort.
 
     Policy (safe default): abort all dangling prepared reservations so that
-    stock is not held forever.  If your coordinator implements a query endpoint
-    (e.g. GET /orders/txn/<txn_id>/status) you can ask it whether to commit
-    or abort instead.
+    stock is not held forever.
     """
+    count = 0
     try:
         cursor = 0
         while True:
@@ -86,29 +101,32 @@ def recover_prepared_transactions():
                 except Exception:
                     continue
                 if res.state == "prepared":
-                    app.logger.warning(
-                        f"[RECOVERY] Found dangling prepared reservation "
-                        f"txn={res.txn_id} item={res.item_id} amount={res.amount}. "
-                        f"Aborting (restoring stock)."
+                    logger.warning(
+                        f"[RECOVERY] DANGLING_PREPARE tx={res.tx_id} "
+                        f"item={res.item_id} amount={res.amount}"
                     )
-                    _do_abort(res.txn_id, res.item_id, res)
+                    _do_abort(res.tx_id, res.item_id, res)
+                    logger.info(
+                        f"[RECOVERY] ABORTED tx={res.tx_id} item={res.item_id}"
+                    )
+                    count += 1
 
             if cursor == 0:
                 break
-    except redis.exceptions.RedisError as e:
-        app.logger.error(f"[RECOVERY] Redis error during recovery scan: {e}")
-        # In recovery
-        logger.warning(f"[RECOVERY] DANGLING_PREPARE txn={res.txn_id} item={res.item_id} amount={res.amount}")
-        logger.info(f"[RECOVERY] ABORTED txn={res.txn_id} item={res.item_id}")
-        logger.info(f"[RECOVERY] COMPLETE total_aborted={res.amount}")
 
-def _do_abort(txn_id: str, item_id: str, res: Reservation) -> bool:
+        logger.info(f"[RECOVERY] COMPLETE total_aborted={count}")
+
+    except redis.exceptions.RedisError as e:
+        logger.error(f"[RECOVERY] Redis error during recovery scan: {e}")
+
+
+def _do_abort(tx_id: str, item_id: str, res: Reservation) -> bool:
     """
     Core abort logic shared by the /abort endpoint and the recovery path.
     Restores the reserved stock and marks the reservation as 'aborted'.
     Returns True on success, False on error.
     """
-    rkey = reservation_key(txn_id, item_id)
+    rkey = reservation_key(tx_id, item_id)
     try:
         with db.pipeline(transaction=True) as pipe:
             while True:
@@ -136,8 +154,9 @@ def _do_abort(txn_id: str, item_id: str, res: Reservation) -> bool:
 
                 except redis.WatchError:
                     continue  # retry optimistic lock
+
     except redis.exceptions.RedisError as e:
-        app.logger.error(f"[ABORT] Redis error for txn={txn_id} item={item_id}: {e}")
+        logger.error(f"[ABORT] Redis error for tx={tx_id} item={item_id}: {e}")
         return False
 
 
@@ -159,7 +178,7 @@ def get_item_from_db(item_id: str) -> StockValue | None:
 @app.post('/item/create/<price>')
 def create_item(price: int):
     key = str(uuid.uuid4())
-    app.logger.debug(f"Item: {key} created")
+    logger.debug(f"Item: {key} created")
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
         db.set(key, value)
@@ -205,7 +224,7 @@ def add_stock(item_id: str, amount: int):
 def remove_stock(item_id: str, amount: int):
     item_entry: StockValue = get_item_from_db(item_id)
     item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
+    logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
     if item_entry.stock < 0:
         abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
     try:
@@ -219,8 +238,8 @@ def remove_stock(item_id: str, amount: int):
 # 2PC Participant endpoints
 # ─────────────────────────────────────────────
 
-@app.post('/stock/prepare/<txn_id>/<item_id>/<int:amount>')
-def prepare(txn_id: str, item_id: str, amount: int):
+@app.post('/stock/2pc/prepare/<tx_id>/<item_id>/<int:amount>')
+def prepare(tx_id: str, item_id: str, amount: int):
     """
     PREPARE phase – called by the Order coordinator.
 
@@ -231,26 +250,30 @@ def prepare(txn_id: str, item_id: str, amount: int):
 
     Returns 200 on success (vote YES), 400 on failure (vote NO).
 
-    Idempotent: if a reservation for this (txn_id, item_id) already exists
+    Idempotent: if a reservation for this (tx_id, item_id) already exists
     in 'prepared' state we return 200 without double-deducting.
     """
-    rkey = reservation_key(txn_id, item_id)
+    logger.info(f"[PREPARE] START tx={tx_id} item={item_id} amount={amount}")
+    rkey = reservation_key(tx_id, item_id)
 
     # ── idempotency check ──
     try:
         existing_raw = db.get(rkey)
     except redis.exceptions.RedisError:
+        logger.error(f"[PREPARE] DB_ERROR tx={tx_id} item={item_id}")
         return abort(400, DB_ERROR_STR)
 
     if existing_raw is not None:
         existing: Reservation = msgpack.decode(existing_raw, type=Reservation)
         if existing.state == "prepared":
+            logger.info(f"[PREPARE] IDEMPOTENT_YES tx={tx_id} item={item_id}")
             return jsonify({"status": "prepared"}), 200
         if existing.state == "committed":
+            logger.info(f"[PREPARE] ALREADY_COMMITTED tx={tx_id} item={item_id}")
             return jsonify({"status": "already committed"}), 200
         if existing.state == "aborted":
-            # Previously aborted – treat as a fresh failure (coordinator should not retry prepare after abort)
-            return abort(400, f"Txn {txn_id}: previously aborted for item {item_id}")
+            logger.warning(f"[PREPARE] PREVIOUSLY_ABORTED tx={tx_id} item={item_id}")
+            return abort(400, f"Txn {tx_id}: previously aborted for item {item_id}")
 
     # ── optimistic locking via WATCH/MULTI/EXEC ──
     try:
@@ -262,19 +285,24 @@ def prepare(txn_id: str, item_id: str, amount: int):
                     item_raw = pipe.get(item_id)
                     if item_raw is None:
                         pipe.unwatch()
+                        logger.warning(f"[PREPARE] ITEM_NOT_FOUND tx={tx_id} item={item_id}")
                         return abort(400, f"Item: {item_id} not found!")
 
                     item: StockValue = msgpack.decode(item_raw, type=StockValue)
 
                     if item.stock < amount:
                         pipe.unwatch()
+                        logger.warning(
+                            f"[PREPARE] INSUFFICIENT_STOCK tx={tx_id} item={item_id} "
+                            f"have={item.stock} need={amount}"
+                        )
                         return abort(400, f"Item: {item_id} insufficient stock "
                                          f"(have {item.stock}, need {amount})")
 
                     # Deduct stock and persist reservation atomically
                     item.stock -= amount
                     reservation = Reservation(
-                        txn_id=txn_id,
+                        tx_id=tx_id,
                         item_id=item_id,
                         amount=amount,
                         state="prepared"
@@ -285,117 +313,105 @@ def prepare(txn_id: str, item_id: str, amount: int):
                     pipe.set(rkey, msgpack.encode(reservation))
                     pipe.execute()
 
-                    app.logger.debug(
-                        f"[PREPARE] txn={txn_id} item={item_id} amount={amount} – YES"
-                    )
+                    logger.info(f"[PREPARE] VOTE_YES tx={tx_id} item={item_id} amount={amount}")
                     return jsonify({"status": "prepared"}), 200
 
                 except redis.WatchError:
-                    # Another write raced with us; retry
-                    continue
+                    continue  # retry optimistic lock
 
     except redis.exceptions.RedisError:
+        logger.error(f"[PREPARE] DB_ERROR tx={tx_id} item={item_id}")
         return abort(400, DB_ERROR_STR)
-    # In prepare()
-    logger.info(f"[PREPARE] START txn={txn_id} item={item_id} amount={amount}")
-    logger.warning(f"[PREPARE] INSUFFICIENT STOCK txn={txn_id} item={item_id} have={item.stock} need={amount}")
-    logger.info(f"[PREPARE] VOTE_YES txn={txn_id} item={item_id} amount={amount}")
-    logger.error(f"[PREPARE] DB_ERROR txn={txn_id} item={item_id}")
 
 
-@app.post('/stock/commit/<txn_id>/<item_id>')
-def commit(txn_id: str, item_id: str):
+@app.post('/stock/2pc/commit/<tx_id>/<item_id>/<int:amount>')
+def commit(tx_id: str, item_id: str, amount: int):
     """
     COMMIT phase – called by the Order coordinator after all participants voted YES.
 
     Marks the reservation as 'committed'.
     The stock was already deducted during prepare, so no stock change is needed.
+    The `amount` parameter is accepted for API compatibility but not used here —
+    the reservation already stores the amount from prepare time.
 
     Idempotent: safe to call multiple times.
     """
-    rkey = reservation_key(txn_id, item_id)
+    logger.info(f"[COMMIT] START tx={tx_id} item={item_id}")
+    rkey = reservation_key(tx_id, item_id)
 
     try:
         raw = db.get(rkey)
     except redis.exceptions.RedisError:
+        logger.error(f"[COMMIT] DB_ERROR tx={tx_id} item={item_id}")
         return abort(400, DB_ERROR_STR)
 
     if raw is None:
-        # No reservation found – could mean prepare was never called or already cleaned up.
-        # Treat as success so coordinator can move on.
-        app.logger.warning(f"[COMMIT] No reservation found for txn={txn_id} item={item_id}")
+        logger.warning(f"[COMMIT] NO_RESERVATION tx={tx_id} item={item_id}")
         return jsonify({"status": "committed"}), 200
 
     res: Reservation = msgpack.decode(raw, type=Reservation)
 
     if res.state == "committed":
-        return jsonify({"status": "committed"}), 200  # idempotent
+        logger.info(f"[COMMIT] IDEMPOTENT tx={tx_id} item={item_id}")
+        return jsonify({"status": "committed"}), 200
 
     if res.state == "aborted":
-        # Should never happen in a correct coordinator; log and error out
-        app.logger.error(f"[COMMIT] txn={txn_id} item={item_id} – already aborted!")
-        return abort(400, f"Txn {txn_id}: cannot commit, already aborted for item {item_id}")
+        logger.error(f"[COMMIT] ALREADY_ABORTED tx={tx_id} item={item_id}")
+        return abort(400, f"Txn {tx_id}: cannot commit, already aborted for item {item_id}")
 
-    # state == "prepared" – mark committed
+    # state == "prepared" — mark committed
     res.state = "committed"
     try:
         db.set(rkey, msgpack.encode(res))
     except redis.exceptions.RedisError:
+        logger.error(f"[COMMIT] DB_ERROR tx={tx_id} item={item_id}")
         return abort(400, DB_ERROR_STR)
-    # In commit()
-    logger.info(f"[COMMIT] START txn={txn_id} item={item_id}")
-    logger.info(f"[COMMIT] SUCCESS txn={txn_id} item={item_id}")
-    logger.warning(f"[COMMIT] NO_RESERVATION txn={txn_id} item={item_id}")
-    logger.error(f"[COMMIT] ALREADY_ABORTED txn={txn_id} item={item_id}")
 
-    app.logger.debug(f"[COMMIT] txn={txn_id} item={item_id} – committed")
+    logger.info(f"[COMMIT] SUCCESS tx={tx_id} item={item_id}")
     return jsonify({"status": "committed"}), 200
-    
 
 
-@app.post('/stock/abort/<txn_id>/<item_id>')
-def abort_txn(txn_id: str, item_id: str):
+@app.post('/stock/2pc/abort/<tx_id>/<item_id>/<int:amount>')
+def abort_txn(tx_id: str, item_id: str, amount: int):
     """
     ABORT phase – called by the Order coordinator when any participant voted NO
     or when a timeout/failure requires rollback.
 
     Restores the reserved stock and marks the reservation as 'aborted'.
+    The `amount` parameter is accepted for API compatibility but not used here —
+    the reservation already stores the amount from prepare time.
 
     Idempotent: safe to call multiple times.
     """
-    rkey = reservation_key(txn_id, item_id)
+    logger.info(f"[ABORT] START tx={tx_id} item={item_id}")
+    rkey = reservation_key(tx_id, item_id)
 
     try:
         raw = db.get(rkey)
     except redis.exceptions.RedisError:
+        logger.error(f"[ABORT] DB_ERROR tx={tx_id} item={item_id}")
         return abort(400, DB_ERROR_STR)
 
     if raw is None:
-        # prepare was never persisted (e.g. stock service crashed before writing reservation)
-        # Nothing to restore – idempotent success.
-        app.logger.warning(f"[ABORT] No reservation found for txn={txn_id} item={item_id} – nothing to undo")
+        logger.warning(f"[ABORT] NO_RESERVATION tx={tx_id} item={item_id}")
         return jsonify({"status": "aborted"}), 200
 
     res: Reservation = msgpack.decode(raw, type=Reservation)
 
     if res.state == "aborted":
-        return jsonify({"status": "aborted"}), 200  # idempotent
+        logger.info(f"[ABORT] IDEMPOTENT tx={tx_id} item={item_id}")
+        return jsonify({"status": "aborted"}), 200
 
     if res.state == "committed":
-        app.logger.error(f"[ABORT] txn={txn_id} item={item_id} – already committed, cannot abort!")
-        return abort(400, f"Txn {txn_id}: cannot abort, already committed for item {item_id}")
+        logger.error(f"[ABORT] ALREADY_COMMITTED tx={tx_id} item={item_id}")
+        return abort(400, f"Txn {tx_id}: cannot abort, already committed for item {item_id}")
 
-    # state == "prepared" – restore stock
-    success = _do_abort(txn_id, item_id, res)
+    # state == "prepared" — restore stock
+    success = _do_abort(tx_id, item_id, res)
     if not success:
         return abort(400, DB_ERROR_STR)
-    
-    # In abort()
-    logger.info(f"[ABORT] START txn={txn_id} item={item_id}")
-    logger.info(f"[ABORT] SUCCESS txn={txn_id} item={item_id} stock_restored={res.amount}")
-    logger.error(f"[ABORT] ALREADY_COMMITTED txn={txn_id} item={item_id}")
 
-    app.logger.debug(f"[ABORT] txn={txn_id} item={item_id} – aborted, stock restored")
+    logger.info(f"[ABORT] SUCCESS tx={tx_id} item={item_id} stock_restored={res.amount}")
     return jsonify({"status": "aborted"}), 200
 
 
@@ -410,17 +426,4 @@ else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
     app.logger.handlers = gunicorn_logger.handlers
     app.logger.setLevel(gunicorn_logger.level)
-    # Run recovery after gunicorn forks the worker
     recover_prepared_transactions()
-
-# ─────────────────────────────────────────────
-# Logging setup
-# ─────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
-    datefmt="%Y-%m-%dT%H:%M:%S"
-)
-logger = logging.getLogger("stock-service")
-
