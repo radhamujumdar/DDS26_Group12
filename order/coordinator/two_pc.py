@@ -15,6 +15,8 @@ from repository.tx_repo import TxRepository
 class TwoPCCoordinator:
     RETRY_LIMIT = 3
     RETRY_BACKOFF_SECONDS = 0.2
+    IN_FLIGHT_WAIT_SECONDS = 5.0
+    IN_FLIGHT_POLL_SECONDS = 0.1
 
     def __init__(
         self,
@@ -34,15 +36,14 @@ class TwoPCCoordinator:
         if order_entry.paid:
             return
 
-        tx = await self.tx_repo.get_by_order(order_id)
-        if tx is None:
-            tx = await self.tx_repo.create(
-                order_id=order_id,
-                user_id=order_entry.user_id,
-                total_cost=order_entry.total_cost,
-                items=self._aggregate_items(order_entry),
-                state=TxState.INIT,
-            )
+        tx, created = await self.tx_repo.get_or_create_by_order(
+            order_id=order_id,
+            user_id=order_entry.user_id,
+            total_cost=order_entry.total_cost,
+            items=self._aggregate_items(order_entry),
+            state=TxState.INIT,
+        )
+        if created:
             self.logger.info("Created tx=%s for order=%s", tx.tx_id, order_id)
         else:
             self.logger.info("Reusing tx=%s for order=%s state=%s", tx.tx_id, order_id, tx.state)
@@ -69,6 +70,9 @@ class TwoPCCoordinator:
                 tx = await self.tx_repo.get(tx_id)
                 if tx is None:
                     raise HTTPException(status_code=400, detail="Transaction not found")
+                return tx
+            tx = await self._wait_for_in_flight_transaction(tx_id)
+            if tx is not None:
                 return tx
             raise HTTPException(status_code=400, detail=f"Transaction {tx_id} is already in progress")
 
@@ -237,6 +241,17 @@ class TwoPCCoordinator:
             await asyncio.sleep(self.RETRY_BACKOFF_SECONDS * attempt)
 
         return ParticipantResult(ok=False, detail=f"{operation_name} failed")
+
+    async def _wait_for_in_flight_transaction(self, tx_id: str) -> TxRecord | None:
+        deadline = asyncio.get_running_loop().time() + self.IN_FLIGHT_WAIT_SECONDS
+        while asyncio.get_running_loop().time() < deadline:
+            tx = await self.tx_repo.get(tx_id)
+            if tx is None:
+                return None
+            if tx.state in (TxState.COMMITTED.value, TxState.ABORTED.value):
+                return tx
+            await asyncio.sleep(self.IN_FLIGHT_POLL_SECONDS)
+        return None
 
     @staticmethod
     def _aggregate_items(order_entry: OrderValue) -> list[tuple[str, int]]:
