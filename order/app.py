@@ -1,15 +1,16 @@
 import logging
 import os
-import atexit
 import random
 import uuid
 from collections import defaultdict
 
 import redis
 import requests
+import uvicorn
 
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
 
 
 DB_ERROR_STR = "DB error"
@@ -17,7 +18,8 @@ REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
-app = Flask("order-service")
+app = FastAPI(title="order-service")
+logger = logging.getLogger("order-service")
 
 db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
@@ -25,11 +27,9 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               db=int(os.environ['REDIS_DB']))
 
 
+@app.on_event("shutdown")
 def close_db_connection():
     db.close()
-
-
-atexit.register(close_db_connection)
 
 
 class OrderValue(Struct):
@@ -43,28 +43,28 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         # get serialized data
         entry: bytes = db.get(order_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    except redis.exceptions.RedisError as exc:
+        raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
     # deserialize data if it exists else return null
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
         # if order does not exist in the database; abort
-        abort(400, f"Order: {order_id} not found!")
+        raise HTTPException(status_code=400, detail=f"Order: {order_id} not found!")
     return entry
 
 
-@app.post('/create/<user_id>')
+@app.post('/create/{user_id}')
 def create_order(user_id: str):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'order_id': key})
+    except redis.exceptions.RedisError as exc:
+        raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+    return {'order_id': key}
 
 
-@app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
+@app.post('/batch_init/{n}/{n_items}/{n_users}/{item_price}')
 def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
 
     n = int(n)
@@ -86,15 +86,15 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
                                   for i in range(n)}
     try:
         db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for orders successful"})
+    except redis.exceptions.RedisError as exc:
+        raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+    return {"msg": "Batch init for orders successful"}
 
 
-@app.get('/find/<order_id>')
+@app.get('/find/{order_id}')
 def find_order(order_id: str):
     order_entry: OrderValue = get_order_from_db(order_id)
-    return jsonify(
+    return (
         {
             "order_id": order_id,
             "paid": order_entry.paid,
@@ -108,8 +108,8 @@ def find_order(order_id: str):
 def send_post_request(url: str):
     try:
         response = requests.post(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
+    except requests.exceptions.RequestException as exc:
+        raise HTTPException(status_code=400, detail=REQ_ERROR_STR) from exc
     else:
         return response
 
@@ -117,28 +117,30 @@ def send_post_request(url: str):
 def send_get_request(url: str):
     try:
         response = requests.get(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
+    except requests.exceptions.RequestException as exc:
+        raise HTTPException(status_code=400, detail=REQ_ERROR_STR) from exc
     else:
         return response
 
 
-@app.post('/addItem/<order_id>/<item_id>/<quantity>')
+@app.post('/addItem/{order_id}/{item_id}/{quantity}')
 def add_item(order_id: str, item_id: str, quantity: int):
     order_entry: OrderValue = get_order_from_db(order_id)
     item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status_code != 200:
         # Request failed because item does not exist
-        abort(400, f"Item: {item_id} does not exist!")
+        raise HTTPException(status_code=400, detail=f"Item: {item_id} does not exist!")
     item_json: dict = item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
     try:
         db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-                    status=200)
+    except redis.exceptions.RedisError as exc:
+        raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+    return PlainTextResponse(
+        f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
+        status_code=200
+    )
 
 
 def rollback_stock(removed_items: list[tuple[str, int]]):
@@ -146,9 +148,9 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
         send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
 
 
-@app.post('/checkout/<order_id>')
+@app.post('/checkout/{order_id}')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    logger.debug(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
     # get the quantity per item
     items_quantities: dict[str, int] = defaultdict(int)
@@ -162,25 +164,25 @@ def checkout(order_id: str):
         if stock_reply.status_code != 200:
             # If one item does not have enough stock we need to rollback
             rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
+            raise HTTPException(status_code=400, detail=f'Out of stock on item_id: {item_id}')
         removed_items.append((item_id, quantity))
     user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
     if user_reply.status_code != 200:
         # If the user does not have enough credit we need to rollback all the item stock subtractions
         rollback_stock(removed_items)
-        abort(400, "User out of credit")
+        raise HTTPException(status_code=400, detail="User out of credit")
     order_entry.paid = True
     try:
         db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+    except redis.exceptions.RedisError as exc:
+        raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+    logger.debug("Checkout successful")
+    return PlainTextResponse("Checkout successful", status_code=200)
 
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
 else:
     gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    logger.handlers = gunicorn_logger.handlers
+    logger.setLevel(gunicorn_logger.level)
