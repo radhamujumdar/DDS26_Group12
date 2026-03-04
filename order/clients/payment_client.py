@@ -1,19 +1,19 @@
-import requests
+import httpx
 from fastapi import HTTPException
 
 from models import REQ_ERROR_STR
 
 
 class PaymentClient:
-    def __init__(self, session: requests.Session, gateway_url: str):
+    def __init__(self, session: httpx.AsyncClient, gateway_url: str):
         self.session = session
         self.base_url = f"{gateway_url}/payment"
 
-    def pay(self, user_id: str, amount: int) -> requests.Response:
-        return self._post(f"/pay/{user_id}/{amount}")
+    async def pay(self, user_id: str, amount: int) -> httpx.Response:
+        return await self._post(f"/pay/{user_id}/{amount}")
 
-    def _post(self, path: str) -> requests.Response:
+    async def _post(self, path: str) -> httpx.Response:
         try:
-            return self.session.post(f"{self.base_url}{path}")
-        except requests.exceptions.RequestException as exc:
+            return await self.session.post(f"{self.base_url}{path}")
+        except httpx.RequestError as exc:
             raise HTTPException(status_code=400, detail=REQ_ERROR_STR) from exc

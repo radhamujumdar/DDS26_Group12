@@ -1,14 +1,14 @@
 import logging
 import os
 import random
+from contextlib import asynccontextmanager
 
-import redis
-import requests
+import httpx
 import uvicorn
-
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from msgspec import msgpack
+from redis.asyncio import Redis
 
 from clients.payment_client import PaymentClient
 from clients.stock_client import StockClient
@@ -19,44 +19,48 @@ from repository.tx_repo import TxRepository
 
 
 GATEWAY_URL = os.environ["GATEWAY_URL"]
-
-app = FastAPI(title="order-service")
 logger = logging.getLogger("order-service")
 
-db: redis.Redis = redis.Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
-)
-http_session = requests.Session()
 
-order_repo = OrderRepository(db)
-tx_repo = TxRepository(db)
-stock_client = StockClient(http_session, GATEWAY_URL)
-payment_client = PaymentClient(http_session, GATEWAY_URL)
-coordinator = TwoPCCoordinator(
-    stock_client=stock_client,
-    payment_client=payment_client,
-    tx_repo=tx_repo,
-    logger=logger,
-)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db = Redis(
+        host=os.environ["REDIS_HOST"],
+        port=int(os.environ["REDIS_PORT"]),
+        password=os.environ["REDIS_PASSWORD"],
+        db=int(os.environ["REDIS_DB"]),
+    )
+    http_client = httpx.AsyncClient()
+    stock_client = StockClient(http_client, GATEWAY_URL)
+    payment_client = PaymentClient(http_client, GATEWAY_URL)
+    tx_repo = TxRepository(db)
+
+    app.state.order_repo = OrderRepository(db)
+    app.state.stock_client = stock_client
+    app.state.coordinator = TwoPCCoordinator(
+        stock_client=stock_client,
+        payment_client=payment_client,
+        tx_repo=tx_repo,
+        logger=logger,
+    )
+
+    yield
+
+    await http_client.aclose()
+    await db.aclose()
 
 
-@app.on_event("shutdown")
-def close_connections():
-    db.close()
-    http_session.close()
+app = FastAPI(title="order-service", lifespan=lifespan)
 
 
 @app.post("/create/{user_id}")
-def create_order(user_id: str):
-    key = order_repo.create_order(user_id)
+async def create_order(user_id: str):
+    key = await app.state.order_repo.create_order(user_id)
     return {"order_id": key}
 
 
 @app.post("/batch_init/{n}/{n_items}/{n_users}/{item_price}")
-def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
+async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     n = int(n)
     n_items = int(n_items)
     n_users = int(n_users)
@@ -74,13 +78,13 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         )
 
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry()) for i in range(n)}
-    order_repo.batch_set_orders(kv_pairs)
+    await app.state.order_repo.batch_set_orders(kv_pairs)
     return {"msg": "Batch init for orders successful"}
 
 
 @app.get("/find/{order_id}")
-def find_order(order_id: str):
-    order_entry: OrderValue = order_repo.get_order(order_id)
+async def find_order(order_id: str):
+    order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
     return {
         "order_id": order_id,
         "paid": order_entry.paid,
@@ -91,16 +95,16 @@ def find_order(order_id: str):
 
 
 @app.post("/addItem/{order_id}/{item_id}/{quantity}")
-def add_item(order_id: str, item_id: str, quantity: int):
-    order_entry: OrderValue = order_repo.get_order(order_id)
-    item_reply = stock_client.find_item(item_id)
+async def add_item(order_id: str, item_id: str, quantity: int):
+    order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
+    item_reply = await app.state.stock_client.find_item(item_id)
     if item_reply.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Item: {item_id} does not exist!")
 
     item_json: dict = item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
-    order_repo.save_order(order_id, order_entry)
+    await app.state.order_repo.save_order(order_id, order_entry)
     return PlainTextResponse(
         f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
         status_code=200,
@@ -108,11 +112,11 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
 
 @app.post("/checkout/{order_id}")
-def checkout(order_id: str):
-    order_entry: OrderValue = order_repo.get_order(order_id)
-    coordinator.checkout(order_id, order_entry)
+async def checkout(order_id: str):
+    order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
+    await app.state.coordinator.checkout(order_id, order_entry)
     order_entry.paid = True
-    order_repo.save_order(order_id, order_entry)
+    await app.state.order_repo.save_order(order_id, order_entry)
     return PlainTextResponse("Checkout successful", status_code=200)
 
 

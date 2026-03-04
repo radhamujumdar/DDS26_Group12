@@ -22,10 +22,10 @@ class TwoPCCoordinator:
         self.tx_repo = tx_repo
         self.logger = logger
 
-    def checkout(self, order_id: str, order_entry: OrderValue):
-        tx = self.tx_repo.create(order_id=order_id, state=TxState.INIT)
+    async def checkout(self, order_id: str, order_entry: OrderValue):
+        tx = await self.tx_repo.create(order_id=order_id, state=TxState.INIT)
         self.logger.debug("Starting checkout for order=%s tx=%s", order_id, tx.tx_id)
-        self.tx_repo.update_state(tx.tx_id, TxState.PREPARING)
+        await self.tx_repo.update_state(tx.tx_id, TxState.PREPARING)
 
         items_quantities: dict[str, int] = defaultdict(int)
         for item_id, quantity in order_entry.items:
@@ -33,26 +33,26 @@ class TwoPCCoordinator:
 
         removed_items: list[tuple[str, int]] = []
         for item_id, quantity in items_quantities.items():
-            stock_reply = self.stock_client.subtract(item_id, quantity)
+            stock_reply = await self.stock_client.subtract(item_id, quantity)
             if stock_reply.status_code != 200:
-                self._rollback_stock(removed_items)
-                self.tx_repo.update_state(tx.tx_id, TxState.ABORTED, error=f"Out of stock on {item_id}")
-                self.tx_repo.remove_active(tx.tx_id)
+                await self._rollback_stock(removed_items)
+                await self.tx_repo.update_state(tx.tx_id, TxState.ABORTED, error=f"Out of stock on {item_id}")
+                await self.tx_repo.remove_active(tx.tx_id)
                 raise HTTPException(status_code=400, detail=f"Out of stock on item_id: {item_id}")
             removed_items.append((item_id, quantity))
 
-        self.tx_repo.update_state(tx.tx_id, TxState.COMMITTING)
-        payment_reply = self.payment_client.pay(order_entry.user_id, order_entry.total_cost)
+        await self.tx_repo.update_state(tx.tx_id, TxState.COMMITTING)
+        payment_reply = await self.payment_client.pay(order_entry.user_id, order_entry.total_cost)
         if payment_reply.status_code != 200:
-            self._rollback_stock(removed_items)
-            self.tx_repo.update_state(tx.tx_id, TxState.ABORTED, error="User out of credit")
-            self.tx_repo.remove_active(tx.tx_id)
+            await self._rollback_stock(removed_items)
+            await self.tx_repo.update_state(tx.tx_id, TxState.ABORTED, error="User out of credit")
+            await self.tx_repo.remove_active(tx.tx_id)
             raise HTTPException(status_code=400, detail="User out of credit")
 
-        self.tx_repo.update_state(tx.tx_id, TxState.COMMITTED)
-        self.tx_repo.remove_active(tx.tx_id)
+        await self.tx_repo.update_state(tx.tx_id, TxState.COMMITTED)
+        await self.tx_repo.remove_active(tx.tx_id)
         self.logger.debug("Checkout successful for order=%s tx=%s", order_id, tx.tx_id)
 
-    def _rollback_stock(self, removed_items: list[tuple[str, int]]):
+    async def _rollback_stock(self, removed_items: list[tuple[str, int]]):
         for item_id, quantity in removed_items:
-            self.stock_client.add(item_id, quantity)
+            await self.stock_client.add(item_id, quantity)
