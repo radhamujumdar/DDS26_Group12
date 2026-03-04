@@ -43,3 +43,10 @@ class OrderRepository:
         if order_entry is None:
             raise HTTPException(status_code=400, detail=f"Order: {order_id} not found!")
         return order_entry
+
+    async def mark_paid(self, order_id: str):
+        order_entry = await self.get_order(order_id)
+        if order_entry.paid:
+            return
+        order_entry.paid = True
+        await self.save_order(order_id, order_entry)

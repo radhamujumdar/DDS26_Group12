@@ -41,8 +41,13 @@ async def lifespan(app: FastAPI):
         stock_client=stock_client,
         payment_client=payment_client,
         tx_repo=tx_repo,
+        order_repo=app.state.order_repo,
         logger=logger,
     )
+    try:
+        await app.state.coordinator.recover_active_transactions()
+    except HTTPException as exc:
+        logger.warning("Startup recovery failed: %s", exc.detail)
 
     yield
 
@@ -115,8 +120,6 @@ async def add_item(order_id: str, item_id: str, quantity: int):
 async def checkout(order_id: str):
     order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
     await app.state.coordinator.checkout(order_id, order_entry)
-    order_entry.paid = True
-    await app.state.order_repo.save_order(order_id, order_entry)
     return PlainTextResponse("Checkout successful", status_code=200)
 
 
