@@ -13,6 +13,7 @@ from redis.asyncio import Redis
 from clients.payment_client import PaymentClient
 from clients.stock_client import StockClient
 from coordinator.two_pc import TwoPCCoordinator
+from logging_utils import log_event
 from models import OrderValue
 from repository.order_repo import OrderRepository
 from repository.tx_repo import TxRepository
@@ -45,9 +46,17 @@ async def lifespan(app: FastAPI):
         logger=logger,
     )
     try:
+        log_event(logger, "startup_recovery_begin", service="order-service")
         await app.state.coordinator.recover_active_transactions()
+        log_event(logger, "startup_recovery_complete", service="order-service")
     except HTTPException as exc:
-        logger.warning("Startup recovery failed: %s", exc.detail)
+        log_event(
+            logger,
+            "startup_recovery_failed",
+            level="warning",
+            service="order-service",
+            detail=str(exc.detail),
+        )
 
     yield
 
