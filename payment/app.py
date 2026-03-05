@@ -126,51 +126,38 @@ def _do_abort(rec: PrepareRecord):
     save_prepare_record(rec)
 
 
-@app.post('/2pc/prepare/<txn_id>/<user_id>/<amount>')
+@app.post('/2pc/prepare/<txn_id>/<user_id>/<int:amount>')   # ← Add int: converter
 def prepare(txn_id: str, user_id: str, amount: int):
     """
-    Phase-1.  Body JSON: { "user_id": "...", "amount": <int>, "action": "pay"|"add_funds" }
-
-    Idempotency: if we already have a record for txn_id just return its
-    current state without touching the DB again.
+    Phase-1: Prepare a payment debit.
+    The coordinator sends the positive total_cost; we negate it for debit.
     """
     existing = get_prepare_record(txn_id)
     if existing:
-        # Already processed – return the saved outcome so the coordinator
-        # can re-drive phase-2 safely.
         if existing.state == TXN_ABORTED:
             return jsonify({"status": "aborted", "txn_id": txn_id}), 409
-        # prepared or committed both count as "yes vote" for phase-2 purposes
         return jsonify({"status": existing.state, "txn_id": txn_id}), 200
-
-    user_id   = user_id
-    amount    = amount
 
     user = get_user_from_db(user_id)
 
-    new_credit = user.credit + amount
+    new_credit = user.credit - amount
 
     if new_credit < 0:
-        # Vote NO – record the abort so retries are idempotent
         rec = PrepareRecord(
             txn_id=txn_id,
             user_id=user_id,
-            delta=amount,
+            delta=-amount,
             old_credit=user.credit,
-            new_credit=user.credit,   # unchanged
+            new_credit=user.credit,
             state=TXN_ABORTED,
         )
         save_prepare_record(rec)
         abort(409, f"Insufficient credit for user {user_id}")
 
-    # Tentatively apply the change and persist the prepare record atomically-ish.
-    # We write the user record first, then the txn record.  If we crash between
-    # the two writes, recovery will see no txn record (or a prepared record) and
-    # can clean up.
     rec = PrepareRecord(
         txn_id=txn_id,
         user_id=user_id,
-        delta=amount,
+        delta=-amount,
         old_credit=user.credit,
         new_credit=new_credit,
         state=TXN_PREPARED,
