@@ -11,6 +11,7 @@ services:
       - order-service
       - stock-service
       - payment-service
+    restart: always
 
   order-service:
     build: ./order
@@ -22,10 +23,14 @@ services:
       - env/order_redis.env
     depends_on:
       - order-db
+    restart: always
+
 
   order-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
+
 
   stock-service:
     build: ./stock
@@ -35,10 +40,13 @@ services:
       - env/stock_redis.env
     depends_on:
       - stock-db
+    restart: always
+
 
   stock-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
 
   payment-service:
     build: ./payment
@@ -48,17 +56,31 @@ services:
       - env/payment_redis.env
     depends_on:
       - payment-db
+    restart: always
+
 
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+    restart: always
 
 
-  redisinsight:
-    image: redis/redisinsight:latest
-    ports:
-      - "5540:5540"
-    depends_on:
-      - order-db
-      - stock-db
-      - payment-db
+  watchdog:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+    command: >
+      sh -c "
+        echo 'Watchdog started - monitoring containers every 3 seconds';
+        while true; do
+          for svc in stock-service payment-service order-service gateway order-db stock-db payment-db; do
+            CONTAINER=$$(docker ps -a -q --filter name=dds_group12-$${svc}-1 --filter status=exited);
+            if [ -n \"$$CONTAINER\" ]; then
+              echo \"Restarting $$svc...\";
+              docker start $$CONTAINER;
+            fi;
+          done;
+          sleep 3;
+        done
+      "
