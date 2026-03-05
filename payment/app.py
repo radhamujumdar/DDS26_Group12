@@ -126,7 +126,7 @@ def _do_abort(rec: PrepareRecord):
     save_prepare_record(rec)
 
 
-@app.post(' /2pc/prepare/<txn_id>/<user_id>/<amount>')
+@app.post('/2pc/prepare/<txn_id>/<user_id>/<amount>')
 def prepare(txn_id: str, user_id: str, amount: int):
     """
     Phase-1.  Body JSON: { "user_id": "...", "amount": <int>, "action": "pay"|"add_funds" }
