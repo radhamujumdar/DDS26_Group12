@@ -238,7 +238,7 @@ def remove_stock(item_id: str, amount: int):
 # 2PC Participant endpoints
 # ─────────────────────────────────────────────
 
-@app.post('/stock/2pc/prepare/<tx_id>/<item_id>/<int:amount>')
+@app.post('/2pc/prepare/<tx_id>/<item_id>/<int:amount>')
 def prepare(tx_id: str, item_id: str, amount: int):
     """
     PREPARE phase – called by the Order coordinator.
@@ -324,7 +324,7 @@ def prepare(tx_id: str, item_id: str, amount: int):
         return abort(400, DB_ERROR_STR)
 
 
-@app.post('/stock/2pc/commit/<tx_id>/<item_id>/<int:amount>')
+@app.post('/2pc/commit/<tx_id>/<item_id>/<int:amount>')
 def commit(tx_id: str, item_id: str, amount: int):
     """
     COMMIT phase – called by the Order coordinator after all participants voted YES.
@@ -371,7 +371,7 @@ def commit(tx_id: str, item_id: str, amount: int):
     return jsonify({"status": "committed"}), 200
 
 
-@app.post('/stock/2pc/abort/<tx_id>/<item_id>/<int:amount>')
+@app.post('/2pc/abort/<tx_id>/<item_id>/<int:amount>')
 def abort_txn(tx_id: str, item_id: str, amount: int):
     """
     ABORT phase – called by the Order coordinator when any participant voted NO

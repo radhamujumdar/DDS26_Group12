@@ -126,8 +126,8 @@ def _do_abort(rec: PrepareRecord):
     save_prepare_record(rec)
 
 
-@app.post('/prepare/<txn_id>')
-def prepare(txn_id: str):
+@app.post(' /2pc/prepare/<txn_id>/<user_id>/<amount>')
+def prepare(txn_id: str, user_id: str, amount: int):
     """
     Phase-1.  Body JSON: { "user_id": "...", "amount": <int>, "action": "pay"|"add_funds" }
 
@@ -143,22 +143,19 @@ def prepare(txn_id: str):
         # prepared or committed both count as "yes vote" for phase-2 purposes
         return jsonify({"status": existing.state, "txn_id": txn_id}), 200
 
-    data      = request.get_json(force=True)
-    user_id   = data["user_id"]
-    amount    = int(data["amount"])
-    action    = data.get("action", "pay")   # "pay" | "add_funds"
+    user_id   = user_id
+    amount    = amount
 
     user = get_user_from_db(user_id)
 
-    delta = -amount if action == "pay" else amount
-    new_credit = user.credit + delta
+    new_credit = user.credit + amount
 
     if new_credit < 0:
         # Vote NO – record the abort so retries are idempotent
         rec = PrepareRecord(
             txn_id=txn_id,
             user_id=user_id,
-            delta=delta,
+            delta=amount,
             old_credit=user.credit,
             new_credit=user.credit,   # unchanged
             state=TXN_ABORTED,
@@ -173,7 +170,7 @@ def prepare(txn_id: str):
     rec = PrepareRecord(
         txn_id=txn_id,
         user_id=user_id,
-        delta=delta,
+        delta=amount,
         old_credit=user.credit,
         new_credit=new_credit,
         state=TXN_PREPARED,
@@ -190,7 +187,7 @@ def prepare(txn_id: str):
     return jsonify({"status": TXN_PREPARED, "txn_id": txn_id}), 200
 
 
-@app.post('/commit/<txn_id>')
+@app.post('/2pc/commit/<txn_id>')
 def commit(txn_id: str):
     """
     Phase-2 commit.  The user record is already updated; just mark the txn done.
@@ -214,7 +211,7 @@ def commit(txn_id: str):
     return jsonify({"status": TXN_COMMITTED, "txn_id": txn_id}), 200
 
 
-@app.post('/abort/<txn_id>')
+@app.post('/2pc/abort/<txn_id>')
 def abort_txn(txn_id: str):
     """
     Phase-2 abort.  Roll back the tentative write made during prepare.
