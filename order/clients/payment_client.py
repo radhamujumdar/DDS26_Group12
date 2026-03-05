@@ -1,0 +1,37 @@
+import httpx
+from fastapi import HTTPException
+
+from models import ParticipantResult, REQ_ERROR_STR
+
+
+class PaymentClient:
+    def __init__(self, session: httpx.AsyncClient, gateway_url: str):
+        self.session = session
+        self.base_url = f"{gateway_url}/payment"
+
+    async def prepare(self, tx_id: str, user_id: str, amount: int) -> ParticipantResult:
+        response = await self._safe_post(f"/2pc/prepare/{tx_id}/{user_id}/{amount}")
+        return self._status_to_result(response)
+
+    async def commit(self, tx_id: str) -> ParticipantResult:
+        response = await self._safe_post(f"/2pc/commit/{tx_id}")
+        return self._status_to_result(response)
+
+    async def abort(self, tx_id: str) -> ParticipantResult:
+        response = await self._safe_post(f"/2pc/abort/{tx_id}")
+        return self._status_to_result(response)
+
+    @staticmethod
+    def _status_to_result(response: httpx.Response) -> ParticipantResult:
+        if response.status_code == 200:
+            return ParticipantResult(ok=True)
+        if response.status_code >= 500:
+            return ParticipantResult(ok=False, retryable=True, detail="Payment service unavailable")
+        detail = response.text.strip() or "Payment request failed"
+        return ParticipantResult(ok=False, detail=detail)
+
+    async def _safe_post(self, path: str) -> httpx.Response:
+        try:
+            return await self.session.post(f"{self.base_url}{path}")
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=400, detail=REQ_ERROR_STR) from exc
