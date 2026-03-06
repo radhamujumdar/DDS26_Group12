@@ -1,87 +1,86 @@
 """
-2PC Bug Showcase Test Suite
-============================
-Tests that demonstrate each confirmed bug in the current implementation.
-Run against a live docker-compose stack:  docker-compose up --build -d
+Behavior and regression tests for the distributed shopping-cart system.
 
-Each test is clearly marked:
-  [BUG]    — currently FAILS / exposes incorrect behaviour (the bug)
-  [FIXED]  — expected behaviour after the bug is fixed
-
-Run:
-    pip install pytest httpx pytest-asyncio
-    pytest test_2pc_bugs.py -v
+The suite is split into:
+1. Core integration behavior that should pass now.
+2. Operational/config checks.
+3. Known consistency gaps marked with xfail.
 """
 
 import asyncio
 import random
 import uuid
 from pathlib import Path
-import pytest
+
 import httpx
+import pytest
 
-BASE = "http://localhost:8000"   # nginx gateway
+BASE_URL = "http://localhost:8000"
 
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
 
-async def create_user(client: httpx.AsyncClient, credit: int) -> str:
-    r = await client.post(f"{BASE}/payment/create_user")
-    assert r.status_code == 200, r.text
-    user_id = r.json()["user_id"]
+async def create_user(client: httpx.AsyncClient, credit: int = 0) -> str:
+    response = await client.post(f"{BASE_URL}/payment/create_user")
+    assert response.status_code == 200, response.text
+    user_id = response.json()["user_id"]
+
     if credit > 0:
-        r2 = await client.post(f"{BASE}/payment/add_funds/{user_id}/{credit}")
-        assert r2.status_code == 200, r2.text
+        add_funds = await client.post(f"{BASE_URL}/payment/add_funds/{user_id}/{credit}")
+        assert add_funds.status_code == 200, add_funds.text
+
     return user_id
 
 
-async def create_item(client: httpx.AsyncClient, price: int, stock: int) -> str:
-    r = await client.post(f"{BASE}/stock/item/create/{price}")
-    assert r.status_code == 200, r.text
-    item_id = r.json()["item_id"]
-    r2 = await client.post(f"{BASE}/stock/add/{item_id}/{stock}")
-    assert r2.status_code == 200, r2.text
+async def create_item(client: httpx.AsyncClient, price: int, stock: int = 0) -> str:
+    response = await client.post(f"{BASE_URL}/stock/item/create/{price}")
+    assert response.status_code == 200, response.text
+    item_id = response.json()["item_id"]
+
+    if stock > 0:
+        add_stock = await client.post(f"{BASE_URL}/stock/add/{item_id}/{stock}")
+        assert add_stock.status_code == 200, add_stock.text
+
     return item_id
 
 
 async def create_order(client: httpx.AsyncClient, user_id: str) -> str:
-    r = await client.post(f"{BASE}/orders/create/{user_id}")
-    assert r.status_code == 200, r.text
-    return r.json()["order_id"]
+    response = await client.post(f"{BASE_URL}/orders/create/{user_id}")
+    assert response.status_code == 200, response.text
+    return response.json()["order_id"]
 
 
-async def add_item_to_order(client: httpx.AsyncClient, order_id: str, item_id: str, qty: int = 1):
-    r = await client.post(f"{BASE}/orders/addItem/{order_id}/{item_id}/{qty}")
-    assert r.status_code == 200, r.text
+async def add_item_to_order(client: httpx.AsyncClient, order_id: str, item_id: str, quantity: int) -> None:
+    response = await client.post(f"{BASE_URL}/orders/addItem/{order_id}/{item_id}/{quantity}")
+    assert response.status_code == 200, response.text
 
 
 async def get_credit(client: httpx.AsyncClient, user_id: str) -> int:
-    r = await client.get(f"{BASE}/payment/find_user/{user_id}")
-    assert r.status_code == 200, r.text
-    return r.json()["credit"]
+    response = await client.get(f"{BASE_URL}/payment/find_user/{user_id}")
+    assert response.status_code == 200, response.text
+    return response.json()["credit"]
 
 
 async def get_stock(client: httpx.AsyncClient, item_id: str) -> int:
-    r = await client.get(f"{BASE}/stock/find/{item_id}")
-    assert r.status_code == 200, r.text
-    return r.json()["stock"]
+    response = await client.get(f"{BASE_URL}/stock/find/{item_id}")
+    assert response.status_code == 200, response.text
+    return response.json()["stock"]
 
 
-def _extract_function_source(path: Path, func_name: str, next_func_name: str | None = None) -> str:
+async def get_order(client: httpx.AsyncClient, order_id: str) -> dict:
+    response = await client.get(f"{BASE_URL}/orders/find/{order_id}")
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _extract_async_function_source(path: Path, function_name: str, next_function_name: str | None = None) -> str:
     source = path.read_text(encoding="utf-8")
-    start = source.find(f"async def {func_name}")
-    assert start != -1, f"Could not find function: {func_name}"
-    if next_func_name is None:
+    start = source.find(f"async def {function_name}")
+    assert start != -1, f"Could not find function {function_name} in {path}"
+    if next_function_name is None:
         return source[start:]
-    end = source.find(f"async def {next_func_name}", start)
-    assert end != -1, f"Could not find next function: {next_func_name}"
+    end = source.find(f"async def {next_function_name}", start)
+    assert end != -1, f"Could not find function {next_function_name} in {path}"
     return source[start:end]
 
-
-# ──────────────────────────────────────────────
-# Fixtures
-# ──────────────────────────────────────────────
 
 @pytest.fixture
 def anyio_backend():
@@ -90,493 +89,241 @@ def anyio_backend():
 
 @pytest.fixture
 async def client():
-    async with httpx.AsyncClient(timeout=10.0) as c:
-        yield c
+    async with httpx.AsyncClient(timeout=10.0) as session:
+        yield session
 
 
-# ══════════════════════════════════════════════
-# BUG 1 — Payment abort: delta vs value compare
-# ══════════════════════════════════════════════
-#
-# _do_abort in payment/app.py checks:
-#   if user.credit == rec.new_credit: restore
-#   else: just mark aborted  ← WRONG — skips restore
-#
-# Reproduce: run two concurrent transactions on the same user.
-# Txn A prepares (credit: 100 → 60, delta=-40).
-# Txn B prepares (credit: 60 → 20, delta=-40).
-# Txn A aborts — by now credit is 20, NOT 60 (rec.new_credit).
-# The guard fires, restore is skipped → user stuck with credit=20
-# instead of the correct credit=60 (20 + 40 restored).
-# ══════════════════════════════════════════════
-
-class TestBug1_PaymentAbortDeltaVsValue:
-
+class TestCoreCheckoutFlow:
     @pytest.mark.anyio
-    async def test_BUG_abort_skips_restore_when_credit_changed_by_concurrent_txn(self, client):
-        """
-        [BUG] After txn A aborts, user credit should be restored to 60.
-        Due to the value-compare guard, restore is skipped → credit stays at 20.
-        This test FAILS on the buggy code (asserts 60, gets 20).
-        """
-        user_id = await create_user(client, 100)
-        txn_a = str(uuid.uuid4())
-        txn_b = str(uuid.uuid4())
+    async def test_successful_checkout_updates_credit_stock_and_order_state(self, client):
+        user_id = await create_user(client, credit=200)
+        item_id = await create_item(client, price=50, stock=5)
+        order_id = await create_order(client, user_id)
+        await add_item_to_order(client, order_id, item_id, quantity=2)
 
-        # Txn A prepares: 100 → 60
-        r = await client.post(f"{BASE}/payment/2pc/prepare/{txn_a}/{user_id}/40")
-        assert r.status_code == 200, f"Prepare A failed: {r.text}"
+        checkout = await client.post(f"{BASE_URL}/orders/checkout/{order_id}")
+        assert checkout.status_code == 200, checkout.text
 
-        # Txn B prepares: 60 → 20  (concurrent)
-        r = await client.post(f"{BASE}/payment/2pc/prepare/{txn_b}/{user_id}/40")
-        assert r.status_code == 200, f"Prepare B failed: {r.text}"
-
-        # Txn B commits (credit stays at 20)
-        r = await client.post(f"{BASE}/payment/2pc/commit/{txn_b}")
-        assert r.status_code == 200
-
-        # Txn A aborts — should restore its delta of 40 → credit becomes 60
-        r = await client.post(f"{BASE}/payment/2pc/abort/{txn_a}")
-        assert r.status_code == 200
-
-        credit = await get_credit(client, user_id)
-        # BUG: actual credit will be 20 (restore was skipped)
-        assert credit == 60, (
-            f"[BUG EXPOSED] Expected credit=60 after txn A abort, got {credit}. "
-            f"The abort silently skipped the restore because credit (20) != rec.new_credit (60)."
-        )
-
-    @pytest.mark.anyio
-    async def test_FIXED_abort_always_restores_delta(self, client):
-        """
-        [FIXED] After applying the fix (always restore by delta),
-        aborting txn A must give the user back its 40 regardless of
-        what other transactions have done to the credit.
-        This test PASSES after the fix.
-        """
-        user_id = await create_user(client, 100)
-        txn_a = str(uuid.uuid4())
-        txn_b = str(uuid.uuid4())
-
-        await client.post(f"{BASE}/payment/2pc/prepare/{txn_a}/{user_id}/40")
-        await client.post(f"{BASE}/payment/2pc/prepare/{txn_b}/{user_id}/40")
-        await client.post(f"{BASE}/payment/2pc/commit/{txn_b}")
-        await client.post(f"{BASE}/payment/2pc/abort/{txn_a}")
-
-        credit = await get_credit(client, user_id)
-        assert credit == 60, f"Expected 60, got {credit}"
-
-
-# ══════════════════════════════════════════════
-# BUG 2 — Stock double-abort restores stock twice
-# ══════════════════════════════════════════════
-#
-# _do_abort in stock/app.py adds stock back unconditionally.
-# There is no guard inside the function checking res.state == "aborted".
-# The state check lives only in the HTTP endpoint, so if the service
-# crashes mid-abort and the coordinator retries, stock is added twice.
-#
-# We simulate this by calling /2pc/abort twice with a synthetic
-# already-aborted reservation injected directly into Redis,
-# OR by simply calling the abort endpoint twice and observing
-# the stock goes above original — because the endpoint-level guard
-# returns early on the SECOND call (idempotent), but if the crash
-# happens BETWEEN writing "aborted" and adding stock, the internal
-# function will be called again on recovery with state still "prepared".
-#
-# For an integration test without a crash, we directly call _do_abort
-# behaviour by hitting the abort endpoint twice, first time with a
-# "prepared" reservation, second time patching state back to "prepared"
-# (simulating mid-abort crash).  Since we can't inject Redis state
-# from outside, we demonstrate the logical gap: the function itself
-# has no guard, so a direct second call would double-restore.
-# ══════════════════════════════════════════════
-
-class TestBug2_StockDoubleAbort:
-
-    @pytest.mark.anyio
-    async def test_BUG_abort_called_twice_simulating_crash_between_state_write_and_stock_restore(self, client):
-        """
-        [BUG] Simulates a scenario where the service crashes after writing
-        res.state="aborted" to Redis but before the pipeline that restores
-        stock executes (WatchError / network blip path).
-
-        In practice, calling abort twice on a fresh "prepared" reservation
-        should be idempotent and restore stock exactly once.
-        The current endpoint guard handles the second call correctly,
-        BUT if a crash happens INSIDE _do_abort after partial execution,
-        the recovery path calls the inner function directly — bypassing
-        the endpoint guard — and stock is restored a second time.
-
-        This test asserts idempotent abort: stock must equal original after
-        any number of abort calls.
-        """
-        item_id = await create_item(client, price=10, stock=5)
-        txn_id = str(uuid.uuid4())
-
-        original_stock = await get_stock(client, item_id)
-        assert original_stock == 5
-
-        # Prepare: reserves 2 units (stock goes to 3)
-        r = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/2")
-        assert r.status_code == 200, r.text
+        assert await get_credit(client, user_id) == 100
         assert await get_stock(client, item_id) == 3
-
-        # First abort: should restore 2 → stock back to 5
-        r = await client.post(f"{BASE}/stock/2pc/abort/{txn_id}/{item_id}/2")
-        assert r.status_code == 200
-        stock_after_first_abort = await get_stock(client, item_id)
-        assert stock_after_first_abort == 5, f"Expected 5 after first abort, got {stock_after_first_abort}"
-
-        # Second abort (simulates retry after crash):
-        # Endpoint returns early (idempotent) because state == "aborted".
-        # But the inner _do_abort has no guard, so a crash-recovery path
-        # calling it directly would give stock=7. This test documents
-        # the vulnerability even though the endpoint path is safe.
-        r2 = await client.post(f"{BASE}/stock/2pc/abort/{txn_id}/{item_id}/2")
-        assert r2.status_code == 200
-        stock_after_second_abort = await get_stock(client, item_id)
-
-        # This assertion passes on buggy code ONLY if we go through the endpoint.
-        # The bug manifests in crash-recovery. We document it:
-        assert stock_after_second_abort == 5, (
-            f"[BUG RISK] Stock is {stock_after_second_abort}. "
-            f"The _do_abort function has no internal state guard. "
-            f"A crash between state-write and stock-restore would cause stock=7 on retry."
-        )
+        assert (await get_order(client, order_id))["paid"] is True
 
     @pytest.mark.anyio
-    async def test_FIXED_abort_is_idempotent_regardless_of_path(self, client):
-        """
-        [FIXED] After adding a state guard inside _do_abort itself,
-        calling abort multiple times must always yield stock == original.
-        """
-        item_id = await create_item(client, price=5, stock=10)
+    async def test_failed_checkout_keeps_credit_stock_and_order_state(self, client):
+        user_id = await create_user(client, credit=10)
+        item_id = await create_item(client, price=50, stock=5)
+        order_id = await create_order(client, user_id)
+        await add_item_to_order(client, order_id, item_id, quantity=1)
+
+        checkout = await client.post(f"{BASE_URL}/orders/checkout/{order_id}")
+        assert checkout.status_code == 400
+
+        assert await get_credit(client, user_id) == 10
+        assert await get_stock(client, item_id) == 5
+        assert (await get_order(client, order_id))["paid"] is False
+
+    @pytest.mark.anyio
+    async def test_competing_checkouts_have_single_success(self, client):
+        user_id = await create_user(client, credit=100)
+        item_id = await create_item(client, price=100, stock=1)
+
+        order_1 = await create_order(client, user_id)
+        order_2 = await create_order(client, user_id)
+        await add_item_to_order(client, order_1, item_id, quantity=1)
+        await add_item_to_order(client, order_2, item_id, quantity=1)
+
+        responses = await asyncio.gather(
+            client.post(f"{BASE_URL}/orders/checkout/{order_1}"),
+            client.post(f"{BASE_URL}/orders/checkout/{order_2}"),
+            return_exceptions=True,
+        )
+
+        status_codes = [response.status_code if isinstance(response, httpx.Response) else 500 for response in responses]
+        assert status_codes.count(200) == 1, status_codes
+        assert status_codes.count(400) == 1, status_codes
+
+        assert await get_stock(client, item_id) == 0
+        assert await get_credit(client, user_id) == 0
+
+
+class TestParticipantSemantics:
+    @pytest.mark.anyio
+    async def test_payment_abort_restores_reserved_credit(self, client):
+        user_id = await create_user(client, credit=100)
+        txn_a = str(uuid.uuid4())
+        txn_b = str(uuid.uuid4())
+
+        assert (await client.post(f"{BASE_URL}/payment/2pc/prepare/{txn_a}/{user_id}/40")).status_code == 200
+        assert (await client.post(f"{BASE_URL}/payment/2pc/prepare/{txn_b}/{user_id}/40")).status_code == 200
+        assert (await client.post(f"{BASE_URL}/payment/2pc/commit/{txn_b}")).status_code == 200
+        assert (await client.post(f"{BASE_URL}/payment/2pc/abort/{txn_a}")).status_code == 200
+
+        assert await get_credit(client, user_id) == 60
+
+    @pytest.mark.anyio
+    async def test_stock_abort_is_idempotent(self, client):
+        item_id = await create_item(client, price=10, stock=10)
         txn_id = str(uuid.uuid4())
 
-        await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/3")
+        assert (await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_id}/{item_id}/3")).status_code == 200
         assert await get_stock(client, item_id) == 7
 
         for _ in range(3):
-            r = await client.post(f"{BASE}/stock/2pc/abort/{txn_id}/{item_id}/3")
-            assert r.status_code == 200
+            abort_response = await client.post(f"{BASE_URL}/stock/2pc/abort/{txn_id}/{item_id}/3")
+            assert abort_response.status_code == 200, abort_response.text
 
         assert await get_stock(client, item_id) == 10
 
-
-# ══════════════════════════════════════════════
-# BUG 3 — Direct /pay endpoint bypasses 2PC
-# ══════════════════════════════════════════════
-#
-# /payment/pay/{user_id}/{amount} modifies credit directly,
-# with no check for an active prepared 2PC transaction on that user.
-# A concurrent direct payment can corrupt in-flight 2PC state.
-# ══════════════════════════════════════════════
-
-class TestBug3_DirectPayBypassesTwoPC:
-
     @pytest.mark.anyio
-    async def test_BUG_direct_pay_races_with_prepared_txn(self, client):
-        """
-        [BUG] While a 2PC transaction is in the PREPARED state (credit locked),
-        a direct /pay call succeeds and reduces credit independently.
-        When the 2PC txn then aborts, it tries to restore credit that was
-        already further reduced, causing an incorrect final balance.
-
-        Correct behaviour: direct /pay should fail (4xx) if a prepared
-        2PC txn is holding a lock on that user's credit.
-        """
-        user_id = await create_user(client, 100)
+    async def test_direct_pay_is_blocked_while_prepared_transaction_exists(self, client):
+        user_id = await create_user(client, credit=100)
         txn_id = str(uuid.uuid4())
 
-        # 2PC prepare: locks 40 credits (100 → 60)
-        r = await client.post(f"{BASE}/payment/2pc/prepare/{txn_id}/{user_id}/40")
-        assert r.status_code == 200
+        assert (await client.post(f"{BASE_URL}/payment/2pc/prepare/{txn_id}/{user_id}/40")).status_code == 200
+        blocked_pay = await client.post(f"{BASE_URL}/payment/pay/{user_id}/30")
+        assert 400 <= blocked_pay.status_code < 500, blocked_pay.text
 
-        # Direct pay while 2PC is prepared — this should be blocked but isn't
-        r_pay = await client.post(f"{BASE}/payment/pay/{user_id}/30")
-        # BUG: returns 200 instead of 4xx
-        assert 400 <= r_pay.status_code < 500, (
-            f"[BUG EXPOSED] Direct /pay succeeded (got {r_pay.status_code}) "
-            f"while a 2PC prepare was active. This bypasses the 2PC lock."
-        )
-
-    @pytest.mark.anyio
-    async def test_FIXED_direct_pay_blocked_during_prepared_txn(self, client):
-        """
-        [FIXED] After adding a lock-check to /pay, it must return 4xx
-        when a 2PC prepare is active on that user.
-        """
-        user_id = await create_user(client, 100)
-        txn_id = str(uuid.uuid4())
-
-        await client.post(f"{BASE}/payment/2pc/prepare/{txn_id}/{user_id}/40")
-        r = await client.post(f"{BASE}/payment/pay/{user_id}/30")
-        assert 400 <= r.status_code < 500, f"Expected 4xx, got {r.status_code}"
-
-        # After commit, direct pay should work again
-        await client.post(f"{BASE}/payment/2pc/commit/{txn_id}")
-        r2 = await client.post(f"{BASE}/payment/pay/{user_id}/10")
-        assert r2.status_code == 200
+        assert (await client.post(f"{BASE_URL}/payment/2pc/commit/{txn_id}")).status_code == 200
+        allowed_pay = await client.post(f"{BASE_URL}/payment/pay/{user_id}/10")
+        assert allowed_pay.status_code == 200, allowed_pay.text
 
 
-# ══════════════════════════════════════════════
-# BUG 4 — Watchdog hardcoded container name
-# ══════════════════════════════════════════════
-#
-# Watchdog uses:  dds_group12-${svc}-1
-# If the project folder is not "dds_group12", containers are never restarted.
-# This is a config/deployment bug, not testable via HTTP, but we document it.
-# ══════════════════════════════════════════════
-
-class TestBug4_WatchdogContainerName:
-
-    def test_BUG_watchdog_uses_hardcoded_prefix(self):
-        """
-        [BUG] docker-compose.yml watchdog hardcodes 'dds_group12' as the
-        container name prefix. Docker Compose derives the prefix from the
-        folder name, so this breaks in any other directory.
-
-        Fix: use COMPOSE_PROJECT_NAME env var or replace the hardcoded
-        prefix with a dynamic one, e.g. via 'docker ps --filter label=...'.
-
-        This test always FAILS to remind you to fix the watchdog config.
-        """
-        import re
+class TestOperationalConfiguration:
+    def test_watchdog_command_uses_service_label_lookup(self):
         compose_path = Path(__file__).resolve().parents[1] / "docker-compose.yml"
-        with compose_path.open() as f:
-            content = f.read()
-
-        hardcoded = re.findall(r"dds_group12", content)
-        assert len(hardcoded) == 0, (
-            f"[BUG EXPOSED] Found {len(hardcoded)} hardcoded 'dds_group12' "
-            f"references in docker-compose.yml watchdog command. "
-            f"Replace with a dynamic container name lookup."
-        )
+        content = compose_path.read_text(encoding="utf-8")
+        assert "label=com.docker.compose.service=" in content
+        assert "dds_group12" not in content
 
 
-# ══════════════════════════════════════════════
-# BUG 5 — No participant-side recovery on restart
-# ══════════════════════════════════════════════
-#
-# If stock-service or payment-service crashes while a txn is in PREPARED
-# state, on restart they have no recovery logic. The coordinator may retry
-# commit/abort, but participants don't pro-actively resolve orphaned prepares.
-# This test verifies the coordinator recovery endpoint exists and is called.
-# ══════════════════════════════════════════════
-
-class TestBug5_ParticipantRecovery:
+class TestKnownConsistencyGaps:
+    @pytest.mark.xfail(
+        reason="Coordinator still starts abort from commit phase.",
+        strict=False,
+    )
+    def test_coordinator_does_not_abort_after_commit_phase_starts(self):
+        coordinator_path = Path(__file__).resolve().parents[1] / "order" / "coordinator" / "two_pc.py"
+        commit_phase_source = _extract_async_function_source(coordinator_path, "_commit_phase", "_abort_phase")
+        assert "_start_abort(" not in commit_phase_source
 
     @pytest.mark.anyio
     @pytest.mark.xfail(
-        reason="Participant self-healing is not implemented; coordinator recovery owns orphan resolution.",
+        reason="Payment participant commit/abort race is not serialized.",
         strict=False,
     )
-    async def test_BUG_orphaned_prepared_txn_locks_stock_after_restart(self, client):
-        """
-        [BUG] Simulates a coordinator crash after prepare but before commit/abort.
-        The txn stays in PREPARED state. A new checkout for the same item
-        may fail because stock appears reserved.
-
-        We can't kill docker containers in this test, but we verify the
-        symptom: after a prepare with no commit/abort, the stock remains
-        reduced and there is no self-healing endpoint on the participant.
-        """
-        item_id = await create_item(client, price=10, stock=1)
-        txn_id = str(uuid.uuid4())
-
-        # Prepare takes the last unit
-        r = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/1")
-        assert r.status_code == 200
-        assert await get_stock(client, item_id) == 0
-
-        # Coordinator "crashes" — never sends commit or abort
-        # Now a new txn tries to buy the same item:
-        txn_id_2 = str(uuid.uuid4())
-        r2 = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id_2}/{item_id}/1")
-
-        # BUG: returns 400 "insufficient stock" — item is permanently locked
-        assert r2.status_code == 200, (
-            f"[BUG EXPOSED] New transaction was rejected (got {r2.status_code}) "
-            f"because orphaned prepared txn permanently holds the last stock unit. "
-            f"Without recovery, this item can never be purchased again."
-        )
-
-    @pytest.mark.anyio
-    async def test_FIXED_recovery_resolves_orphaned_prepared_txn(self, client):
-        """
-        [FIXED] After implementing coordinator recovery (recover_active_transactions),
-        orphaned PREPARED transactions should be aborted on restart,
-        freeing the stock for new purchases.
-
-        This test assumes recovery runs on order-service startup.
-        We verify stock is restored to 1 after a simulated orphan scenario.
-        (Full verification requires killing and restarting the container.)
-        """
-        item_id = await create_item(client, price=10, stock=1)
-        txn_id = str(uuid.uuid4())
-
-        await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/1")
-        assert await get_stock(client, item_id) == 0
-
-        # Manually abort (simulating what recovery would do)
-        await client.post(f"{BASE}/stock/2pc/abort/{txn_id}/{item_id}/1")
-        assert await get_stock(client, item_id) == 1
-
-        # Now a new transaction can succeed
-        txn_id_2 = str(uuid.uuid4())
-        r = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id_2}/{item_id}/1")
-        assert r.status_code == 200
-
-
-# ══════════════════════════════════════════════
-# INTEGRATION — Full checkout consistency test
-# ══════════════════════════════════════════════
-
-class TestReviewFindings:
-
-    @pytest.mark.xfail(
-        reason="Coordinator still calls _start_abort from _commit_phase.",
-        strict=False,
-    )
-    def test_issue_1_commit_phase_must_not_start_abort(self):
-        repo_root = Path(__file__).resolve().parents[1]
-        coordinator_path = repo_root / "order" / "coordinator" / "two_pc.py"
-        commit_phase = _extract_function_source(coordinator_path, "_commit_phase", "_abort_phase")
-        assert "_start_abort(" not in commit_phase, (
-            "Coordinator should not initiate ABORT once commit phase is in progress."
-        )
-
-    @pytest.mark.anyio
-    @pytest.mark.xfail(
-        reason="Payment commit/abort race allows both requests to return success.",
-        strict=False,
-    )
-    async def test_issue_2_payment_commit_abort_must_be_mutually_exclusive(self, client):
+    async def test_payment_commit_and_abort_are_terminally_exclusive(self, client):
         for attempt in range(120):
-            user_id = await create_user(client, 100)
+            user_id = await create_user(client, credit=100)
             txn_id = str(uuid.uuid4())
-            prepared = await client.post(f"{BASE}/payment/2pc/prepare/{txn_id}/{user_id}/40")
+            prepared = await client.post(f"{BASE_URL}/payment/2pc/prepare/{txn_id}/{user_id}/40")
             assert prepared.status_code == 200, prepared.text
 
             await asyncio.sleep(random.random() * 0.01)
             commit_response, abort_response = await asyncio.gather(
-                client.post(f"{BASE}/payment/2pc/commit/{txn_id}"),
-                client.post(f"{BASE}/payment/2pc/abort/{txn_id}"),
+                client.post(f"{BASE_URL}/payment/2pc/commit/{txn_id}"),
+                client.post(f"{BASE_URL}/payment/2pc/abort/{txn_id}"),
             )
 
             if commit_response.status_code == 200 and abort_response.status_code == 200:
-                credit = await get_credit(client, user_id)
+                final_credit = await get_credit(client, user_id)
                 pytest.fail(
-                    f"Attempt {attempt}: commit and abort both succeeded for txn {txn_id}; final credit={credit}"
+                    f"Attempt {attempt}: commit and abort both returned 200 for txn {txn_id}; "
+                    f"credit={final_credit}"
                 )
 
     @pytest.mark.anyio
     @pytest.mark.xfail(
-        reason="Stock commit/abort race allows contradictory outcomes.",
+        reason="Stock participant commit/abort race is not serialized.",
         strict=False,
     )
-    async def test_issue_3_stock_commit_abort_must_be_mutually_exclusive(self, client):
+    async def test_stock_commit_and_abort_are_terminally_exclusive(self, client):
         item_id = await create_item(client, price=10, stock=5000)
 
         for attempt in range(150):
             txn_id = str(uuid.uuid4())
-            prepared = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/1")
+            prepared = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_id}/{item_id}/1")
             assert prepared.status_code == 200, prepared.text
 
             await asyncio.sleep(random.random() * 0.01)
             commit_response, abort_response = await asyncio.gather(
-                client.post(f"{BASE}/stock/2pc/commit/{txn_id}/{item_id}/1"),
-                client.post(f"{BASE}/stock/2pc/abort/{txn_id}/{item_id}/1"),
+                client.post(f"{BASE_URL}/stock/2pc/commit/{txn_id}/{item_id}/1"),
+                client.post(f"{BASE_URL}/stock/2pc/abort/{txn_id}/{item_id}/1"),
             )
 
             if commit_response.status_code == 200 and abort_response.status_code == 200:
                 final_stock = await get_stock(client, item_id)
                 pytest.fail(
-                    f"Attempt {attempt}: commit and abort both succeeded for txn {txn_id}; stock={final_stock}"
+                    f"Attempt {attempt}: commit and abort both returned 200 for txn {txn_id}; "
+                    f"stock={final_stock}"
                 )
 
     @pytest.mark.anyio
     @pytest.mark.xfail(
-        reason="Negative values are accepted in order/payment/stock paths.",
+        reason="Negative quantities/amounts are not consistently validated.",
         strict=False,
     )
-    async def test_issue_4_negative_amounts_must_be_rejected(self, client):
-        user_id = await create_user(client, 100)
+    async def test_negative_values_are_rejected_by_order_payment_and_stock(self, client):
+        user_id = await create_user(client, credit=100)
         item_id = await create_item(client, price=5, stock=20)
         order_id = await create_order(client, user_id)
 
-        add_negative_qty = await client.post(f"{BASE}/orders/addItem/{order_id}/{item_id}/-2")
-        assert 400 <= add_negative_qty.status_code < 500, (
-            f"Negative quantity accepted by order service: {add_negative_qty.status_code}"
-        )
+        negative_item = await client.post(f"{BASE_URL}/orders/addItem/{order_id}/{item_id}/-2")
+        assert 400 <= negative_item.status_code < 500
 
-        pay_prepare_negative = await client.post(
-            f"{BASE}/payment/2pc/prepare/{uuid.uuid4()}/{user_id}/-10"
-        )
-        assert 400 <= pay_prepare_negative.status_code < 500, (
-            f"Negative prepare amount accepted by payment service: {pay_prepare_negative.status_code}"
-        )
+        negative_payment = await client.post(f"{BASE_URL}/payment/2pc/prepare/{uuid.uuid4()}/{user_id}/-10")
+        assert 400 <= negative_payment.status_code < 500
 
-        stock_prepare_negative = await client.post(
-            f"{BASE}/stock/2pc/prepare/{uuid.uuid4()}/{item_id}/-3"
-        )
-        assert 400 <= stock_prepare_negative.status_code < 500, (
-            f"Negative prepare amount accepted by stock service: {stock_prepare_negative.status_code}"
-        )
+        negative_stock = await client.post(f"{BASE_URL}/stock/2pc/prepare/{uuid.uuid4()}/{item_id}/-3")
+        assert 400 <= negative_stock.status_code < 500
 
     @pytest.mark.anyio
     @pytest.mark.xfail(
-        reason="Order remains mutable after it is paid.",
+        reason="Paid orders can still be modified.",
         strict=False,
     )
-    async def test_issue_5_paid_order_must_not_accept_new_items(self, client):
-        user_id = await create_user(client, 200)
+    async def test_paid_order_is_not_mutable(self, client):
+        user_id = await create_user(client, credit=200)
         item_id = await create_item(client, price=10, stock=20)
         order_id = await create_order(client, user_id)
-        await add_item_to_order(client, order_id, item_id, qty=1)
+        await add_item_to_order(client, order_id, item_id, quantity=1)
 
-        checkout = await client.post(f"{BASE}/orders/checkout/{order_id}")
+        checkout = await client.post(f"{BASE_URL}/orders/checkout/{order_id}")
         assert checkout.status_code == 200, checkout.text
 
-        add_after_paid = await client.post(f"{BASE}/orders/addItem/{order_id}/{item_id}/1")
-        assert 400 <= add_after_paid.status_code < 500, (
-            f"Paid order still accepted addItem: {add_after_paid.status_code}"
-        )
+        add_after_paid = await client.post(f"{BASE_URL}/orders/addItem/{order_id}/{item_id}/1")
+        assert 400 <= add_after_paid.status_code < 500
 
     @pytest.mark.xfail(
-        reason="payment.get_prepare_record masks RedisError by returning None.",
+        reason="payment.get_prepare_record masks RedisError as missing transaction.",
         strict=False,
     )
-    def test_issue_6_get_prepare_record_should_not_mask_db_errors(self):
-        repo_root = Path(__file__).resolve().parents[1]
-        payment_path = repo_root / "payment" / "app.py"
-        function_source = _extract_function_source(payment_path, "get_prepare_record", "save_prepare_record")
+    def test_payment_prepare_lookup_propagates_db_errors(self):
+        payment_path = Path(__file__).resolve().parents[1] / "payment" / "app.py"
+        function_source = _extract_async_function_source(payment_path, "get_prepare_record", "save_prepare_record")
         assert "except RedisError" in function_source
-        assert "raise HTTPException" in function_source, (
-            "get_prepare_record should propagate DB failures instead of returning None."
-        )
+        assert "raise HTTPException" in function_source
 
     @pytest.mark.anyio
     @pytest.mark.xfail(
-        reason="/payment/pay lock check is TOCTOU; pay and prepare can both succeed.",
+        reason="TOCTOU race between /pay and /2pc/prepare still possible.",
         strict=False,
     )
-    async def test_issue_7_pay_and_prepare_should_not_both_succeed(self, client):
+    async def test_direct_pay_and_prepare_cannot_both_succeed(self, client):
         for attempt in range(120):
-            user_id = await create_user(client, 100)
+            user_id = await create_user(client, credit=100)
             txn_id = str(uuid.uuid4())
 
             await asyncio.sleep(random.random() * 0.005)
             pay_response, prepare_response = await asyncio.gather(
-                client.post(f"{BASE}/payment/pay/{user_id}/30"),
-                client.post(f"{BASE}/payment/2pc/prepare/{txn_id}/{user_id}/80"),
+                client.post(f"{BASE_URL}/payment/pay/{user_id}/30"),
+                client.post(f"{BASE_URL}/payment/2pc/prepare/{txn_id}/{user_id}/80"),
             )
 
             if pay_response.status_code == 200 and prepare_response.status_code == 200:
                 final_credit = await get_credit(client, user_id)
                 pytest.fail(
-                    f"Attempt {attempt}: /pay and /2pc/prepare both returned 200; final credit={final_credit}"
+                    f"Attempt {attempt}: /pay and /2pc/prepare both returned 200 for user {user_id}; "
+                    f"credit={final_credit}"
                 )
 
     @pytest.mark.anyio
@@ -584,98 +331,28 @@ class TestReviewFindings:
         reason="Stock prepare idempotency does not validate amount consistency.",
         strict=False,
     )
-    async def test_issue_8_prepare_replay_with_different_amount_must_fail(self, client):
+    async def test_stock_prepare_replay_with_changed_amount_is_rejected(self, client):
         item_id = await create_item(client, price=10, stock=20)
         txn_id = str(uuid.uuid4())
 
-        first_prepare = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/1")
+        first_prepare = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_id}/{item_id}/1")
         assert first_prepare.status_code == 200, first_prepare.text
 
-        mismatched_prepare = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/3")
-        assert 400 <= mismatched_prepare.status_code < 500, (
-            f"prepare replay with amount mismatch unexpectedly succeeded: {mismatched_prepare.status_code}"
-        )
-
-
-class TestIntegrationCheckout:
+        mismatched_prepare = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_id}/{item_id}/3")
+        assert 400 <= mismatched_prepare.status_code < 500
 
     @pytest.mark.anyio
-    async def test_successful_checkout_reduces_stock_and_credit(self, client):
-        """
-        [BASELINE] A successful checkout must atomically:
-        - reduce stock by the ordered quantity
-        - reduce user credit by total_cost
-        - mark order as paid
-        """
-        user_id = await create_user(client, 200)
-        item_id = await create_item(client, price=50, stock=5)
-        order_id = await create_order(client, user_id)
-        await add_item_to_order(client, order_id, item_id, qty=2)
+    @pytest.mark.xfail(
+        reason="Prepared reservations can remain blocked without explicit recovery.",
+        strict=False,
+    )
+    async def test_orphaned_prepared_reservation_requires_recovery_action(self, client):
+        item_id = await create_item(client, price=10, stock=1)
+        txn_a = str(uuid.uuid4())
+        txn_b = str(uuid.uuid4())
 
-        r = await client.post(f"{BASE}/orders/checkout/{order_id}")
-        assert r.status_code == 200, f"Checkout failed: {r.text}"
+        prepared = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_a}/{item_id}/1")
+        assert prepared.status_code == 200, prepared.text
 
-        assert await get_credit(client, user_id) == 100  # 200 - 2*50
-        assert await get_stock(client, item_id) == 3     # 5 - 2
-
-        order = await client.get(f"{BASE}/orders/find/{order_id}")
-        assert order.json()["paid"] is True
-
-    @pytest.mark.anyio
-    async def test_failed_checkout_rolls_back_stock_and_credit(self, client):
-        """
-        [BASELINE] A checkout that fails (insufficient credit) must:
-        - NOT reduce stock
-        - NOT reduce credit
-        - NOT mark order as paid
-        """
-        user_id = await create_user(client, 10)   # not enough for price=50
-        item_id = await create_item(client, price=50, stock=5)
-        order_id = await create_order(client, user_id)
-        await add_item_to_order(client, order_id, item_id, qty=1)
-
-        r = await client.post(f"{BASE}/orders/checkout/{order_id}")
-        assert r.status_code == 400, f"Expected failure, got: {r.text}"
-
-        assert await get_credit(client, user_id) == 10   # unchanged
-        assert await get_stock(client, item_id) == 5     # unchanged
-
-        order = await client.get(f"{BASE}/orders/find/{order_id}")
-        assert order.json()["paid"] is False
-
-    @pytest.mark.anyio
-    async def test_concurrent_checkouts_maintain_consistency(self, client):
-        """
-        [CONSISTENCY] Two concurrent checkouts competing for the last item
-        and limited credit. Exactly one should succeed, the other should
-        fail and fully roll back. Neither stock nor credit should go negative.
-        """
-        user_id = await create_user(client, 100)
-        item_id = await create_item(client, price=100, stock=1)  # only 1 item
-
-        order_id_1 = await create_order(client, user_id)
-        await add_item_to_order(client, order_id_1, item_id, qty=1)
-
-        order_id_2 = await create_order(client, user_id)
-        await add_item_to_order(client, order_id_2, item_id, qty=1)
-
-        results = await asyncio.gather(
-            client.post(f"{BASE}/orders/checkout/{order_id_1}"),
-            client.post(f"{BASE}/orders/checkout/{order_id_2}"),
-            return_exceptions=True,
-        )
-
-        status_codes = [r.status_code if isinstance(r, httpx.Response) else 500 for r in results]
-        successes = status_codes.count(200)
-        failures = status_codes.count(400)
-
-        assert successes == 1, f"Expected exactly 1 success, got {successes}. Statuses: {status_codes}"
-        assert failures == 1, f"Expected exactly 1 failure, got {failures}. Statuses: {status_codes}"
-
-        final_stock = await get_stock(client, item_id)
-        final_credit = await get_credit(client, user_id)
-
-        assert final_stock == 0, f"Stock should be 0, got {final_stock}"
-        assert final_credit == 0, f"Credit should be 0, got {final_credit}"
-        assert final_stock >= 0, "Stock went negative!"
-        assert final_credit >= 0, "Credit went negative!"
+        blocked = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_b}/{item_id}/1")
+        assert blocked.status_code == 200
