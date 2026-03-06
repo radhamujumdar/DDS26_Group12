@@ -1,6 +1,5 @@
 import logging
 import os
-import atexit
 import uuid
 
 import redis.asyncio as redis
@@ -8,7 +7,7 @@ from redis.exceptions import RedisError, WatchError
 
 from msgspec import msgpack, Struct
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import PlainTextResponse
 from contextlib import asynccontextmanager
 
 
@@ -100,21 +99,30 @@ async def _do_abort(tx_id: str, item_id: str, res: Reservation) -> bool:
                 try:
                     await pipe.watch(item_id, rkey)
 
+                    res_raw = await pipe.get(rkey)
+                    if res_raw is None:
+                        return True
+                    current_res: Reservation = msgpack.decode(res_raw, type=Reservation)
+                    if current_res.state == "aborted":
+                        return True
+                    if current_res.state == "committed":
+                        return False
+
                     item_raw = await pipe.get(item_id)
                     if item_raw is None:
                         pipe.multi()
-                        res.state = "aborted"
-                        pipe.set(rkey, msgpack.encode(res))
+                        current_res.state = "aborted"
+                        pipe.set(rkey, msgpack.encode(current_res))
                         await pipe.execute()
                         return True
 
                     item: StockValue = msgpack.decode(item_raw, type=StockValue)
-                    item.stock += res.amount
+                    item.stock += current_res.amount
 
                     pipe.multi()
                     pipe.set(item_id, msgpack.encode(item))
-                    res.state = "aborted"
-                    pipe.set(rkey, msgpack.encode(res))
+                    current_res.state = "aborted"
+                    pipe.set(rkey, msgpack.encode(current_res))
                     await pipe.execute()
                     return True
 
@@ -277,9 +285,18 @@ async def commit(tx_id: str, item_id: str, amount: int):
 
     if raw is None:
         logger.warning(f"[COMMIT] NO_RESERVATION tx={tx_id} item={item_id}")
-        return {"status": "committed"}
+        raise HTTPException(status_code=400, detail=f"Unknown transaction {tx_id} for item {item_id}")
 
     res: Reservation = msgpack.decode(raw, type=Reservation)
+
+    if int(amount) != int(res.amount):
+        logger.error(
+            f"[COMMIT] AMOUNT_MISMATCH tx={tx_id} item={item_id} expected={res.amount} got={amount}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Txn {tx_id}: commit amount mismatch for item {item_id}",
+        )
 
     if res.state == "committed":
         logger.info(f"[COMMIT] IDEMPOTENT tx={tx_id} item={item_id}")
@@ -317,6 +334,15 @@ async def abort_txn(tx_id: str, item_id: str, amount: int):
         return {"status": "aborted"}
 
     res: Reservation = msgpack.decode(raw, type=Reservation)
+
+    if int(amount) != int(res.amount):
+        logger.error(
+            f"[ABORT] AMOUNT_MISMATCH tx={tx_id} item={item_id} expected={res.amount} got={amount}"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Txn {tx_id}: abort amount mismatch for item {item_id}",
+        )
 
     if res.state == "aborted":
         logger.info(f"[ABORT] IDEMPOTENT tx={tx_id} item={item_id}")

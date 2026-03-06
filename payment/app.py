@@ -1,6 +1,5 @@
 import logging
 import os
-import atexit
 import uuid
 
 import redis.asyncio as redis
@@ -41,6 +40,10 @@ TXN_ABORTED   = "aborted"
 
 def txn_key(txn_id: str) -> str:
     return f"txn:{txn_id}"
+
+
+def prepared_user_key(user_id: str) -> str:
+    return f"txn:user:{user_id}:prepared"
 
 
 # ─────────────────────────────────────────────
@@ -100,44 +103,47 @@ async def save_prepare_record(rec: PrepareRecord):
         raise HTTPException(status_code=400, detail=DB_ERROR_STR)
 
 
+async def has_active_prepare(user_id: str) -> bool:
+    db = get_db()
+    try:
+        return int(await db.scard(prepared_user_key(user_id))) > 0
+    except RedisError as exc:
+        raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+
+
 async def _do_abort(rec: PrepareRecord):
     db = get_db()
     try:
         async with db.pipeline(transaction=True) as pipe:
             while True:
                 try:
-                    await pipe.watch(rec.user_id, txn_key(rec.txn_id))
+                    await pipe.watch(rec.user_id, txn_key(rec.txn_id), prepared_user_key(rec.user_id))
 
                     raw = await pipe.get(rec.user_id)
                     if raw:
                         user: UserValue = msgpack.decode(raw, type=UserValue)
-                        if user.credit == rec.new_credit:
-                            user.credit = rec.old_credit
-                            pipe.multi()
-                            pipe.set(rec.user_id, msgpack.encode(user))
-                            rec.state = TXN_ABORTED
-                            pipe.set(txn_key(rec.txn_id), msgpack.encode(rec))
-                            await pipe.execute()
-                            return
-                        else:
-                            # Credit already different, just mark aborted
-                            pipe.multi()
-                            rec.state = TXN_ABORTED
-                            pipe.set(txn_key(rec.txn_id), msgpack.encode(rec))
-                            await pipe.execute()
-                            return
+                        # Always restore this transaction's reserved delta.
+                        user.credit -= rec.delta
+                        pipe.multi()
+                        pipe.set(rec.user_id, msgpack.encode(user))
+                        rec.state = TXN_ABORTED
+                        pipe.set(txn_key(rec.txn_id), msgpack.encode(rec))
+                        pipe.srem(prepared_user_key(rec.user_id), rec.txn_id)
+                        await pipe.execute()
+                        return
                     else:
                         pipe.multi()
                         rec.state = TXN_ABORTED
                         pipe.set(txn_key(rec.txn_id), msgpack.encode(rec))
+                        pipe.srem(prepared_user_key(rec.user_id), rec.txn_id)
                         await pipe.execute()
                         return
 
                 except redis.WatchError:
                     continue
 
-    except RedisError:
-        logger.error(f"Recovery abort failed for txn {rec.txn_id}")
+    except RedisError as exc:
+        raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
 
 # ─────────────────────────────────────────────
@@ -197,6 +203,7 @@ async def prepare(txn_id: str, user_id: str, amount: int):
                     pipe.multi()
                     pipe.set(user_id, msgpack.encode(UserValue(credit=actual_new_credit)))
                     pipe.set(txn_key(txn_id), msgpack.encode(rec))
+                    pipe.sadd(prepared_user_key(user_id), txn_id)
                     await pipe.execute()
                     break
 
@@ -213,6 +220,7 @@ async def prepare(txn_id: str, user_id: str, amount: int):
 
 @app.post('/2pc/commit/{txn_id}')
 async def commit(txn_id: str):
+    db = get_db()
     rec = await get_prepare_record(txn_id)
     if rec is None:
         raise HTTPException(status_code=400, detail=f"Unknown transaction {txn_id}")
@@ -221,15 +229,28 @@ async def commit(txn_id: str):
         raise HTTPException(status_code=400, detail=f"Transaction {txn_id} was already aborted")
 
     if rec.state == TXN_COMMITTED:
+        try:
+            await db.srem(prepared_user_key(rec.user_id), rec.txn_id)
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         return {"status": TXN_COMMITTED, "txn_id": txn_id}
 
     rec.state = TXN_COMMITTED
-    await save_prepare_record(rec)
+    try:
+        async with db.pipeline(transaction=True) as pipe:
+            pipe.multi()
+            pipe.set(txn_key(txn_id), msgpack.encode(rec))
+            pipe.srem(prepared_user_key(rec.user_id), rec.txn_id)
+            await pipe.execute()
+    except RedisError as exc:
+        raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+
     return {"status": TXN_COMMITTED, "txn_id": txn_id}
 
 
 @app.post('/2pc/abort/{txn_id}')
 async def abort_txn(txn_id: str):
+    db = get_db()
     rec = await get_prepare_record(txn_id)
     if rec is None:
         return {"status": TXN_ABORTED, "txn_id": txn_id}
@@ -238,6 +259,10 @@ async def abort_txn(txn_id: str):
         raise HTTPException(status_code=400, detail=f"Transaction {txn_id} already committed, cannot abort")
 
     if rec.state == TXN_ABORTED:
+        try:
+            await db.srem(prepared_user_key(rec.user_id), rec.txn_id)
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         return {"status": TXN_ABORTED, "txn_id": txn_id}
 
     await _do_abort(rec)
@@ -297,6 +322,12 @@ async def add_credit(user_id: str, amount: int):
 @app.post('/pay/{user_id}/{amount}')
 async def remove_credit(user_id: str, amount: int):
     db = get_db()
+    if await has_active_prepare(user_id):
+        raise HTTPException(
+            status_code=400,
+            detail=f"User: {user_id} has a prepared transaction in progress",
+        )
+
     user_entry: UserValue = await get_user_from_db(user_id)
     user_entry.credit -= int(amount)
     if user_entry.credit < 0:

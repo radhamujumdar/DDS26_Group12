@@ -75,7 +75,7 @@ services:
         echo 'Watchdog started - monitoring containers every 3 seconds';
         while true; do
           for svc in stock-service payment-service order-service gateway order-db stock-db payment-db; do
-            CONTAINER=$$(docker ps -a -q --filter name=dds_group12-$${svc}-1 --filter status=exited);
+            CONTAINER=$$(docker ps -a -q --filter label=com.docker.compose.service=$${svc} --filter status=exited | head -n 1);
             if [ -n \"$$CONTAINER\" ]; then
               echo \"Restarting $$svc...\";
               docker start $$CONTAINER;
