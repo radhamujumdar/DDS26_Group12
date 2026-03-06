@@ -156,7 +156,7 @@ async def prepare(txn_id: str, user_id: str, amount: int):
     existing = await get_prepare_record(txn_id)
     if existing:
         if existing.state == TXN_ABORTED:
-            raise HTTPException(status_code=400, detail=f"Insufficient credit for user {user_id}")
+            raise HTTPException(status_code=400, detail=f"Insufficient credit for user {user_id}") # TODO: Update error message - a transaction can be aborted by orchestrator due to insufficient stock
         return {"status": existing.state, "txn_id": txn_id}
 
     user = await get_user_from_db(user_id)
@@ -253,11 +253,12 @@ async def abort_txn(txn_id: str):
     db = get_db()
     rec = await get_prepare_record(txn_id)
     if rec is None:
-        return {"status": TXN_ABORTED, "txn_id": txn_id}
+        return {"status": TXN_ABORTED, "txn_id": txn_id} # TODO: Should this return "Transaction not found"?
 
     if rec.state == TXN_COMMITTED:
         raise HTTPException(status_code=400, detail=f"Transaction {txn_id} already committed, cannot abort")
 
+    # TODO: Is this check needed? We remove the transaction from the prepared set, but the _do_abort sets the state to TXN_ABORTED AND removes it from the set atomically.
     if rec.state == TXN_ABORTED:
         try:
             await db.srem(prepared_user_key(rec.user_id), rec.txn_id)

@@ -47,7 +47,7 @@ class Reservation(Struct):
 # ─────────────────────────────────────────────
 
 def reservation_key(tx_id: str, item_id: str) -> str:
-    return f"txn:{tx_id}:{item_id}"
+    return f"txn:{tx_id}:{item_id}" # TODO: Do we need the item id in the identifier?
 
 
 # ─────────────────────────────────────────────
@@ -174,6 +174,7 @@ async def find_item(item_id: str):
     return {"stock": item_entry.stock, "price": item_entry.price}
 
 
+# TODO: Do we need locking for the item amounts?
 @app.post('/add/{item_id}/{amount}')
 async def add_stock(item_id: str, amount: int):
     db = get_db()
@@ -185,7 +186,7 @@ async def add_stock(item_id: str, amount: int):
         raise HTTPException(status_code=400, detail=DB_ERROR_STR)
     return PlainTextResponse(f"Item: {item_id} stock updated to: {item_entry.stock}", status_code=200)
 
-
+# TODO: Do we need locking for the item amounts?
 @app.post('/subtract/{item_id}/{amount}')
 async def remove_stock(item_id: str, amount: int):
     db = get_db()

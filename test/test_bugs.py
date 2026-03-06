@@ -14,6 +14,7 @@ Run:
 """
 
 import asyncio
+import random
 import uuid
 from pathlib import Path
 import pytest
@@ -65,6 +66,17 @@ async def get_stock(client: httpx.AsyncClient, item_id: str) -> int:
     r = await client.get(f"{BASE}/stock/find/{item_id}")
     assert r.status_code == 200, r.text
     return r.json()["stock"]
+
+
+def _extract_function_source(path: Path, func_name: str, next_func_name: str | None = None) -> str:
+    source = path.read_text(encoding="utf-8")
+    start = source.find(f"async def {func_name}")
+    assert start != -1, f"Could not find function: {func_name}"
+    if next_func_name is None:
+        return source[start:]
+    end = source.find(f"async def {next_func_name}", start)
+    assert end != -1, f"Could not find next function: {next_func_name}"
+    return source[start:end]
 
 
 # ──────────────────────────────────────────────
@@ -420,6 +432,170 @@ class TestBug5_ParticipantRecovery:
 # ══════════════════════════════════════════════
 # INTEGRATION — Full checkout consistency test
 # ══════════════════════════════════════════════
+
+class TestReviewFindings:
+
+    @pytest.mark.xfail(
+        reason="Coordinator still calls _start_abort from _commit_phase.",
+        strict=False,
+    )
+    def test_issue_1_commit_phase_must_not_start_abort(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        coordinator_path = repo_root / "order" / "coordinator" / "two_pc.py"
+        commit_phase = _extract_function_source(coordinator_path, "_commit_phase", "_abort_phase")
+        assert "_start_abort(" not in commit_phase, (
+            "Coordinator should not initiate ABORT once commit phase is in progress."
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.xfail(
+        reason="Payment commit/abort race allows both requests to return success.",
+        strict=False,
+    )
+    async def test_issue_2_payment_commit_abort_must_be_mutually_exclusive(self, client):
+        for attempt in range(120):
+            user_id = await create_user(client, 100)
+            txn_id = str(uuid.uuid4())
+            prepared = await client.post(f"{BASE}/payment/2pc/prepare/{txn_id}/{user_id}/40")
+            assert prepared.status_code == 200, prepared.text
+
+            await asyncio.sleep(random.random() * 0.01)
+            commit_response, abort_response = await asyncio.gather(
+                client.post(f"{BASE}/payment/2pc/commit/{txn_id}"),
+                client.post(f"{BASE}/payment/2pc/abort/{txn_id}"),
+            )
+
+            if commit_response.status_code == 200 and abort_response.status_code == 200:
+                credit = await get_credit(client, user_id)
+                pytest.fail(
+                    f"Attempt {attempt}: commit and abort both succeeded for txn {txn_id}; final credit={credit}"
+                )
+
+    @pytest.mark.anyio
+    @pytest.mark.xfail(
+        reason="Stock commit/abort race allows contradictory outcomes.",
+        strict=False,
+    )
+    async def test_issue_3_stock_commit_abort_must_be_mutually_exclusive(self, client):
+        item_id = await create_item(client, price=10, stock=5000)
+
+        for attempt in range(150):
+            txn_id = str(uuid.uuid4())
+            prepared = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/1")
+            assert prepared.status_code == 200, prepared.text
+
+            await asyncio.sleep(random.random() * 0.01)
+            commit_response, abort_response = await asyncio.gather(
+                client.post(f"{BASE}/stock/2pc/commit/{txn_id}/{item_id}/1"),
+                client.post(f"{BASE}/stock/2pc/abort/{txn_id}/{item_id}/1"),
+            )
+
+            if commit_response.status_code == 200 and abort_response.status_code == 200:
+                final_stock = await get_stock(client, item_id)
+                pytest.fail(
+                    f"Attempt {attempt}: commit and abort both succeeded for txn {txn_id}; stock={final_stock}"
+                )
+
+    @pytest.mark.anyio
+    @pytest.mark.xfail(
+        reason="Negative values are accepted in order/payment/stock paths.",
+        strict=False,
+    )
+    async def test_issue_4_negative_amounts_must_be_rejected(self, client):
+        user_id = await create_user(client, 100)
+        item_id = await create_item(client, price=5, stock=20)
+        order_id = await create_order(client, user_id)
+
+        add_negative_qty = await client.post(f"{BASE}/orders/addItem/{order_id}/{item_id}/-2")
+        assert 400 <= add_negative_qty.status_code < 500, (
+            f"Negative quantity accepted by order service: {add_negative_qty.status_code}"
+        )
+
+        pay_prepare_negative = await client.post(
+            f"{BASE}/payment/2pc/prepare/{uuid.uuid4()}/{user_id}/-10"
+        )
+        assert 400 <= pay_prepare_negative.status_code < 500, (
+            f"Negative prepare amount accepted by payment service: {pay_prepare_negative.status_code}"
+        )
+
+        stock_prepare_negative = await client.post(
+            f"{BASE}/stock/2pc/prepare/{uuid.uuid4()}/{item_id}/-3"
+        )
+        assert 400 <= stock_prepare_negative.status_code < 500, (
+            f"Negative prepare amount accepted by stock service: {stock_prepare_negative.status_code}"
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.xfail(
+        reason="Order remains mutable after it is paid.",
+        strict=False,
+    )
+    async def test_issue_5_paid_order_must_not_accept_new_items(self, client):
+        user_id = await create_user(client, 200)
+        item_id = await create_item(client, price=10, stock=20)
+        order_id = await create_order(client, user_id)
+        await add_item_to_order(client, order_id, item_id, qty=1)
+
+        checkout = await client.post(f"{BASE}/orders/checkout/{order_id}")
+        assert checkout.status_code == 200, checkout.text
+
+        add_after_paid = await client.post(f"{BASE}/orders/addItem/{order_id}/{item_id}/1")
+        assert 400 <= add_after_paid.status_code < 500, (
+            f"Paid order still accepted addItem: {add_after_paid.status_code}"
+        )
+
+    @pytest.mark.xfail(
+        reason="payment.get_prepare_record masks RedisError by returning None.",
+        strict=False,
+    )
+    def test_issue_6_get_prepare_record_should_not_mask_db_errors(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        payment_path = repo_root / "payment" / "app.py"
+        function_source = _extract_function_source(payment_path, "get_prepare_record", "save_prepare_record")
+        assert "except RedisError" in function_source
+        assert "raise HTTPException" in function_source, (
+            "get_prepare_record should propagate DB failures instead of returning None."
+        )
+
+    @pytest.mark.anyio
+    @pytest.mark.xfail(
+        reason="/payment/pay lock check is TOCTOU; pay and prepare can both succeed.",
+        strict=False,
+    )
+    async def test_issue_7_pay_and_prepare_should_not_both_succeed(self, client):
+        for attempt in range(120):
+            user_id = await create_user(client, 100)
+            txn_id = str(uuid.uuid4())
+
+            await asyncio.sleep(random.random() * 0.005)
+            pay_response, prepare_response = await asyncio.gather(
+                client.post(f"{BASE}/payment/pay/{user_id}/30"),
+                client.post(f"{BASE}/payment/2pc/prepare/{txn_id}/{user_id}/80"),
+            )
+
+            if pay_response.status_code == 200 and prepare_response.status_code == 200:
+                final_credit = await get_credit(client, user_id)
+                pytest.fail(
+                    f"Attempt {attempt}: /pay and /2pc/prepare both returned 200; final credit={final_credit}"
+                )
+
+    @pytest.mark.anyio
+    @pytest.mark.xfail(
+        reason="Stock prepare idempotency does not validate amount consistency.",
+        strict=False,
+    )
+    async def test_issue_8_prepare_replay_with_different_amount_must_fail(self, client):
+        item_id = await create_item(client, price=10, stock=20)
+        txn_id = str(uuid.uuid4())
+
+        first_prepare = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/1")
+        assert first_prepare.status_code == 200, first_prepare.text
+
+        mismatched_prepare = await client.post(f"{BASE}/stock/2pc/prepare/{txn_id}/{item_id}/3")
+        assert 400 <= mismatched_prepare.status_code < 500, (
+            f"prepare replay with amount mismatch unexpectedly succeeded: {mismatched_prepare.status_code}"
+        )
+
 
 class TestIntegrationCheckout:
 
