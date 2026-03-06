@@ -28,14 +28,14 @@ services:
 
   order-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
 
 
   stock-service:
     build: ./stock
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -45,13 +45,13 @@ services:
 
   stock-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
 
   payment-service:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
@@ -61,7 +61,7 @@ services:
 
   payment-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
 
 
@@ -75,7 +75,7 @@ services:
         echo 'Watchdog started - monitoring containers every 3 seconds';
         while true; do
           for svc in stock-service payment-service order-service gateway order-db stock-db payment-db; do
-            CONTAINER=$$(docker ps -a -q --filter name=dds_group12-$${svc}-1 --filter status=exited);
+            CONTAINER=$$(docker ps -a -q --filter label=com.docker.compose.service=$${svc} --filter status=exited | head -n 1);
             if [ -n \"$$CONTAINER\" ]; then
               echo \"Restarting $$svc...\";
               docker start $$CONTAINER;

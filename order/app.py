@@ -110,7 +110,13 @@ async def find_order(order_id: str):
 
 @app.post("/addItem/{order_id}/{item_id}/{quantity}")
 async def add_item(order_id: str, item_id: str, quantity: int):
+    if int(quantity) <= 0:
+        raise HTTPException(status_code=400, detail="Quantity must be greater than zero")
+
     order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
+    if order_entry.paid:
+        raise HTTPException(status_code=400, detail=f"Order: {order_id} is already paid")
+
     item_reply = await app.state.stock_client.find_item(item_id)
     if item_reply.status_code != 200:
         raise HTTPException(status_code=400, detail=f"Item: {item_id} does not exist!")
