@@ -111,21 +111,13 @@ async def _do_abort(rec: PrepareRecord):
                     raw = await pipe.get(rec.user_id)
                     if raw:
                         user: UserValue = msgpack.decode(raw, type=UserValue)
-                        if user.credit == rec.new_credit:
-                            user.credit = rec.old_credit
-                            pipe.multi()
-                            pipe.set(rec.user_id, msgpack.encode(user))
-                            rec.state = TXN_ABORTED
-                            pipe.set(txn_key(rec.txn_id), msgpack.encode(rec))
-                            await pipe.execute()
-                            return
-                        else:
-                            # Credit already different, just mark aborted
-                            pipe.multi()
-                            rec.state = TXN_ABORTED
-                            pipe.set(txn_key(rec.txn_id), msgpack.encode(rec))
-                            await pipe.execute()
-                            return
+                        user.credit += abs(rec.delta)  # always restore by delta
+                        pipe.multi()
+                        pipe.set(rec.user_id, msgpack.encode(user))
+                        rec.state = TXN_ABORTED
+                        pipe.set(txn_key(rec.txn_id), msgpack.encode(rec))
+                        await pipe.execute()
+                        return
                     else:
                         pipe.multi()
                         rec.state = TXN_ABORTED
@@ -297,6 +289,25 @@ async def add_credit(user_id: str, amount: int):
 @app.post('/pay/{user_id}/{amount}')
 async def remove_credit(user_id: str, amount: int):
     db = get_db()
+    # Block direct payments while a 2PC prepare is active for this user
+    try:
+        async for key in db.scan_iter("txn:*"):
+            raw = await db.get(key)
+            if raw:
+                try:
+                    rec = msgpack.decode(raw, type=PrepareRecord)
+                    if rec.user_id == user_id and rec.state == TXN_PREPARED:
+                        raise HTTPException(
+                            status_code=409,
+                            detail=f"User {user_id} has an active 2PC transaction in progress"
+                        )
+                except HTTPException:
+                    raise
+                except Exception:
+                    pass  # key belongs to a different type (e.g. stock txn), skip it
+    except RedisError:
+        raise HTTPException(status_code=400, detail=DB_ERROR_STR)
+
     user_entry: UserValue = await get_user_from_db(user_id)
     user_entry.credit -= int(amount)
     if user_entry.credit < 0:
