@@ -28,7 +28,7 @@ services:
 
   order-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
 
 
@@ -45,7 +45,7 @@ services:
 
   stock-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
 
   payment-service:
@@ -61,7 +61,7 @@ services:
 
   payment-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
 
 
