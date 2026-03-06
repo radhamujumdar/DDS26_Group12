@@ -138,6 +138,14 @@ async def checkout(order_id: str):
     return PlainTextResponse("Checkout successful", status_code=200)
 
 
+@app.get("/2pc/tx/{tx_id}")
+async def get_tx_state(tx_id: str):
+    tx = await app.state.coordinator.tx_repo.get(tx_id)
+    if tx is None:
+        raise HTTPException(status_code=400, detail=f"Transaction {tx_id} not found")
+    return {"tx_id": tx.tx_id, "state": tx.state}
+
+
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
 else:

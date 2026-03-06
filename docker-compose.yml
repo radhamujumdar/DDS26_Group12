@@ -35,6 +35,8 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
+    environment:
+      - GATEWAY_URL=http://gateway:80
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
@@ -51,6 +53,8 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
+    environment:
+      - GATEWAY_URL=http://gateway:80
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env

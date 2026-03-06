@@ -1,9 +1,12 @@
 import logging
 import os
 import uuid
+import asyncio
+from contextlib import suppress
 
 import redis.asyncio as redis
 from redis.exceptions import RedisError
+import httpx
 
 from msgspec import msgpack, Struct
 from fastapi import FastAPI, HTTPException
@@ -12,6 +15,9 @@ from contextlib import asynccontextmanager
 
 
 DB_ERROR_STR = "DB error"
+DEFAULT_GATEWAY_URL = "http://gateway:80"
+RECOVERY_INTERVAL_SECONDS = 2.0
+RECOVERY_STARTUP_DELAY_SECONDS = 1.0
 
 logger = logging.getLogger("payment-service")
 
@@ -51,6 +57,10 @@ def _validate_positive_amount(amount: int, field_name: str = "amount"):
         raise HTTPException(status_code=400, detail=f"{field_name} must be greater than zero")
 
 
+def _get_gateway_url() -> str:
+    return os.environ.get("GATEWAY_URL", DEFAULT_GATEWAY_URL).rstrip("/")
+
+
 # ─────────────────────────────────────────────
 # App + DB lifecycle
 # ─────────────────────────────────────────────
@@ -63,8 +73,15 @@ async def lifespan(the_app: FastAPI):
         password=os.environ['REDIS_PASSWORD'],
         db=int(os.environ['REDIS_DB']),
     )
+    the_app.state.gateway_url = _get_gateway_url()
+    the_app.state.gateway_client = httpx.AsyncClient(timeout=2.0)
+    the_app.state.recovery_task = asyncio.create_task(_recovery_loop())
     logger.info("[STARTUP] Payment service ready")
     yield
+    the_app.state.recovery_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await the_app.state.recovery_task
+    await the_app.state.gateway_client.aclose()
     await the_app.state.db.aclose()
     logger.info("[SHUTDOWN] Payment service stopped")
 
@@ -74,6 +91,99 @@ app = FastAPI(title="payment-service", lifespan=lifespan)
 
 def get_db() -> redis.Redis:
     return app.state.db
+
+
+async def _get_coordinator_tx_state(txn_id: str) -> str | None:
+    client: httpx.AsyncClient = app.state.gateway_client
+    gateway_url: str = app.state.gateway_url
+    try:
+        response = await client.get(f"{gateway_url}/orders/2pc/tx/{txn_id}")
+    except httpx.HTTPError:
+        return None
+
+    if response.status_code == 200:
+        payload = response.json()
+        return str(payload.get("state", ""))
+    if response.status_code == 400:
+        try:
+            detail = str(response.json().get("detail", "")).lower()
+        except ValueError:
+            detail = ""
+        if "not found" in detail:
+            return "UNKNOWN"
+    return None
+
+
+async def _list_prepared_txns() -> list[str]:
+    db = get_db()
+    prepared: list[str] = []
+    async for raw_key in db.scan_iter(match="txn:*"):
+        key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+        if key.startswith("txn:user:"):
+            continue
+
+        try:
+            raw_record = await db.get(key)
+        except RedisError:
+            continue
+        if raw_record is None:
+            continue
+
+        try:
+            record = msgpack.decode(raw_record, type=PrepareRecord)
+        except Exception:
+            continue
+
+        if record.state == TXN_PREPARED:
+            prepared.append(record.txn_id)
+    return prepared
+
+
+def _decision_action(coordinator_state: str | None) -> str | None:
+    if coordinator_state in {"COMMITTED", "COMMITTING"}:
+        return "commit"
+    if coordinator_state in {"ABORTED", "ABORTING", "UNKNOWN"}:
+        return "abort"
+    return None
+
+
+async def recover_prepared_transactions_once() -> int:
+    recovered = 0
+    pending = await _list_prepared_txns()
+    for txn_id in pending:
+        tx_state = await _get_coordinator_tx_state(txn_id)
+        action = _decision_action(tx_state)
+        if action is None:
+            continue
+
+        try:
+            if action == "commit":
+                await commit(txn_id)
+            else:
+                await abort_txn(txn_id)
+            recovered += 1
+            logger.info("[RECOVERY] finalized txn=%s action=%s coordinator_state=%s", txn_id, action, tx_state)
+        except HTTPException as exc:
+            logger.warning(
+                "[RECOVERY] failed txn=%s action=%s coordinator_state=%s detail=%s",
+                txn_id,
+                action,
+                tx_state,
+                exc.detail,
+            )
+    return recovered
+
+
+async def _recovery_loop():
+    await asyncio.sleep(RECOVERY_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            recovered = await recover_prepared_transactions_once()
+            if recovered:
+                logger.info("[RECOVERY] finalized_count=%s", recovered)
+        except Exception as exc:
+            logger.warning("[RECOVERY] loop_error=%s", exc)
+        await asyncio.sleep(RECOVERY_INTERVAL_SECONDS)
 
 
 # ─────────────────────────────────────────────

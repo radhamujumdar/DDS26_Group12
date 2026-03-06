@@ -1,9 +1,12 @@
 import logging
 import os
 import uuid
+import asyncio
+from contextlib import suppress
 
 import redis.asyncio as redis
 from redis.exceptions import RedisError, WatchError
+import httpx
 
 from msgspec import msgpack, Struct
 from fastapi import FastAPI, HTTPException
@@ -28,6 +31,9 @@ logger = logging.getLogger("stock-service")
 # ─────────────────────────────────────────────
 
 DB_ERROR_STR = "DB error"
+DEFAULT_GATEWAY_URL = "http://gateway:80"
+RECOVERY_INTERVAL_SECONDS = 2.0
+RECOVERY_STARTUP_DELAY_SECONDS = 1.0
 
 
 class StockValue(Struct):
@@ -55,6 +61,10 @@ def _validate_positive_amount(amount: int, field_name: str = "amount"):
         raise HTTPException(status_code=400, detail=f"{field_name} must be greater than zero")
 
 
+def _get_gateway_url() -> str:
+    return os.environ.get("GATEWAY_URL", DEFAULT_GATEWAY_URL).rstrip("/")
+
+
 # ─────────────────────────────────────────────
 # App + DB lifecycle
 # ─────────────────────────────────────────────
@@ -67,8 +77,15 @@ async def lifespan(the_app: FastAPI):
         password=os.environ['REDIS_PASSWORD'],
         db=int(os.environ['REDIS_DB']),
     )
+    the_app.state.gateway_url = _get_gateway_url()
+    the_app.state.gateway_client = httpx.AsyncClient(timeout=2.0)
+    the_app.state.recovery_task = asyncio.create_task(_recovery_loop())
     logger.info("[STARTUP] Stock service ready")
     yield
+    the_app.state.recovery_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await the_app.state.recovery_task
+    await the_app.state.gateway_client.aclose()
     await the_app.state.db.aclose()
     logger.info("[SHUTDOWN] Stock service stopped")
 
@@ -78,6 +95,111 @@ app = FastAPI(title="stock-service", lifespan=lifespan)
 
 def get_db() -> redis.Redis:
     return app.state.db
+
+
+async def _get_coordinator_tx_state(tx_id: str) -> str | None:
+    client: httpx.AsyncClient = app.state.gateway_client
+    gateway_url: str = app.state.gateway_url
+    try:
+        response = await client.get(f"{gateway_url}/orders/2pc/tx/{tx_id}")
+    except httpx.HTTPError:
+        return None
+
+    if response.status_code == 200:
+        payload = response.json()
+        return str(payload.get("state", ""))
+    if response.status_code == 400:
+        try:
+            detail = str(response.json().get("detail", "")).lower()
+        except ValueError:
+            detail = ""
+        if "not found" in detail:
+            return "UNKNOWN"
+    return None
+
+
+async def _list_prepared_reservations() -> list[Reservation]:
+    db = get_db()
+    prepared: list[Reservation] = []
+    async for raw_key in db.scan_iter(match="txn:*:*"):
+        key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+        if key.count(":") != 2:
+            continue
+
+        try:
+            raw_record = await db.get(key)
+        except RedisError:
+            continue
+        if raw_record is None:
+            continue
+
+        try:
+            reservation = msgpack.decode(raw_record, type=Reservation)
+        except Exception:
+            continue
+
+        if reservation.state == "prepared":
+            prepared.append(reservation)
+    return prepared
+
+
+def _decision_action(coordinator_state: str | None) -> str | None:
+    if coordinator_state in {"COMMITTED", "COMMITTING"}:
+        return "commit"
+    if coordinator_state in {"ABORTED", "ABORTING", "UNKNOWN"}:
+        return "abort"
+    return None
+
+
+async def recover_prepared_reservations_once() -> int:
+    recovered = 0
+    tx_state_cache: dict[str, str | None] = {}
+    pending = await _list_prepared_reservations()
+    for reservation in pending:
+        tx_state = tx_state_cache.get(reservation.tx_id)
+        if tx_state is None and reservation.tx_id not in tx_state_cache:
+            tx_state = await _get_coordinator_tx_state(reservation.tx_id)
+            tx_state_cache[reservation.tx_id] = tx_state
+
+        action = _decision_action(tx_state)
+        if action is None:
+            continue
+
+        try:
+            if action == "commit":
+                await commit(reservation.tx_id, reservation.item_id, reservation.amount)
+            else:
+                await abort_txn(reservation.tx_id, reservation.item_id, reservation.amount)
+            recovered += 1
+            logger.info(
+                "[RECOVERY] finalized tx=%s item=%s action=%s coordinator_state=%s",
+                reservation.tx_id,
+                reservation.item_id,
+                action,
+                tx_state,
+            )
+        except HTTPException as exc:
+            logger.warning(
+                "[RECOVERY] failed tx=%s item=%s action=%s coordinator_state=%s detail=%s",
+                reservation.tx_id,
+                reservation.item_id,
+                action,
+                tx_state,
+                exc.detail,
+            )
+    return recovered
+
+
+async def _recovery_loop():
+    await asyncio.sleep(RECOVERY_STARTUP_DELAY_SECONDS)
+    while True:
+        try:
+            recovered = await recover_prepared_reservations_once()
+            if recovered:
+                logger.info("[RECOVERY] finalized_count=%s", recovered)
+        except Exception as exc:
+            logger.warning("[RECOVERY] loop_error=%s", exc)
+        await asyncio.sleep(RECOVERY_INTERVAL_SECONDS)
 
 
 # ─────────────────────────────────────────────
