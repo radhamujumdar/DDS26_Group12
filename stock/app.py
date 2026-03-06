@@ -50,6 +50,11 @@ def reservation_key(tx_id: str, item_id: str) -> str:
     return f"txn:{tx_id}:{item_id}" # TODO: Do we need the item id in the identifier?
 
 
+def _validate_positive_amount(amount: int, field_name: str = "amount"):
+    if int(amount) <= 0:
+        raise HTTPException(status_code=400, detail=f"{field_name} must be greater than zero")
+
+
 # ─────────────────────────────────────────────
 # App + DB lifecycle
 # ─────────────────────────────────────────────
@@ -140,6 +145,7 @@ async def _do_abort(tx_id: str, item_id: str, res: Reservation) -> bool:
 
 @app.post('/item/create/{price}')
 async def create_item(price: int):
+    _validate_positive_amount(price, "price")
     db = get_db()
     key = str(uuid.uuid4())
     logger.debug(f"Item: {key} created")
@@ -153,6 +159,8 @@ async def create_item(price: int):
 
 @app.post('/batch_init/{n}/{starting_stock}/{item_price}')
 async def batch_init_users(n: int, starting_stock: int, item_price: int):
+    _validate_positive_amount(starting_stock, "starting_stock")
+    _validate_positive_amount(item_price, "item_price")
     db = get_db()
     n = int(n)
     starting_stock = int(starting_stock)
@@ -177,6 +185,7 @@ async def find_item(item_id: str):
 # TODO: Do we need locking for the item amounts?
 @app.post('/add/{item_id}/{amount}')
 async def add_stock(item_id: str, amount: int):
+    _validate_positive_amount(amount)
     db = get_db()
     item_entry: StockValue = await get_item_from_db(item_id)
     item_entry.stock += int(amount)
@@ -189,6 +198,7 @@ async def add_stock(item_id: str, amount: int):
 # TODO: Do we need locking for the item amounts?
 @app.post('/subtract/{item_id}/{amount}')
 async def remove_stock(item_id: str, amount: int):
+    _validate_positive_amount(amount)
     db = get_db()
     item_entry: StockValue = await get_item_from_db(item_id)
     item_entry.stock -= int(amount)
@@ -208,6 +218,7 @@ async def remove_stock(item_id: str, amount: int):
 
 @app.post('/2pc/prepare/{tx_id}/{item_id}/{amount}')
 async def prepare(tx_id: str, item_id: str, amount: int):
+    _validate_positive_amount(amount)
     db = get_db()
     logger.info(f"[PREPARE] START tx={tx_id} item={item_id} amount={amount}")
     rkey = reservation_key(tx_id, item_id)
@@ -221,6 +232,14 @@ async def prepare(tx_id: str, item_id: str, amount: int):
 
     if existing_raw is not None:
         existing: Reservation = msgpack.decode(existing_raw, type=Reservation)
+        if int(existing.amount) != int(amount):
+            logger.warning(
+                f"[PREPARE] AMOUNT_MISMATCH tx={tx_id} item={item_id} expected={existing.amount} got={amount}"
+            )
+            raise HTTPException(
+                status_code=400,
+                detail=f"Txn {tx_id}: prepare amount mismatch for item {item_id}",
+            )
         if existing.state == "prepared":
             logger.info(f"[PREPARE] IDEMPOTENT_YES tx={tx_id} item={item_id}")
             return {"status": "prepared"}
@@ -274,52 +293,75 @@ async def prepare(tx_id: str, item_id: str, amount: int):
 
 @app.post('/2pc/commit/{tx_id}/{item_id}/{amount}')
 async def commit(tx_id: str, item_id: str, amount: int):
+    _validate_positive_amount(amount)
     db = get_db()
     logger.info(f"[COMMIT] START tx={tx_id} item={item_id}")
     rkey = reservation_key(tx_id, item_id)
 
     try:
-        raw = await db.get(rkey)
+        async with db.pipeline(transaction=True) as pipe:
+            while True:
+                try:
+                    await pipe.watch(rkey)
+                    raw = await pipe.get(rkey)
+                    if raw is None:
+                        await pipe.unwatch()
+                        logger.warning(f"[COMMIT] NO_RESERVATION tx={tx_id} item={item_id}")
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Unknown transaction {tx_id} for item {item_id}",
+                        )
+
+                    res: Reservation = msgpack.decode(raw, type=Reservation)
+                    if int(amount) != int(res.amount):
+                        await pipe.unwatch()
+                        logger.error(
+                            f"[COMMIT] AMOUNT_MISMATCH tx={tx_id} item={item_id} expected={res.amount} got={amount}"
+                        )
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Txn {tx_id}: commit amount mismatch for item {item_id}",
+                        )
+
+                    if res.state == "committed":
+                        await pipe.unwatch()
+                        logger.info(f"[COMMIT] IDEMPOTENT tx={tx_id} item={item_id}")
+                        return {"status": "committed"}
+
+                    if res.state == "aborted":
+                        await pipe.unwatch()
+                        logger.error(f"[COMMIT] ALREADY_ABORTED tx={tx_id} item={item_id}")
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Txn {tx_id}: cannot commit, already aborted for item {item_id}",
+                        )
+
+                    if res.state != "prepared":
+                        await pipe.unwatch()
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"Txn {tx_id}: invalid state {res.state} for item {item_id}",
+                        )
+
+                    res.state = "committed"
+                    pipe.multi()
+                    pipe.set(rkey, msgpack.encode(res))
+                    await pipe.execute()
+
+                    logger.info(f"[COMMIT] SUCCESS tx={tx_id} item={item_id}")
+                    return {"status": "committed"}
+                except WatchError:
+                    continue
+    except HTTPException:
+        raise
     except RedisError:
         logger.error(f"[COMMIT] DB_ERROR tx={tx_id} item={item_id}")
         raise HTTPException(status_code=400, detail=DB_ERROR_STR)
-
-    if raw is None:
-        logger.warning(f"[COMMIT] NO_RESERVATION tx={tx_id} item={item_id}")
-        raise HTTPException(status_code=400, detail=f"Unknown transaction {tx_id} for item {item_id}")
-
-    res: Reservation = msgpack.decode(raw, type=Reservation)
-
-    if int(amount) != int(res.amount):
-        logger.error(
-            f"[COMMIT] AMOUNT_MISMATCH tx={tx_id} item={item_id} expected={res.amount} got={amount}"
-        )
-        raise HTTPException(
-            status_code=400,
-            detail=f"Txn {tx_id}: commit amount mismatch for item {item_id}",
-        )
-
-    if res.state == "committed":
-        logger.info(f"[COMMIT] IDEMPOTENT tx={tx_id} item={item_id}")
-        return {"status": "committed"}
-
-    if res.state == "aborted":
-        logger.error(f"[COMMIT] ALREADY_ABORTED tx={tx_id} item={item_id}")
-        raise HTTPException(status_code=400, detail=f"Txn {tx_id}: cannot commit, already aborted for item {item_id}")
-
-    res.state = "committed"
-    try:
-        await db.set(rkey, msgpack.encode(res))
-    except RedisError:
-        logger.error(f"[COMMIT] DB_ERROR tx={tx_id} item={item_id}")
-        raise HTTPException(status_code=400, detail=DB_ERROR_STR)
-
-    logger.info(f"[COMMIT] SUCCESS tx={tx_id} item={item_id}")
-    return {"status": "committed"}
 
 
 @app.post('/2pc/abort/{tx_id}/{item_id}/{amount}')
 async def abort_txn(tx_id: str, item_id: str, amount: int):
+    _validate_positive_amount(amount)
     logger.info(f"[ABORT] START tx={tx_id} item={item_id}")
     rkey = reservation_key(tx_id, item_id)
     db = get_db()

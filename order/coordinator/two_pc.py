@@ -188,7 +188,11 @@ class TwoPCCoordinator:
                 item_id=item_id,
             )
             if not result.ok:
-                return await self._start_abort(tx.tx_id, result.detail or f"Stock commit failed for item {item_id}")
+                return await self.tx_repo.update(
+                    tx.tx_id,
+                    state=TxState.COMMITTING.value,
+                    error=result.detail or f"Stock commit failed for item {item_id}",
+                )
             committed_items.append((item_id, amount))
             tx = await self.tx_repo.update(
                 tx.tx_id,
@@ -205,14 +209,18 @@ class TwoPCCoordinator:
                 participant="payment",
             )
             if not result.ok:
-                return await self._start_abort(tx.tx_id, result.detail or "Payment commit failed")
+                return await self.tx_repo.update(
+                    tx.tx_id,
+                    state=TxState.COMMITTING.value,
+                    error=result.detail or "Payment commit failed",
+                )
             tx = await self.tx_repo.update(
                 tx.tx_id,
                 payment_committed=True,
                 attempts=tx.attempts + 1,
             )
 
-        tx = await self._transition_state(tx, TxState.COMMITTED)
+        tx = await self._transition_state(tx, TxState.COMMITTED, error=None)
         await self.order_repo.mark_paid(tx.order_id)
         await self.tx_repo.remove_active(tx.tx_id)
         self._log("tx_terminal", tx_id=tx.tx_id, order_id=tx.order_id, tx_state=tx.state)

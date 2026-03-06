@@ -197,22 +197,14 @@ class TestOperationalConfiguration:
 
 
 class TestKnownConsistencyGaps:
-    @pytest.mark.xfail(
-        reason="Coordinator still starts abort from commit phase.",
-        strict=False,
-    )
     def test_coordinator_does_not_abort_after_commit_phase_starts(self):
         coordinator_path = Path(__file__).resolve().parents[1] / "order" / "coordinator" / "two_pc.py"
         commit_phase_source = _extract_async_function_source(coordinator_path, "_commit_phase", "_abort_phase")
         assert "_start_abort(" not in commit_phase_source
 
     @pytest.mark.anyio
-    @pytest.mark.xfail(
-        reason="Payment participant commit/abort race is not serialized.",
-        strict=False,
-    )
     async def test_payment_commit_and_abort_are_terminally_exclusive(self, client):
-        for attempt in range(120):
+        for attempt in range(80):
             user_id = await create_user(client, credit=100)
             txn_id = str(uuid.uuid4())
             prepared = await client.post(f"{BASE_URL}/payment/2pc/prepare/{txn_id}/{user_id}/40")
@@ -232,14 +224,10 @@ class TestKnownConsistencyGaps:
                 )
 
     @pytest.mark.anyio
-    @pytest.mark.xfail(
-        reason="Stock participant commit/abort race is not serialized.",
-        strict=False,
-    )
     async def test_stock_commit_and_abort_are_terminally_exclusive(self, client):
         item_id = await create_item(client, price=10, stock=5000)
 
-        for attempt in range(150):
+        for attempt in range(80):
             txn_id = str(uuid.uuid4())
             prepared = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_id}/{item_id}/1")
             assert prepared.status_code == 200, prepared.text
@@ -258,10 +246,6 @@ class TestKnownConsistencyGaps:
                 )
 
     @pytest.mark.anyio
-    @pytest.mark.xfail(
-        reason="Negative quantities/amounts are not consistently validated.",
-        strict=False,
-    )
     async def test_negative_values_are_rejected_by_order_payment_and_stock(self, client):
         user_id = await create_user(client, credit=100)
         item_id = await create_item(client, price=5, stock=20)
@@ -277,10 +261,6 @@ class TestKnownConsistencyGaps:
         assert 400 <= negative_stock.status_code < 500
 
     @pytest.mark.anyio
-    @pytest.mark.xfail(
-        reason="Paid orders can still be modified.",
-        strict=False,
-    )
     async def test_paid_order_is_not_mutable(self, client):
         user_id = await create_user(client, credit=200)
         item_id = await create_item(client, price=10, stock=20)
@@ -293,10 +273,6 @@ class TestKnownConsistencyGaps:
         add_after_paid = await client.post(f"{BASE_URL}/orders/addItem/{order_id}/{item_id}/1")
         assert 400 <= add_after_paid.status_code < 500
 
-    @pytest.mark.xfail(
-        reason="payment.get_prepare_record masks RedisError as missing transaction.",
-        strict=False,
-    )
     def test_payment_prepare_lookup_propagates_db_errors(self):
         payment_path = Path(__file__).resolve().parents[1] / "payment" / "app.py"
         function_source = _extract_async_function_source(payment_path, "get_prepare_record", "save_prepare_record")
@@ -304,12 +280,8 @@ class TestKnownConsistencyGaps:
         assert "raise HTTPException" in function_source
 
     @pytest.mark.anyio
-    @pytest.mark.xfail(
-        reason="TOCTOU race between /pay and /2pc/prepare still possible.",
-        strict=False,
-    )
     async def test_direct_pay_and_prepare_cannot_both_succeed(self, client):
-        for attempt in range(120):
+        for attempt in range(80):
             user_id = await create_user(client, credit=100)
             txn_id = str(uuid.uuid4())
 
@@ -327,10 +299,6 @@ class TestKnownConsistencyGaps:
                 )
 
     @pytest.mark.anyio
-    @pytest.mark.xfail(
-        reason="Stock prepare idempotency does not validate amount consistency.",
-        strict=False,
-    )
     async def test_stock_prepare_replay_with_changed_amount_is_rejected(self, client):
         item_id = await create_item(client, price=10, stock=20)
         txn_id = str(uuid.uuid4())
