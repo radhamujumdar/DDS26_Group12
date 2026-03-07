@@ -286,6 +286,36 @@ class TestKnownConsistencyGaps:
         assert "raise HTTPException" in function_source
         assert "except HTTPException" not in function_source
 
+    def test_stock_prepare_watches_reservation_key_and_rechecks_inside_watch_loop(self):
+        stock_path = Path(__file__).resolve().parents[1] / "stock" / "repository" / "stock_repo.py"
+        function_source = _extract_async_function_source(stock_path, "prepare_reservation", "commit_reservation")
+        assert "await pipe.watch(item_id, rkey)" in function_source
+        assert "existing_raw = await pipe.get(rkey)" in function_source
+
+    def test_payment_prepare_watches_tx_key_and_rechecks_inside_watch_loop(self):
+        payment_path = Path(__file__).resolve().parents[1] / "payment" / "repository" / "payment_repo.py"
+        function_source = _extract_async_function_source(payment_path, "prepare_transaction", "commit_transaction")
+        assert "await pipe.watch(user_id, tx_key)" in function_source
+        assert "existing_raw = await pipe.get(tx_key)" in function_source
+
+    def test_saga_tx_lock_is_token_based_and_release_is_compare_delete(self):
+        saga_repo_path = Path(__file__).resolve().parents[1] / "order" / "repository" / "saga_repo.py"
+        source = saga_repo_path.read_text(encoding="utf-8")
+        assert "async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 30) -> str | None:" in source
+        assert "token = str(uuid.uuid4())" in source
+        assert "async def release_tx_lock(self, tx_id: str, token: str) -> bool:" in source
+        assert "if self._decode_str(current) != token:" in source
+
+    def test_recovery_loops_use_leader_lease_guard(self):
+        payment_source = (
+            Path(__file__).resolve().parents[1] / "payment" / "services" / "recovery_service.py"
+        ).read_text(encoding="utf-8")
+        stock_source = (
+            Path(__file__).resolve().parents[1] / "stock" / "services" / "recovery_service.py"
+        ).read_text(encoding="utf-8")
+        assert "is_leader = await self._acquire_or_renew_leadership()" in payment_source
+        assert "is_leader = await self._acquire_or_renew_leadership()" in stock_source
+
     @pytest.mark.anyio
     async def test_direct_pay_and_prepare_cannot_both_succeed(self, client):
         for attempt in range(80):

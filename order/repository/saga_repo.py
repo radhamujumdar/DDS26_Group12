@@ -32,6 +32,14 @@ class SagaTxRepository:
     def _tx_order_create_lock_key(self, order_id: str) -> str:
         return f"{self.TX_ORDER_CREATE_LOCK_PREFIX}{order_id}"
 
+    @staticmethod
+    def _decode_str(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode()
+        return str(value)
+
     async def create(
         self,
         order_id: str,
@@ -185,16 +193,54 @@ class SagaTxRepository:
         except redis.exceptions.RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
-    async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 30) -> bool:
+    async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 30) -> str | None:
+        token = str(uuid.uuid4())
         try:
-            was_set = await self.db.set(self._tx_lock_key(tx_id), "1", nx=True, ex=ttl_seconds)
+            was_set = await self.db.set(self._tx_lock_key(tx_id), token, nx=True, ex=ttl_seconds)
         except redis.exceptions.RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
-        return bool(was_set)
+        return token if was_set else None
 
-    async def release_tx_lock(self, tx_id: str):
+    async def renew_tx_lock(self, tx_id: str, token: str, ttl_seconds: int = 30) -> bool:
+        lock_key = self._tx_lock_key(tx_id)
         try:
-            await self.db.delete(self._tx_lock_key(tx_id))
+            async with self.db.pipeline(transaction=True) as pipe:
+                while True:
+                    try:
+                        await pipe.watch(lock_key)
+                        current = await pipe.get(lock_key)
+                        if self._decode_str(current) != token:
+                            await pipe.unwatch()
+                            return False
+                        pipe.multi()
+                        pipe.expire(lock_key, ttl_seconds)
+                        await pipe.execute()
+                        return True
+                    except redis.WatchError:
+                        continue
+        except redis.exceptions.RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+
+    async def release_tx_lock(self, tx_id: str, token: str) -> bool:
+        lock_key = self._tx_lock_key(tx_id)
+        try:
+            async with self.db.pipeline(transaction=True) as pipe:
+                while True:
+                    try:
+                        await pipe.watch(lock_key)
+                        current = await pipe.get(lock_key)
+                        if current is None:
+                            await pipe.unwatch()
+                            return False
+                        if self._decode_str(current) != token:
+                            await pipe.unwatch()
+                            return False
+                        pipe.multi()
+                        pipe.delete(lock_key)
+                        await pipe.execute()
+                        return True
+                    except redis.WatchError:
+                        continue
         except redis.exceptions.RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 

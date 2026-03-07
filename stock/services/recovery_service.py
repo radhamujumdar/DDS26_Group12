@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import socket
 
 import httpx
 from fastapi import HTTPException
@@ -18,12 +20,21 @@ class StockRecoveryService:
         gateway_client: httpx.AsyncClient,
         gateway_url: str,
         logger: logging.Logger,
+        enable_loop: bool = True,
+        lease_key: str = "stock:recovery:lease",
+        lease_ttl_seconds: int = 10,
+        owner_id: str | None = None,
     ):
         self.repo = repo
         self.stock_service = stock_service
         self.gateway_client = gateway_client
         self.gateway_url = gateway_url
         self.logger = logger
+        self.enable_loop = bool(enable_loop)
+        self.lease_key = lease_key
+        self.lease_ttl_seconds = int(lease_ttl_seconds)
+        self.owner_id = owner_id or f"{socket.gethostname()}-{os.getpid()}"
+        self._is_leader = False
 
     async def recover_once(self) -> int:
         recovered = 0
@@ -79,14 +90,52 @@ class StockRecoveryService:
 
     async def run_loop(self, startup_delay_seconds: float, interval_seconds: float):
         await asyncio.sleep(startup_delay_seconds)
+        if not self.enable_loop:
+            self._log("recovery_disabled")
+            return
+
         while True:
             try:
+                is_leader = await self._acquire_or_renew_leadership()
+                if is_leader and not self._is_leader:
+                    self._log("recovery_leader_acquired", lease_key=self.lease_key, owner_id=self.owner_id)
+                if not is_leader and self._is_leader:
+                    self._log(
+                        "recovery_leader_lost",
+                        level="warning",
+                        lease_key=self.lease_key,
+                        owner_id=self.owner_id,
+                    )
+                self._is_leader = is_leader
+                if not is_leader:
+                    await asyncio.sleep(min(interval_seconds, 1.0))
+                    continue
+
                 recovered_count = await self.recover_once()
                 if recovered_count:
                     self._log("recovery_pass_complete", recovered_count=recovered_count)
             except Exception as exc:
                 self._log("recovery_loop_failed", level="warning", detail=str(exc))
             await asyncio.sleep(interval_seconds)
+
+    async def _acquire_or_renew_leadership(self) -> bool:
+        try:
+            current_owner = await self.repo.db.get(self.lease_key)
+            if self._decode(current_owner) == self.owner_id:
+                await self.repo.db.expire(self.lease_key, self.lease_ttl_seconds)
+                return True
+            if current_owner is None:
+                acquired = await self.repo.db.set(
+                    self.lease_key,
+                    self.owner_id,
+                    nx=True,
+                    ex=self.lease_ttl_seconds,
+                )
+                return bool(acquired)
+            return False
+        except Exception as exc:
+            self._log("recovery_leader_check_failed", level="warning", detail=str(exc))
+            return False
 
     async def _get_coordinator_tx_state(self, tx_id: str) -> str | None:
         try:
@@ -125,3 +174,11 @@ class StockRecoveryService:
             component="recovery",
             **fields,
         )
+
+    @staticmethod
+    def _decode(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode()
+        return str(value)

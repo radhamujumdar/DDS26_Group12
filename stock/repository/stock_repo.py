@@ -100,28 +100,31 @@ class StockRepository:
     async def prepare_reservation(self, tx_id: str, item_id: str, amount: int) -> str:
         rkey = reservation_key(tx_id, item_id)
         try:
-            existing_raw = await self.db.get(rkey)
-        except RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
-
-        if existing_raw is not None:
-            existing = self._decode_reservation(existing_raw)
-            if int(existing.amount) != int(amount):
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Txn {tx_id}: prepare amount mismatch for item {item_id}",
-                )
-            if existing.state == ReservationState.PREPARED:
-                return ReservationState.PREPARED.value
-            if existing.state == ReservationState.COMMITTED:
-                return "already committed"
-            raise HTTPException(status_code=400, detail=f"Txn {tx_id}: previously aborted for item {item_id}")
-
-        try:
             async with self.db.pipeline(transaction=True) as pipe:
                 while True:
                     try:
-                        await pipe.watch(item_id)
+                        await pipe.watch(item_id, rkey)
+                        existing_raw = await pipe.get(rkey)
+                        if existing_raw is not None:
+                            existing = self._decode_reservation(existing_raw)
+                            if int(existing.amount) != int(amount):
+                                await pipe.unwatch()
+                                raise HTTPException(
+                                    status_code=400,
+                                    detail=f"Txn {tx_id}: prepare amount mismatch for item {item_id}",
+                                )
+                            if existing.state == ReservationState.PREPARED:
+                                await pipe.unwatch()
+                                return ReservationState.PREPARED.value
+                            if existing.state == ReservationState.COMMITTED:
+                                await pipe.unwatch()
+                                return "already committed"
+                            await pipe.unwatch()
+                            raise HTTPException(
+                                status_code=400,
+                                detail=f"Txn {tx_id}: previously aborted for item {item_id}",
+                            )
+
                         item_raw = await pipe.get(item_id)
                         if item_raw is None:
                             await pipe.unwatch()

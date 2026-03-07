@@ -3,6 +3,7 @@ import logging
 import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 
 from fastapi import HTTPException
 
@@ -19,6 +20,8 @@ class SagaCoordinator:
     RETRY_BACKOFF_SECONDS = 0.2
     IN_FLIGHT_WAIT_SECONDS = 5.0
     IN_FLIGHT_POLL_SECONDS = 0.1
+    TX_LOCK_TTL_SECONDS = 30
+    TX_LOCK_RENEW_INTERVAL_SECONDS = 10.0
 
     def __init__(
         self,
@@ -88,8 +91,8 @@ class SagaCoordinator:
                 self._log("recovery_tx_processed", tx_id=tx.tx_id, order_id=tx.order_id, tx_state=tx.state)
 
     async def _process_transaction(self, tx_id: str, from_recovery: bool = False) -> SagaTxRecord:
-        acquired = await self.saga_repo.acquire_tx_lock(tx_id)
-        if not acquired:
+        lock_token = await self.saga_repo.acquire_tx_lock(tx_id, ttl_seconds=self.TX_LOCK_TTL_SECONDS)
+        if lock_token is None:
             if from_recovery:
                 tx = await self.saga_repo.get(tx_id)
                 if tx is None:
@@ -105,6 +108,7 @@ class SagaCoordinator:
             self._log("tx_lock_wait_timeout", level="warning", tx_id=tx_id)
             raise HTTPException(status_code=400, detail=f"Saga transaction {tx_id} is already in progress")
 
+        renew_task = asyncio.create_task(self._renew_tx_lock_loop(tx_id, lock_token))
         try:
             tx = await self.saga_repo.get(tx_id)
             if tx is None:
@@ -125,7 +129,12 @@ class SagaCoordinator:
 
             return await self._forward_phase(tx)
         finally:
-            await self.saga_repo.release_tx_lock(tx_id)
+            renew_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await renew_task
+            released = await self.saga_repo.release_tx_lock(tx_id, lock_token)
+            if not released:
+                self._log("tx_lock_release_skipped_not_owner", level="warning", tx_id=tx_id)
 
     async def _forward_phase(self, tx: SagaTxRecord) -> SagaTxRecord:
         tx = await self._transition_state(tx, SagaState.RESERVING_STOCK)
@@ -342,6 +351,18 @@ class SagaCoordinator:
             detail=error,
         )
         return updated
+
+    async def _renew_tx_lock_loop(self, tx_id: str, token: str):
+        while True:
+            await asyncio.sleep(self.TX_LOCK_RENEW_INTERVAL_SECONDS)
+            renewed = await self.saga_repo.renew_tx_lock(
+                tx_id,
+                token,
+                ttl_seconds=self.TX_LOCK_TTL_SECONDS,
+            )
+            if not renewed:
+                self._log("tx_lock_lost", level="warning", tx_id=tx_id)
+                return
 
     def _log(self, event: str, level: str = "info", **fields):
         log_event(

@@ -35,6 +35,10 @@ async def lifespan(the_app: FastAPI):
         gateway_client=gateway_client,
         gateway_url=config.gateway_url,
         logger=logger,
+        enable_loop=config.enable_recovery_loop,
+        lease_key=config.recovery_lease_key,
+        lease_ttl_seconds=config.recovery_lease_ttl_seconds,
+        owner_id=config.recovery_owner_id,
     )
     saga_broker_db: Redis | None = None
     saga_worker_task: asyncio.Task | None = None

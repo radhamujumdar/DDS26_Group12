@@ -5,6 +5,9 @@ from dataclasses import dataclass
 DEFAULT_GATEWAY_URL = "http://gateway:80"
 DEFAULT_RECOVERY_INTERVAL_SECONDS = 2.0
 DEFAULT_RECOVERY_STARTUP_DELAY_SECONDS = 1.0
+DEFAULT_ENABLE_RECOVERY_LOOP = True
+DEFAULT_RECOVERY_LEASE_KEY = "stock:recovery:lease"
+DEFAULT_RECOVERY_LEASE_TTL_SECONDS = 10
 DEFAULT_SAGA_MQ_ENABLED = True
 DEFAULT_SAGA_MQ_STREAM_PARTITIONS = 4
 DEFAULT_SAGA_MQ_BLOCK_MS = 1000
@@ -30,6 +33,10 @@ class StockConfig:
     gateway_url: str
     recovery_interval_seconds: float
     recovery_startup_delay_seconds: float
+    enable_recovery_loop: bool
+    recovery_lease_key: str
+    recovery_lease_ttl_seconds: int
+    recovery_owner_id: str | None
     saga_mq_enabled: bool
     enable_saga_worker: bool
     saga_mq_redis_host: str
@@ -57,6 +64,12 @@ class StockConfig:
             recovery_startup_delay_seconds=float(
                 os.environ.get("RECOVERY_STARTUP_DELAY_SECONDS", DEFAULT_RECOVERY_STARTUP_DELAY_SECONDS)
             ),
+            enable_recovery_loop=_read_bool_env("ENABLE_RECOVERY_LOOP", DEFAULT_ENABLE_RECOVERY_LOOP),
+            recovery_lease_key=os.environ.get("RECOVERY_LEASE_KEY", DEFAULT_RECOVERY_LEASE_KEY),
+            recovery_lease_ttl_seconds=int(
+                os.environ.get("RECOVERY_LEASE_TTL_SECONDS", DEFAULT_RECOVERY_LEASE_TTL_SECONDS)
+            ),
+            recovery_owner_id=os.environ.get("RECOVERY_OWNER_ID"),
             saga_mq_enabled=_read_bool_env("SAGA_MQ_ENABLED", DEFAULT_SAGA_MQ_ENABLED),
             enable_saga_worker=_read_bool_env("ENABLE_SAGA_WORKER", True),
             saga_mq_redis_host=os.environ.get("SAGA_MQ_REDIS_HOST", os.environ["REDIS_HOST"]),

@@ -93,33 +93,24 @@ class PaymentRepository:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def prepare_transaction(self, txn_id: str, user_id: str, amount: int) -> PrepareRecord:
-        existing = await self.get_prepare_record(txn_id)
-        if existing is not None:
-            if existing.user_id != user_id or int(existing.delta) != -int(amount):
-                raise HTTPException(status_code=400, detail=f"Transaction {txn_id} parameters mismatch")
-            if existing.state == TxnState.ABORTED:
-                raise HTTPException(status_code=400, detail=f"Insufficient credit for user {user_id}")
-            return existing
-
-        user = await self.get_user_or_error(user_id)
-        proposed_credit = user.credit - int(amount)
-        if proposed_credit < 0:
-            rec = PrepareRecord(
-                txn_id=txn_id,
-                user_id=user_id,
-                delta=-int(amount),
-                old_credit=user.credit,
-                new_credit=user.credit,
-                state=TxnState.ABORTED,
-            )
-            await self.save_prepare_record(rec)
-            raise HTTPException(status_code=400, detail=f"Insufficient credit for user {user_id}")
-
+        tx_key = txn_key(txn_id)
         try:
             async with self.db.pipeline(transaction=True) as pipe:
                 while True:
                     try:
-                        await pipe.watch(user_id)
+                        await pipe.watch(user_id, tx_key)
+                        existing_raw = await pipe.get(tx_key)
+                        if existing_raw is not None:
+                            existing = self._decode_prepare(existing_raw)
+                            if existing.user_id != user_id or int(existing.delta) != -int(amount):
+                                await pipe.unwatch()
+                                raise HTTPException(status_code=400, detail=f"Transaction {txn_id} parameters mismatch")
+                            if existing.state == TxnState.ABORTED:
+                                await pipe.unwatch()
+                                raise HTTPException(status_code=400, detail=f"Insufficient credit for user {user_id}")
+                            await pipe.unwatch()
+                            return existing
+
                         raw = await pipe.get(user_id)
                         if raw is None:
                             await pipe.unwatch()
@@ -128,7 +119,6 @@ class PaymentRepository:
                         current_user = self._decode_user(raw)
                         actual_new_credit = current_user.credit - int(amount)
                         if actual_new_credit < 0:
-                            await pipe.unwatch()
                             rec = PrepareRecord(
                                 txn_id=txn_id,
                                 user_id=user_id,
@@ -137,7 +127,9 @@ class PaymentRepository:
                                 new_credit=current_user.credit,
                                 state=TxnState.ABORTED,
                             )
-                            await self.save_prepare_record(rec)
+                            pipe.multi()
+                            pipe.set(tx_key, msgpack.encode(rec))
+                            await pipe.execute()
                             raise HTTPException(status_code=400, detail=f"Insufficient credit for user {user_id}")
 
                         rec = PrepareRecord(
@@ -150,7 +142,7 @@ class PaymentRepository:
                         )
                         pipe.multi()
                         pipe.set(user_id, msgpack.encode(UserValue(credit=actual_new_credit)))
-                        pipe.set(txn_key(txn_id), msgpack.encode(rec))
+                        pipe.set(tx_key, msgpack.encode(rec))
                         pipe.sadd(prepared_user_key(user_id), txn_id)
                         await pipe.execute()
                         return rec
