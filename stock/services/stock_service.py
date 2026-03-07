@@ -131,6 +131,22 @@ class StockService:
             )
             raise
 
+    async def saga_reserve(self, tx_id: str, item_id: str, amount: int) -> dict:
+        self._require_positive(amount, "amount")
+        self._log("saga_reserve_todo", level="warning", tx_id=tx_id, item_id=item_id, amount=amount)
+        raise HTTPException(
+            status_code=400,
+            detail="TODO: implement /saga/reserve/{tx_id}/{item_id}/{amount} with durable idempotent reserve/subtract",
+        )
+
+    async def saga_release(self, tx_id: str, item_id: str, amount: int) -> dict:
+        self._require_positive(amount, "amount")
+        self._log("saga_release_todo", level="warning", tx_id=tx_id, item_id=item_id, amount=amount)
+        raise HTTPException(
+            status_code=400,
+            detail="TODO: implement /saga/release/{tx_id}/{item_id}/{amount} with durable idempotent release/restock",
+        )
+
     async def list_prepared_reservations(self):
         return await self.repo.list_prepared_reservations()
 

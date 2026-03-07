@@ -90,3 +90,23 @@ async def abort_txn(
     service: StockService = Depends(get_stock_service),
 ):
     return await service.abort(tx_id=tx_id, item_id=item_id, amount=amount)
+
+
+@router.post("/saga/reserve/{tx_id}/{item_id}/{amount}")
+async def saga_reserve(
+    tx_id: NonEmptyStr,
+    item_id: NonEmptyStr,
+    amount: IntValue,
+    service: StockService = Depends(get_stock_service),
+):
+    return await service.saga_reserve(tx_id=tx_id, item_id=item_id, amount=amount)
+
+
+@router.post("/saga/release/{tx_id}/{item_id}/{amount}")
+async def saga_release(
+    tx_id: NonEmptyStr,
+    item_id: NonEmptyStr,
+    amount: IntValue,
+    service: StockService = Depends(get_stock_service),
+):
+    return await service.saga_release(tx_id=tx_id, item_id=item_id, amount=amount)
