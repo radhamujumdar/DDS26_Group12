@@ -24,6 +24,14 @@ class StockClient:
         response = await self._safe_post(f"/2pc/abort/{tx_id}/{item_id}/{amount}")
         return self._status_to_result(response)
 
+    async def saga_reserve_item(self, tx_id: str, item_id: str, amount: int) -> ParticipantResult:
+        response = await self._safe_post(f"/saga/reserve/{tx_id}/{item_id}/{amount}")
+        return self._status_to_result(response)
+
+    async def saga_release_item(self, tx_id: str, item_id: str, amount: int) -> ParticipantResult:
+        response = await self._safe_post(f"/saga/release/{tx_id}/{item_id}/{amount}")
+        return self._status_to_result(response)
+
     @staticmethod
     def _status_to_result(response: httpx.Response) -> ParticipantResult:
         if response.status_code == 200:

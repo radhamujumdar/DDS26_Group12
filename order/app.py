@@ -12,19 +12,25 @@ from redis.asyncio import Redis
 
 from clients.payment_client import PaymentClient
 from clients.stock_client import StockClient
+from coordinator.saga import SagaCoordinator
 from coordinator.two_pc import TwoPCCoordinator
 from logging_utils import log_event
-from models import OrderValue
+from models import OrderValue, TxMode
 from repository.order_repo import OrderRepository
+from repository.saga_repo import SagaTxRepository
 from repository.tx_repo import TxRepository
 
 
 GATEWAY_URL = os.environ["GATEWAY_URL"]
+TX_MODE = os.environ.get("TX_MODE", TxMode.TWO_PC.value).lower()
 logger = logging.getLogger("order-service")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if TX_MODE not in (TxMode.TWO_PC.value, TxMode.SAGA.value):
+        raise RuntimeError(f"Unsupported TX_MODE={TX_MODE}. Expected one of: 2pc, saga")
+
     db = Redis(
         host=os.environ["REDIS_HOST"],
         port=int(os.environ["REDIS_PORT"]),
@@ -35,9 +41,11 @@ async def lifespan(app: FastAPI):
     stock_client = StockClient(http_client, GATEWAY_URL)
     payment_client = PaymentClient(http_client, GATEWAY_URL)
     tx_repo = TxRepository(db)
+    saga_repo = SagaTxRepository(db)
 
     app.state.order_repo = OrderRepository(db)
     app.state.stock_client = stock_client
+    app.state.tx_mode = TX_MODE
     app.state.coordinator = TwoPCCoordinator(
         stock_client=stock_client,
         payment_client=payment_client,
@@ -45,9 +53,19 @@ async def lifespan(app: FastAPI):
         order_repo=app.state.order_repo,
         logger=logger,
     )
+    app.state.saga_coordinator = SagaCoordinator(
+        stock_client=stock_client,
+        payment_client=payment_client,
+        saga_repo=saga_repo,
+        order_repo=app.state.order_repo,
+        logger=logger,
+    )
     try:
         log_event(logger, "startup_recovery_begin", service="order-service")
-        await app.state.coordinator.recover_active_transactions()
+        if app.state.tx_mode == TxMode.SAGA.value:
+            await app.state.saga_coordinator.recover_active_transactions()
+        else:
+            await app.state.coordinator.recover_active_transactions()
         log_event(logger, "startup_recovery_complete", service="order-service")
     except HTTPException as exc:
         log_event(
@@ -134,7 +152,10 @@ async def add_item(order_id: str, item_id: str, quantity: int):
 @app.post("/checkout/{order_id}")
 async def checkout(order_id: str):
     order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
-    await app.state.coordinator.checkout(order_id, order_entry)
+    if app.state.tx_mode == TxMode.SAGA.value:
+        await app.state.saga_coordinator.checkout(order_id, order_entry)
+    else:
+        await app.state.coordinator.checkout(order_id, order_entry)
     return PlainTextResponse("Checkout successful", status_code=200)
 
 
@@ -143,6 +164,14 @@ async def get_tx_state(tx_id: str):
     tx = await app.state.coordinator.tx_repo.get(tx_id)
     if tx is None:
         raise HTTPException(status_code=400, detail=f"Transaction {tx_id} not found")
+    return {"tx_id": tx.tx_id, "state": tx.state}
+
+
+@app.get("/saga/tx/{tx_id}")
+async def get_saga_tx_state(tx_id: str):
+    tx = await app.state.saga_coordinator.saga_repo.get(tx_id)
+    if tx is None:
+        raise HTTPException(status_code=400, detail=f"Saga transaction {tx_id} not found")
     return {"tx_id": tx.tx_id, "state": tx.state}
 
 

@@ -21,6 +21,14 @@ class PaymentClient:
         response = await self._safe_post(f"/2pc/abort/{tx_id}")
         return self._status_to_result(response)
 
+    async def saga_debit(self, tx_id: str, user_id: str, amount: int) -> ParticipantResult:
+        response = await self._safe_post(f"/saga/debit/{tx_id}/{user_id}/{amount}")
+        return self._status_to_result(response)
+
+    async def saga_refund(self, tx_id: str) -> ParticipantResult:
+        response = await self._safe_post(f"/saga/refund/{tx_id}")
+        return self._status_to_result(response)
+
     @staticmethod
     def _status_to_result(response: httpx.Response) -> ParticipantResult:
         if response.status_code == 200:

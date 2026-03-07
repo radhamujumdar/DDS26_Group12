@@ -18,6 +18,7 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - TX_MODE=${TX_MODE:-2pc}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
