@@ -18,11 +18,28 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - TX_MODE=${TX_MODE:-2pc}
+      - ENABLE_ORDER_DISPATCHER=${ENABLE_ORDER_DISPATCHER:-true}
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
+      - SAGA_MQ_RESPONSE_TIMEOUT_MS=${SAGA_MQ_RESPONSE_TIMEOUT_MS:-3000}
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_PENDING_TTL_SECONDS=${SAGA_MQ_PENDING_TTL_SECONDS:-3600}
+      - SAGA_MQ_PENDING_STALE_AFTER_MS=${SAGA_MQ_PENDING_STALE_AFTER_MS:-3000}
+      - SAGA_MQ_POLL_INTERVAL_SECONDS=${SAGA_MQ_POLL_INTERVAL_SECONDS:-0.05}
+      - SAGA_MQ_DISPATCH_BLOCK_MS=${SAGA_MQ_DISPATCH_BLOCK_MS:-1000}
+      - SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS=${SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS:-10}
+      - SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS=${SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS:-2.0}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+      - saga-broker
     restart: always
 
 
@@ -31,15 +48,38 @@ services:
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
 
+  saga-broker:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    restart: always
+
 
   stock-service:
     build: ./stock
     image: stock:latest
+    environment:
+      - GATEWAY_URL=http://gateway:80
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
+      - ENABLE_SAGA_WORKER=${STOCK_ENABLE_SAGA_WORKER:-true}
+      - ENABLE_RECOVERY_LOOP=${STOCK_ENABLE_RECOVERY_LOOP:-true}
+      - RECOVERY_LEASE_KEY=${STOCK_RECOVERY_LEASE_KEY:-stock:recovery:lease}
+      - RECOVERY_LEASE_TTL_SECONDS=${STOCK_RECOVERY_LEASE_TTL_SECONDS:-10}
+      - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
+      - SAGA_MQ_CONSUMER_GROUP=${STOCK_SAGA_MQ_CONSUMER_GROUP:-saga-stock-workers}
+      - SAGA_MQ_BLOCK_MS=${SAGA_MQ_BLOCK_MS:-1000}
+      - SAGA_MQ_BATCH_SIZE=${SAGA_MQ_BATCH_SIZE:-16}
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
       - stock-db
+      - saga-broker
     restart: always
 
 
@@ -51,11 +91,29 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
+    environment:
+      - GATEWAY_URL=http://gateway:80
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
+      - ENABLE_SAGA_WORKER=${PAYMENT_ENABLE_SAGA_WORKER:-true}
+      - ENABLE_RECOVERY_LOOP=${PAYMENT_ENABLE_RECOVERY_LOOP:-true}
+      - RECOVERY_LEASE_KEY=${PAYMENT_RECOVERY_LEASE_KEY:-payment:recovery:lease}
+      - RECOVERY_LEASE_TTL_SECONDS=${PAYMENT_RECOVERY_LEASE_TTL_SECONDS:-10}
+      - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
+      - SAGA_MQ_CONSUMER_GROUP=${PAYMENT_SAGA_MQ_CONSUMER_GROUP:-saga-payment-workers}
+      - SAGA_MQ_BLOCK_MS=${SAGA_MQ_BLOCK_MS:-1000}
+      - SAGA_MQ_BATCH_SIZE=${SAGA_MQ_BATCH_SIZE:-16}
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
       - payment-db
+      - saga-broker
     restart: always
 
 
@@ -74,7 +132,7 @@ services:
       sh -c "
         echo 'Watchdog started - monitoring containers every 3 seconds';
         while true; do
-          for svc in stock-service payment-service order-service gateway order-db stock-db payment-db; do
+          for svc in stock-service payment-service order-service gateway order-db stock-db payment-db saga-broker; do
             CONTAINER=$$(docker ps -a -q --filter label=com.docker.compose.service=$${svc} --filter status=exited | head -n 1);
             if [ -n \"$$CONTAINER\" ]; then
               echo \"Restarting $$svc...\";

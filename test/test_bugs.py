@@ -4,7 +4,7 @@ Behavior and regression tests for the distributed shopping-cart system.
 The suite is split into:
 1. Core integration behavior that should pass now.
 2. Operational/config checks.
-3. Known consistency gaps marked with xfail.
+3. Consistency and recovery regressions.
 """
 
 import asyncio
@@ -274,10 +274,47 @@ class TestKnownConsistencyGaps:
         assert 400 <= add_after_paid.status_code < 500
 
     def test_payment_prepare_lookup_propagates_db_errors(self):
-        payment_path = Path(__file__).resolve().parents[1] / "payment" / "app.py"
+        payment_path = Path(__file__).resolve().parents[1] / "payment" / "repository" / "payment_repo.py"
         function_source = _extract_async_function_source(payment_path, "get_prepare_record", "save_prepare_record")
         assert "except RedisError" in function_source
         assert "raise HTTPException" in function_source
+
+    def test_payment_prepared_scan_surfaces_fetch_and_decode_errors(self):
+        payment_path = Path(__file__).resolve().parents[1] / "payment" / "repository" / "payment_repo.py"
+        function_source = _extract_async_function_source(payment_path, "list_prepared_tx_ids", "has_active_prepare")
+        assert "except RedisError as exc" in function_source
+        assert "raise HTTPException" in function_source
+        assert "except HTTPException" not in function_source
+
+    def test_stock_prepare_watches_reservation_key_and_rechecks_inside_watch_loop(self):
+        stock_path = Path(__file__).resolve().parents[1] / "stock" / "repository" / "stock_repo.py"
+        function_source = _extract_async_function_source(stock_path, "prepare_reservation", "commit_reservation")
+        assert "await pipe.watch(item_id, rkey)" in function_source
+        assert "existing_raw = await pipe.get(rkey)" in function_source
+
+    def test_payment_prepare_watches_tx_key_and_rechecks_inside_watch_loop(self):
+        payment_path = Path(__file__).resolve().parents[1] / "payment" / "repository" / "payment_repo.py"
+        function_source = _extract_async_function_source(payment_path, "prepare_transaction", "commit_transaction")
+        assert "await pipe.watch(user_id, tx_key)" in function_source
+        assert "existing_raw = await pipe.get(tx_key)" in function_source
+
+    def test_saga_tx_lock_is_token_based_and_release_is_compare_delete(self):
+        saga_repo_path = Path(__file__).resolve().parents[1] / "order" / "repository" / "saga_repo.py"
+        source = saga_repo_path.read_text(encoding="utf-8")
+        assert "async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 30) -> str | None:" in source
+        assert "token = str(uuid.uuid4())" in source
+        assert "async def release_tx_lock(self, tx_id: str, token: str) -> bool:" in source
+        assert "if self._decode_str(current) != token:" in source
+
+    def test_recovery_loops_use_leader_lease_guard(self):
+        payment_source = (
+            Path(__file__).resolve().parents[1] / "payment" / "services" / "recovery_service.py"
+        ).read_text(encoding="utf-8")
+        stock_source = (
+            Path(__file__).resolve().parents[1] / "stock" / "services" / "recovery_service.py"
+        ).read_text(encoding="utf-8")
+        assert "is_leader = await self._acquire_or_renew_leadership()" in payment_source
+        assert "is_leader = await self._acquire_or_renew_leadership()" in stock_source
 
     @pytest.mark.anyio
     async def test_direct_pay_and_prepare_cannot_both_succeed(self, client):
@@ -310,11 +347,7 @@ class TestKnownConsistencyGaps:
         assert 400 <= mismatched_prepare.status_code < 500
 
     @pytest.mark.anyio
-    @pytest.mark.xfail(
-        reason="Prepared reservations can remain blocked without explicit recovery.",
-        strict=False,
-    )
-    async def test_orphaned_prepared_reservation_requires_recovery_action(self, client):
+    async def test_orphaned_prepared_reservation_is_recovered(self, client):
         item_id = await create_item(client, price=10, stock=1)
         txn_a = str(uuid.uuid4())
         txn_b = str(uuid.uuid4())
@@ -322,5 +355,14 @@ class TestKnownConsistencyGaps:
         prepared = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_a}/{item_id}/1")
         assert prepared.status_code == 200, prepared.text
 
-        blocked = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_b}/{item_id}/1")
-        assert blocked.status_code == 200
+        # Stock recovery loop should abort orphaned prepare after coordinator reports unknown txn.
+        recovered = False
+        for _ in range(30):
+            retry = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_b}/{item_id}/1")
+            if retry.status_code == 200:
+                recovered = True
+                break
+            await asyncio.sleep(0.2)
+
+        assert recovered, "Prepared reservation did not recover within the expected window"
+        assert await get_stock(client, item_id) == 0

@@ -24,6 +24,23 @@ class TxState(StrEnum):
     ABORTED = "ABORTED"
 
 
+class TxMode(StrEnum):
+    TWO_PC = "2pc"
+    SAGA = "saga"
+
+
+class SagaState(StrEnum):
+    INIT = "INIT"
+    RESERVING_STOCK = "RESERVING_STOCK"
+    STOCK_RESERVED = "STOCK_RESERVED"
+    DEBITTING_PAYMENT = "DEBITTING_PAYMENT"
+    PAYMENT_DEBITED = "PAYMENT_DEBITED"
+    COMPENSATING = "COMPENSATING"
+    COMPENSATED = "COMPENSATED"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+
 class TxRecord(Struct):
     tx_id: str
     order_id: str
@@ -37,6 +54,23 @@ class TxRecord(Struct):
     stock_committed_items: list[tuple[str, int]] = field(default_factory=list)
     payment_prepared: bool = False
     payment_committed: bool = False
+    attempts: int = 0
+    error: str | None = None
+
+
+class SagaTxRecord(Struct):
+    tx_id: str
+    order_id: str
+    user_id: str
+    total_cost: int
+    items: list[tuple[str, int]]
+    state: str
+    created_at: float
+    updated_at: float
+    stock_reserved_items: list[tuple[str, int]] = field(default_factory=list)
+    stock_released_items: list[tuple[str, int]] = field(default_factory=list)
+    payment_debited: bool = False
+    payment_refunded: bool = False
     attempts: int = 0
     error: str | None = None
 

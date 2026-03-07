@@ -1,13 +1,20 @@
 import httpx
 from fastapi import HTTPException
 
+from clients.saga_bus import SagaCommandBus
 from models import ParticipantResult, REQ_ERROR_STR
 
 
 class StockClient:
-    def __init__(self, session: httpx.AsyncClient, gateway_url: str):
+    def __init__(
+        self,
+        session: httpx.AsyncClient,
+        gateway_url: str,
+        saga_bus: SagaCommandBus | None = None,
+    ):
         self.session = session
         self.base_url = f"{gateway_url}/stock"
+        self.saga_bus = saga_bus
 
     async def find_item(self, item_id: str) -> httpx.Response:
         return await self._safe_get(f"/find/{item_id}")
@@ -23,6 +30,28 @@ class StockClient:
     async def abort_item(self, tx_id: str, item_id: str, amount: int) -> ParticipantResult:
         response = await self._safe_post(f"/2pc/abort/{tx_id}/{item_id}/{amount}")
         return self._status_to_result(response)
+
+    async def saga_reserve_item(self, tx_id: str, item_id: str, amount: int, attempt: int) -> ParticipantResult:
+        if self.saga_bus is None:
+            raise HTTPException(status_code=400, detail="Saga MQ bus is not configured")
+        return await self.saga_bus.request(
+            participant="stock",
+            action="reserve",
+            tx_id=tx_id,
+            payload={"item_id": item_id, "amount": int(amount)},
+            attempt=attempt,
+        )
+
+    async def saga_release_item(self, tx_id: str, item_id: str, amount: int, attempt: int) -> ParticipantResult:
+        if self.saga_bus is None:
+            raise HTTPException(status_code=400, detail="Saga MQ bus is not configured")
+        return await self.saga_bus.request(
+            participant="stock",
+            action="release",
+            tx_id=tx_id,
+            payload={"item_id": item_id, "amount": int(amount)},
+            attempt=attempt,
+        )
 
     @staticmethod
     def _status_to_result(response: httpx.Response) -> ParticipantResult:

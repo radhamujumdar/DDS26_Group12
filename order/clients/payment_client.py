@@ -1,13 +1,20 @@
 import httpx
 from fastapi import HTTPException
 
+from clients.saga_bus import SagaCommandBus
 from models import ParticipantResult, REQ_ERROR_STR
 
 
 class PaymentClient:
-    def __init__(self, session: httpx.AsyncClient, gateway_url: str):
+    def __init__(
+        self,
+        session: httpx.AsyncClient,
+        gateway_url: str,
+        saga_bus: SagaCommandBus | None = None,
+    ):
         self.session = session
         self.base_url = f"{gateway_url}/payment"
+        self.saga_bus = saga_bus
 
     async def prepare(self, tx_id: str, user_id: str, amount: int) -> ParticipantResult:
         response = await self._safe_post(f"/2pc/prepare/{tx_id}/{user_id}/{amount}")
@@ -20,6 +27,28 @@ class PaymentClient:
     async def abort(self, tx_id: str) -> ParticipantResult:
         response = await self._safe_post(f"/2pc/abort/{tx_id}")
         return self._status_to_result(response)
+
+    async def saga_debit(self, tx_id: str, user_id: str, amount: int, attempt: int) -> ParticipantResult:
+        if self.saga_bus is None:
+            raise HTTPException(status_code=400, detail="Saga MQ bus is not configured")
+        return await self.saga_bus.request(
+            participant="payment",
+            action="debit",
+            tx_id=tx_id,
+            payload={"user_id": user_id, "amount": int(amount)},
+            attempt=attempt,
+        )
+
+    async def saga_refund(self, tx_id: str, attempt: int) -> ParticipantResult:
+        if self.saga_bus is None:
+            raise HTTPException(status_code=400, detail="Saga MQ bus is not configured")
+        return await self.saga_bus.request(
+            participant="payment",
+            action="refund",
+            tx_id=tx_id,
+            payload={},
+            attempt=attempt,
+        )
 
     @staticmethod
     def _status_to_result(response: httpx.Response) -> ParticipantResult:
