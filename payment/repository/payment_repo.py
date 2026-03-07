@@ -69,26 +69,21 @@ class PaymentRepository:
 
     async def list_prepared_tx_ids(self) -> list[str]:
         prepared: list[str] = []
-        async for raw_key in self.db.scan_iter(match="txn:*"):
-            key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
-            if key.startswith("txn:user:"):
-                continue
+        try:
+            async for raw_key in self.db.scan_iter(match="txn:*"):
+                key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+                if key.startswith("txn:user:"):
+                    continue
 
-            try:
                 raw_record = await self.db.get(key)
-            except RedisError:
-                continue
+                if raw_record is None:
+                    continue
 
-            if raw_record is None:
-                continue
-
-            try:
                 record = self._decode_prepare(raw_record)
-            except HTTPException:
-                continue
-
-            if record.state == TxnState.PREPARED:
-                prepared.append(record.txn_id)
+                if record.state == TxnState.PREPARED:
+                    prepared.append(record.txn_id)
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         return prepared
 
     async def has_active_prepare(self, user_id: str) -> bool:

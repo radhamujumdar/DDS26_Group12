@@ -82,22 +82,19 @@ class StockRepository:
 
     async def list_prepared_reservations(self) -> list[Reservation]:
         prepared: list[Reservation] = []
-        async for raw_key in self.db.scan_iter(match="txn:*:*"):
-            key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
-            if key.count(":") != 2:
-                continue
-            try:
+        try:
+            async for raw_key in self.db.scan_iter(match="txn:*:*"):
+                key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
+                if key.count(":") != 2:
+                    continue
                 raw_record = await self.db.get(key)
-            except RedisError:
-                continue
-            if raw_record is None:
-                continue
-            try:
+                if raw_record is None:
+                    continue
                 reservation = self._decode_reservation(raw_record)
-            except HTTPException:
-                continue
-            if reservation.state == ReservationState.PREPARED:
-                prepared.append(reservation)
+                if reservation.state == ReservationState.PREPARED:
+                    prepared.append(reservation)
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         return prepared
 
     async def prepare_reservation(self, tx_id: str, item_id: str, amount: int) -> str:

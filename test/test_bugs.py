@@ -279,6 +279,13 @@ class TestKnownConsistencyGaps:
         assert "except RedisError" in function_source
         assert "raise HTTPException" in function_source
 
+    def test_payment_prepared_scan_surfaces_fetch_and_decode_errors(self):
+        payment_path = Path(__file__).resolve().parents[1] / "payment" / "repository" / "payment_repo.py"
+        function_source = _extract_async_function_source(payment_path, "list_prepared_tx_ids", "has_active_prepare")
+        assert "except RedisError as exc" in function_source
+        assert "raise HTTPException" in function_source
+        assert "except HTTPException" not in function_source
+
     @pytest.mark.anyio
     async def test_direct_pay_and_prepare_cannot_both_succeed(self, client):
         for attempt in range(80):

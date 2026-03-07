@@ -52,10 +52,12 @@ class SagaTxRepository:
             created_at=now,
             updated_at=now,
         )
-        await self.save(record)
-        await self.add_active(tx_id)
         try:
-            await self.db.set(self._tx_order_key(order_id), tx_id)
+            async with self.db.pipeline(transaction=True) as pipe:
+                pipe.set(self._tx_key(record.tx_id), msgpack.encode(record))
+                pipe.sadd(self.TX_ACTIVE, record.tx_id)
+                pipe.set(self._tx_order_key(order_id), record.tx_id)
+                await pipe.execute()
         except redis.exceptions.RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         return record
