@@ -19,15 +19,27 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:80
       - TX_MODE=${TX_MODE:-2pc}
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_RESPONSE_TIMEOUT_MS=${SAGA_MQ_RESPONSE_TIMEOUT_MS:-3000}
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+      - saga-broker
     restart: always
 
 
   order-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    restart: always
+
+  saga-broker:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
@@ -38,11 +50,16 @@ services:
     image: stock:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
       - stock-db
+      - saga-broker
     restart: always
 
 
@@ -56,11 +73,16 @@ services:
     image: user:latest
     environment:
       - GATEWAY_URL=http://gateway:80
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
       - payment-db
+      - saga-broker
     restart: always
 
 
@@ -79,7 +101,7 @@ services:
       sh -c "
         echo 'Watchdog started - monitoring containers every 3 seconds';
         while true; do
-          for svc in stock-service payment-service order-service gateway order-db stock-db payment-db; do
+          for svc in stock-service payment-service order-service gateway order-db stock-db payment-db saga-broker; do
             CONTAINER=$$(docker ps -a -q --filter label=com.docker.compose.service=$${svc} --filter status=exited | head -n 1);
             if [ -n \"$$CONTAINER\" ]; then
               echo \"Restarting $$svc...\";

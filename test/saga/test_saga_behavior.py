@@ -1,5 +1,4 @@
 import os
-import uuid
 from pathlib import Path
 import sys
 
@@ -56,33 +55,32 @@ class TestSagaBehavior:
         assert (await get_order(client, order_id))["paid"] is False
 
     @pytest.mark.anyio
-    async def test_payment_debit_and_refund_are_idempotent(self, client):
+    async def test_duplicate_checkout_is_idempotent(self, client):
         user_id = await create_user(client, credit=100)
-        tx_id = str(uuid.uuid4())
+        item_id = await create_item(client, price=10, stock=10)
+        order_id = await create_order(client, user_id)
+        await add_item_to_order(client, order_id, item_id, quantity=3)
 
-        first_debit = await client.post(f"{BASE_URL}/payment/saga/debit/{tx_id}/{user_id}/30")
-        second_debit = await client.post(f"{BASE_URL}/payment/saga/debit/{tx_id}/{user_id}/30")
-        first_refund = await client.post(f"{BASE_URL}/payment/saga/refund/{tx_id}")
-        second_refund = await client.post(f"{BASE_URL}/payment/saga/refund/{tx_id}")
-
-        assert first_debit.status_code == 200, first_debit.text
-        assert second_debit.status_code == 200, second_debit.text
-        assert first_refund.status_code == 200, first_refund.text
-        assert second_refund.status_code == 200, second_refund.text
-        assert await get_credit(client, user_id) == 100
+        checkout_1 = await client.post(f"{BASE_URL}/orders/checkout/{order_id}")
+        checkout_2 = await client.post(f"{BASE_URL}/orders/checkout/{order_id}")
+        assert checkout_1.status_code == 200, checkout_1.text
+        assert checkout_2.status_code == 200, checkout_2.text
+        assert await get_stock(client, item_id) == 7
+        assert await get_credit(client, user_id) == 70
+        assert (await get_order(client, order_id))["paid"] is True
 
     @pytest.mark.anyio
-    async def test_stock_reserve_and_release_are_idempotent(self, client):
-        item_id = await create_item(client, price=10, stock=10)
-        tx_id = str(uuid.uuid4())
+    async def test_retry_after_failure_keeps_state_consistent(self, client):
+        user_id = await create_user(client, credit=5)
+        item_id = await create_item(client, price=10, stock=5)
+        order_id = await create_order(client, user_id)
+        await add_item_to_order(client, order_id, item_id, quantity=1)
 
-        first_reserve = await client.post(f"{BASE_URL}/stock/saga/reserve/{tx_id}/{item_id}/3")
-        second_reserve = await client.post(f"{BASE_URL}/stock/saga/reserve/{tx_id}/{item_id}/3")
-        first_release = await client.post(f"{BASE_URL}/stock/saga/release/{tx_id}/{item_id}/3")
-        second_release = await client.post(f"{BASE_URL}/stock/saga/release/{tx_id}/{item_id}/3")
+        first_checkout = await client.post(f"{BASE_URL}/orders/checkout/{order_id}")
+        second_checkout = await client.post(f"{BASE_URL}/orders/checkout/{order_id}")
 
-        assert first_reserve.status_code == 200, first_reserve.text
-        assert second_reserve.status_code == 200, second_reserve.text
-        assert first_release.status_code == 200, first_release.text
-        assert second_release.status_code == 200, second_release.text
-        assert await get_stock(client, item_id) == 10
+        assert first_checkout.status_code == 400
+        assert second_checkout.status_code == 400
+        assert await get_credit(client, user_id) == 5
+        assert await get_stock(client, item_id) == 5
+        assert (await get_order(client, order_id))["paid"] is False

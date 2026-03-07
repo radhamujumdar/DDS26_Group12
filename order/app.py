@@ -11,6 +11,7 @@ from msgspec import msgpack
 from redis.asyncio import Redis
 
 from clients.payment_client import PaymentClient
+from clients.saga_bus import SagaCommandBus
 from clients.stock_client import StockClient
 from coordinator.saga import SagaCoordinator
 from coordinator.two_pc import TwoPCCoordinator
@@ -37,15 +38,33 @@ async def lifespan(app: FastAPI):
         password=os.environ["REDIS_PASSWORD"],
         db=int(os.environ["REDIS_DB"]),
     )
+    saga_broker_db: Redis | None = None
+    saga_bus: SagaCommandBus | None = None
+    if TX_MODE == TxMode.SAGA.value:
+        saga_broker_db = Redis(
+            host=os.environ.get("SAGA_MQ_REDIS_HOST", os.environ["REDIS_HOST"]),
+            port=int(os.environ.get("SAGA_MQ_REDIS_PORT", os.environ["REDIS_PORT"])),
+            password=os.environ.get("SAGA_MQ_REDIS_PASSWORD", os.environ["REDIS_PASSWORD"]),
+            db=int(os.environ.get("SAGA_MQ_REDIS_DB", "0")),
+        )
+        saga_bus = SagaCommandBus(
+            db=saga_broker_db,
+            logger=logger,
+            response_timeout_ms=int(os.environ.get("SAGA_MQ_RESPONSE_TIMEOUT_MS", "3000")),
+            command_stream_maxlen=int(os.environ.get("SAGA_MQ_COMMAND_STREAM_MAXLEN", "100000")),
+        )
+
     http_client = httpx.AsyncClient()
-    stock_client = StockClient(http_client, GATEWAY_URL)
-    payment_client = PaymentClient(http_client, GATEWAY_URL)
+    stock_client = StockClient(http_client, GATEWAY_URL, saga_bus=saga_bus)
+    payment_client = PaymentClient(http_client, GATEWAY_URL, saga_bus=saga_bus)
     tx_repo = TxRepository(db)
     saga_repo = SagaTxRepository(db)
 
     app.state.order_repo = OrderRepository(db)
     app.state.stock_client = stock_client
     app.state.tx_mode = TX_MODE
+    app.state.saga_bus = saga_bus
+    app.state.saga_broker_db = saga_broker_db
     app.state.coordinator = TwoPCCoordinator(
         stock_client=stock_client,
         payment_client=payment_client,
@@ -79,6 +98,8 @@ async def lifespan(app: FastAPI):
     yield
 
     await http_client.aclose()
+    if saga_broker_db is not None:
+        await saga_broker_db.aclose()
     await db.aclose()
 
 
