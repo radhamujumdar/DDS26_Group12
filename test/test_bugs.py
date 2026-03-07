@@ -4,7 +4,7 @@ Behavior and regression tests for the distributed shopping-cart system.
 The suite is split into:
 1. Core integration behavior that should pass now.
 2. Operational/config checks.
-3. Known consistency gaps marked with xfail.
+3. Consistency and recovery regressions.
 """
 
 import asyncio
@@ -274,7 +274,7 @@ class TestKnownConsistencyGaps:
         assert 400 <= add_after_paid.status_code < 500
 
     def test_payment_prepare_lookup_propagates_db_errors(self):
-        payment_path = Path(__file__).resolve().parents[1] / "payment" / "app.py"
+        payment_path = Path(__file__).resolve().parents[1] / "payment" / "repository" / "payment_repo.py"
         function_source = _extract_async_function_source(payment_path, "get_prepare_record", "save_prepare_record")
         assert "except RedisError" in function_source
         assert "raise HTTPException" in function_source
@@ -310,11 +310,7 @@ class TestKnownConsistencyGaps:
         assert 400 <= mismatched_prepare.status_code < 500
 
     @pytest.mark.anyio
-    @pytest.mark.xfail(
-        reason="Prepared reservations can remain blocked without explicit recovery.",
-        strict=False,
-    )
-    async def test_orphaned_prepared_reservation_requires_recovery_action(self, client):
+    async def test_orphaned_prepared_reservation_is_recovered(self, client):
         item_id = await create_item(client, price=10, stock=1)
         txn_a = str(uuid.uuid4())
         txn_b = str(uuid.uuid4())
@@ -322,5 +318,14 @@ class TestKnownConsistencyGaps:
         prepared = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_a}/{item_id}/1")
         assert prepared.status_code == 200, prepared.text
 
-        blocked = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_b}/{item_id}/1")
-        assert blocked.status_code == 200
+        # Stock recovery loop should abort orphaned prepare after coordinator reports unknown txn.
+        recovered = False
+        for _ in range(30):
+            retry = await client.post(f"{BASE_URL}/stock/2pc/prepare/{txn_b}/{item_id}/1")
+            if retry.status_code == 200:
+                recovered = True
+                break
+            await asyncio.sleep(0.2)
+
+        assert recovered, "Prepared reservation did not recover within the expected window"
+        assert await get_stock(client, item_id) == 0
