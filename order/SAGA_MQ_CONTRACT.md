@@ -64,6 +64,15 @@ Payload shapes:
 
 - Pending commands: `saga:mq:pending:{correlation_id}`
 - Dispatcher cursors: `saga:mq:cursor:{participant}:p{partition}`
+- Partition leases: `saga:mq:lease:p{partition}`
+- Metrics counters: `saga:mq:metric:{counter_name}`
+
+## Dispatcher ownership model
+
+- Each `order` instance has a unique `owner_id`.
+- A result partition is processed only by the instance holding its lease key.
+- Leases are renewed periodically (`SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS`) and expire by TTL (`SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS`).
+- If an instance dies, another instance can acquire expired leases and continue from shared cursor keys.
 
 ## Participant requirements (to be implemented)
 
@@ -78,3 +87,8 @@ Payload shapes:
 
 - 2PC mode: `TX_MODE=2pc`
 - Saga mode (MQ): `TX_MODE=saga`
+
+Relevant toggles:
+
+- `ENABLE_ORDER_DISPATCHER` (enable/disable order result dispatcher on an instance)
+- `ENABLE_SAGA_WORKER` (enable/disable participant MQ workers on payment/stock)

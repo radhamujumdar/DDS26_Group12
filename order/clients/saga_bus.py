@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import json
+import os
+import socket
 import time
 import uuid
 from dataclasses import dataclass
@@ -27,6 +29,8 @@ class SagaCommandBus:
     RESULT_STREAM_PREFIX = "saga:res:"
     PENDING_PREFIX = "saga:mq:pending:"
     CURSOR_PREFIX = "saga:mq:cursor:"
+    LEASE_PREFIX = "saga:mq:lease:p"
+    METRIC_PREFIX = "saga:mq:metric:"
 
     def __init__(
         self,
@@ -38,6 +42,11 @@ class SagaCommandBus:
         result_stream_maxlen: int = 100000,
         pending_ttl_seconds: int = 3600,
         poll_interval_seconds: float = 0.05,
+        enable_dispatcher: bool = True,
+        dispatcher_block_ms: int = 1000,
+        dispatch_lease_ttl_seconds: int = 10,
+        dispatch_renew_interval_seconds: float = 2.0,
+        owner_id: str | None = None,
         participants: tuple[str, ...] = ("stock", "payment"),
     ):
         self.db = db
@@ -48,16 +57,32 @@ class SagaCommandBus:
         self.result_stream_maxlen = int(result_stream_maxlen)
         self.pending_ttl_seconds = int(pending_ttl_seconds)
         self.poll_interval_seconds = float(poll_interval_seconds)
+        self.enable_dispatcher = bool(enable_dispatcher)
+        self.dispatcher_block_ms = int(dispatcher_block_ms)
+        self.dispatch_lease_ttl_seconds = int(dispatch_lease_ttl_seconds)
+        self.dispatch_renew_interval_seconds = float(dispatch_renew_interval_seconds)
         self.participants = participants
+        self.owner_id = owner_id or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
         self._dispatcher_task: asyncio.Task | None = None
+        self._owned_partitions: set[int] = set()
+        self._stream_cursors: dict[str, str] = {}
 
     async def start(self):
         if self._dispatcher_task is not None and not self._dispatcher_task.done():
             return
         await self._ensure_cursor_keys()
+        if not self.enable_dispatcher:
+            self._log(
+                "saga_mq_dispatcher_disabled",
+                owner_id=self.owner_id,
+                participants=list(self.participants),
+                stream_partitions=self.stream_partitions,
+            )
+            return
         self._dispatcher_task = asyncio.create_task(self._dispatcher_loop())
         self._log(
             "saga_mq_dispatcher_started",
+            owner_id=self.owner_id,
             participants=list(self.participants),
             stream_partitions=self.stream_partitions,
         )
@@ -71,6 +96,7 @@ class SagaCommandBus:
         except asyncio.CancelledError:
             pass
         self._dispatcher_task = None
+        self._owned_partitions.clear()
         self._log("saga_mq_dispatcher_stopped")
 
     async def recover_stale_pending(self, stale_after_ms: int):
@@ -106,6 +132,7 @@ class SagaCommandBus:
                     },
                 )
                 stale_count += 1
+                await self._incr_metric("stale_pending_recovered_total")
 
             if cursor == 0:
                 break
@@ -179,6 +206,7 @@ class SagaCommandBus:
                     "completed_at_ms": str(int(time.time() * 1000)),
                 },
             )
+            await self._incr_metric("publish_failed_total")
             self._log(
                 "saga_mq_publish_failed",
                 level="warning",
@@ -190,6 +218,7 @@ class SagaCommandBus:
                 detail=str(exc),
             )
             return ParticipantResult(ok=False, retryable=True, detail="Saga MQ publish failed")
+        await self._incr_metric("published_total")
 
         self._log(
             "saga_mq_published",
@@ -230,6 +259,7 @@ class SagaCommandBus:
                 "completed_at_ms": str(int(time.time() * 1000)),
             },
         )
+        await self._incr_metric("response_timeout_total")
         return PendingCommandResult(
             status="timed_out",
             ok=False,
@@ -238,11 +268,29 @@ class SagaCommandBus:
         )
 
     async def _dispatcher_loop(self):
-        streams = await self._load_result_cursors()
         while True:
             try:
-                entries = await self.db.xread(streams=streams, count=128, block=1000)
+                owned_partitions = await self._refresh_partition_leases()
+                if owned_partitions != self._owned_partitions:
+                    self._owned_partitions = owned_partitions
+                    self._log(
+                        "saga_mq_partition_ownership_changed",
+                        owner_id=self.owner_id,
+                        owned_partitions=sorted(self._owned_partitions),
+                    )
+
+                if not owned_partitions:
+                    await asyncio.sleep(self.dispatch_renew_interval_seconds)
+                    continue
+
+                streams = await self._load_result_cursors(owned_partitions)
+                block_ms = min(
+                    self.dispatcher_block_ms,
+                    max(100, int(self.dispatch_renew_interval_seconds * 1000)),
+                )
+                entries = await self.db.xread(streams=streams, count=128, block=block_ms)
             except redis.exceptions.RedisError as exc:
+                await self._incr_metric("dispatcher_read_failed_total")
                 self._log("saga_mq_dispatcher_read_failed", level="warning", detail=str(exc))
                 await asyncio.sleep(0.2)
                 continue
@@ -255,12 +303,15 @@ class SagaCommandBus:
                 participant, partition = self._parse_result_stream(stream_name)
                 if participant is None:
                     continue
+                if partition not in owned_partitions:
+                    continue
 
                 for message_id_raw, fields_raw in stream_entries:
                     message_id = self._decode(message_id_raw)
                     fields = self._decode_dict(fields_raw)
                     correlation_id = fields.get("correlation_id", "")
                     if not correlation_id:
+                        await self._incr_metric("result_missing_correlation_total")
                         self._log(
                             "saga_mq_result_missing_correlation",
                             level="warning",
@@ -268,12 +319,14 @@ class SagaCommandBus:
                             message_id=message_id,
                         )
                         streams[stream_name] = message_id
+                        self._stream_cursors[stream_name] = message_id
                         await self.db.set(self._cursor_key(participant, partition), message_id)
                         continue
 
                     await self._apply_result(correlation_id, fields)
 
                     streams[stream_name] = message_id
+                    self._stream_cursors[stream_name] = message_id
                     await self.db.set(self._cursor_key(participant, partition), message_id)
 
     async def _apply_result(self, correlation_id: str, fields: dict[str, str]):
@@ -281,6 +334,7 @@ class SagaCommandBus:
         data = await self.db.hgetall(pending_key)
         decoded = self._decode_dict(data)
         if not decoded:
+            await self._incr_metric("result_without_pending_total")
             self._log(
                 "saga_mq_result_without_pending",
                 level="warning",
@@ -292,6 +346,7 @@ class SagaCommandBus:
             return
 
         if decoded.get("status") != "pending":
+            await self._incr_metric("result_for_non_pending_total")
             return
 
         ok = fields.get("ok", "0")
@@ -308,6 +363,11 @@ class SagaCommandBus:
             },
         )
         await self.db.expire(pending_key, self.pending_ttl_seconds)
+        await self._incr_metric("result_applied_total")
+        if ok.lower() in ("1", "true", "yes"):
+            await self._incr_metric("result_ok_total")
+        else:
+            await self._incr_metric("result_fail_total")
         self._log(
             "saga_mq_result_applied",
             tx_id=fields.get("tx_id"),
@@ -324,14 +384,41 @@ class SagaCommandBus:
             for partition in range(self.stream_partitions):
                 await self.db.setnx(self._cursor_key(participant, partition), "0-0")
 
-    async def _load_result_cursors(self) -> dict[str, str]:
+    async def _load_result_cursors(self, partitions: set[int]) -> dict[str, str]:
         streams: dict[str, str] = {}
         for participant in self.participants:
-            for partition in range(self.stream_partitions):
-                cursor = await self.db.get(self._cursor_key(participant, partition))
+            for partition in sorted(partitions):
                 stream = self._result_stream(participant, partition)
-                streams[stream] = self._decode(cursor) if cursor is not None else "0-0"
+                cached = self._stream_cursors.get(stream)
+                if cached is not None:
+                    streams[stream] = cached
+                    continue
+                cursor = await self.db.get(self._cursor_key(participant, partition))
+                value = self._decode(cursor) if cursor is not None else "0-0"
+                streams[stream] = value
+                self._stream_cursors[stream] = value
         return streams
+
+    async def _refresh_partition_leases(self) -> set[int]:
+        owned: set[int] = set()
+        for partition in range(self.stream_partitions):
+            lease_key = self._lease_key(partition)
+            value = await self.db.get(lease_key)
+            current_owner = self._decode(value)
+            if current_owner == self.owner_id:
+                await self.db.expire(lease_key, self.dispatch_lease_ttl_seconds)
+                owned.add(partition)
+                continue
+            if value is None:
+                acquired = await self.db.set(
+                    lease_key,
+                    self.owner_id,
+                    nx=True,
+                    ex=self.dispatch_lease_ttl_seconds,
+                )
+                if acquired:
+                    owned.add(partition)
+        return owned
 
     def _partition_for_tx(self, tx_id: str) -> int:
         digest = hashlib.sha256(tx_id.encode("utf-8")).hexdigest()
@@ -348,6 +435,12 @@ class SagaCommandBus:
 
     def _cursor_key(self, participant: str, partition: int) -> str:
         return f"{self.CURSOR_PREFIX}{participant}:p{partition}"
+
+    def _lease_key(self, partition: int) -> str:
+        return f"{self.LEASE_PREFIX}{partition}"
+
+    def _metric_key(self, metric_name: str) -> str:
+        return f"{self.METRIC_PREFIX}{metric_name}"
 
     @staticmethod
     def _decode(value) -> str:
@@ -376,6 +469,83 @@ class SagaCommandBus:
         except ValueError:
             self._log("saga_mq_invalid_result_partition", level="warning", stream=stream_name)
             return None, -1
+
+    async def _incr_metric(self, metric_name: str, delta: int = 1):
+        try:
+            await self.db.incrby(self._metric_key(metric_name), int(delta))
+        except redis.exceptions.RedisError:
+            pass
+
+    async def get_metrics_snapshot(self) -> dict:
+        metric_keys = [
+            "published_total",
+            "publish_failed_total",
+            "response_timeout_total",
+            "stale_pending_recovered_total",
+            "dispatcher_read_failed_total",
+            "result_missing_correlation_total",
+            "result_without_pending_total",
+            "result_for_non_pending_total",
+            "result_applied_total",
+            "result_ok_total",
+            "result_fail_total",
+        ]
+        counters: dict[str, int] = {}
+        for name in metric_keys:
+            raw = await self.db.get(self._metric_key(name))
+            counters[name] = int(self._decode(raw) or "0")
+
+        command_stream_lengths: dict[str, int] = {}
+        result_stream_lengths: dict[str, int] = {}
+        for participant in self.participants:
+            for partition in range(self.stream_partitions):
+                cmd_stream = self._command_stream(participant, partition)
+                res_stream = self._result_stream(participant, partition)
+                try:
+                    command_stream_lengths[cmd_stream] = int(await self.db.xlen(cmd_stream))
+                except redis.exceptions.RedisError:
+                    command_stream_lengths[cmd_stream] = -1
+                try:
+                    result_stream_lengths[res_stream] = int(await self.db.xlen(res_stream))
+                except redis.exceptions.RedisError:
+                    result_stream_lengths[res_stream] = -1
+
+        pending_counts = await self._count_pending_statuses()
+        return {
+            "owner_id": self.owner_id,
+            "dispatcher_enabled": self.enable_dispatcher,
+            "owned_partitions": sorted(self._owned_partitions),
+            "stream_partitions": self.stream_partitions,
+            "counters": counters,
+            "pending": pending_counts,
+            "command_stream_lengths": command_stream_lengths,
+            "result_stream_lengths": result_stream_lengths,
+        }
+
+    async def _count_pending_statuses(self) -> dict[str, int]:
+        cursor = 0
+        counts: dict[str, int] = {
+            "pending": 0,
+            "completed": 0,
+            "failed": 0,
+            "timed_out": 0,
+            "unknown": 0,
+            "total": 0,
+        }
+        while True:
+            cursor, keys = await self.db.scan(cursor=cursor, match=f"{self.PENDING_PREFIX}*", count=200)
+            for pending_key in keys:
+                key_str = self._decode(pending_key)
+                raw = await self.db.hget(key_str, "status")
+                status = self._decode(raw) or "unknown"
+                counts["total"] += 1
+                if status in counts:
+                    counts[status] += 1
+                else:
+                    counts["unknown"] += 1
+            if cursor == 0:
+                break
+        return counts
 
     def _log(self, event: str, level: str = "info", **fields):
         log_event(

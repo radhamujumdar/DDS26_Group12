@@ -39,7 +39,7 @@ async def lifespan(the_app: FastAPI):
     saga_broker_db: Redis | None = None
     saga_worker_task: asyncio.Task | None = None
     saga_worker = None
-    if config.saga_mq_enabled:
+    if config.saga_mq_enabled and config.enable_saga_worker:
         saga_broker_db = Redis(
             host=config.saga_mq_redis_host,
             port=config.saga_mq_redis_port,
@@ -59,6 +59,8 @@ async def lifespan(the_app: FastAPI):
             command_stream_maxlen=config.saga_mq_command_stream_maxlen,
             result_stream_maxlen=config.saga_mq_result_stream_maxlen,
         )
+    elif config.saga_mq_enabled and not config.enable_saga_worker:
+        log_event(logger, "saga_worker_disabled", service="payment-service")
 
     the_app.state.config = config
     the_app.state.db = db

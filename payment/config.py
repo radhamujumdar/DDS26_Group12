@@ -31,6 +31,7 @@ class PaymentConfig:
     recovery_interval_seconds: float
     recovery_startup_delay_seconds: float
     saga_mq_enabled: bool
+    enable_saga_worker: bool
     saga_mq_redis_host: str
     saga_mq_redis_port: int
     saga_mq_redis_password: str
@@ -57,6 +58,7 @@ class PaymentConfig:
                 os.environ.get("RECOVERY_STARTUP_DELAY_SECONDS", DEFAULT_RECOVERY_STARTUP_DELAY_SECONDS)
             ),
             saga_mq_enabled=_read_bool_env("SAGA_MQ_ENABLED", DEFAULT_SAGA_MQ_ENABLED),
+            enable_saga_worker=_read_bool_env("ENABLE_SAGA_WORKER", True),
             saga_mq_redis_host=os.environ.get("SAGA_MQ_REDIS_HOST", os.environ["REDIS_HOST"]),
             saga_mq_redis_port=int(os.environ.get("SAGA_MQ_REDIS_PORT", os.environ["REDIS_PORT"])),
             saga_mq_redis_password=os.environ.get("SAGA_MQ_REDIS_PASSWORD", os.environ["REDIS_PASSWORD"]),

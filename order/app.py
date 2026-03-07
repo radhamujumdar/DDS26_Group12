@@ -24,6 +24,7 @@ from repository.tx_repo import TxRepository
 
 GATEWAY_URL = os.environ["GATEWAY_URL"]
 TX_MODE = os.environ.get("TX_MODE", TxMode.TWO_PC.value).lower()
+ENABLE_ORDER_DISPATCHER = os.environ.get("ENABLE_ORDER_DISPATCHER", "true").lower() in ("1", "true", "yes", "on")
 logger = logging.getLogger("order-service")
 
 
@@ -56,6 +57,13 @@ async def lifespan(app: FastAPI):
             result_stream_maxlen=int(os.environ.get("SAGA_MQ_RESULT_STREAM_MAXLEN", "100000")),
             pending_ttl_seconds=int(os.environ.get("SAGA_MQ_PENDING_TTL_SECONDS", "3600")),
             poll_interval_seconds=float(os.environ.get("SAGA_MQ_POLL_INTERVAL_SECONDS", "0.05")),
+            enable_dispatcher=ENABLE_ORDER_DISPATCHER,
+            dispatcher_block_ms=int(os.environ.get("SAGA_MQ_DISPATCH_BLOCK_MS", "1000")),
+            dispatch_lease_ttl_seconds=int(os.environ.get("SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS", "10")),
+            dispatch_renew_interval_seconds=float(
+                os.environ.get("SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS", "2.0")
+            ),
+            owner_id=os.environ.get("SAGA_MQ_OWNER_ID"),
         )
         await saga_bus.start()
         await saga_bus.recover_stale_pending(
@@ -204,6 +212,17 @@ async def get_saga_tx_state(tx_id: str):
     if tx is None:
         raise HTTPException(status_code=400, detail=f"Saga transaction {tx_id} not found")
     return {"tx_id": tx.tx_id, "state": tx.state}
+
+
+@app.get("/saga/metrics")
+async def get_saga_metrics():
+    if app.state.saga_bus is None:
+        raise HTTPException(status_code=400, detail="Saga mode is disabled")
+    snapshot = await app.state.saga_bus.get_metrics_snapshot()
+    active_ids = await app.state.saga_coordinator.saga_repo.list_active()
+    snapshot["active_saga_transactions"] = len(active_ids)
+    snapshot["tx_mode"] = app.state.tx_mode
+    return snapshot
 
 
 if __name__ == "__main__":

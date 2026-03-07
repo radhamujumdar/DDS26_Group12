@@ -6,9 +6,12 @@ class TestSagaContract:
         compose_path = Path(__file__).resolve().parents[2] / "docker-compose.yml"
         content = compose_path.read_text(encoding="utf-8")
         assert "TX_MODE=${TX_MODE:-2pc}" in content
+        assert "ENABLE_ORDER_DISPATCHER=${ENABLE_ORDER_DISPATCHER:-true}" in content
         assert "saga-broker:" in content
         assert "SAGA_MQ_REDIS_HOST=saga-broker" in content
         assert "SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}" in content
+        assert "ENABLE_SAGA_WORKER=${STOCK_ENABLE_SAGA_WORKER:-true}" in content
+        assert "ENABLE_SAGA_WORKER=${PAYMENT_ENABLE_SAGA_WORKER:-true}" in content
 
     def test_order_wires_saga_command_bus(self):
         order_app_path = Path(__file__).resolve().parents[2] / "order" / "app.py"
@@ -17,6 +20,8 @@ class TestSagaContract:
         assert "if TX_MODE == TxMode.SAGA.value:" in content
         assert "await saga_bus.start()" in content
         assert "recover_stale_pending" in content
+        assert "ENABLE_ORDER_DISPATCHER" in content
+        assert "/saga/metrics" in content
 
     def test_mq_contract_document_exists(self):
         contract_path = Path(__file__).resolve().parents[2] / "order" / "SAGA_MQ_CONTRACT.md"
@@ -25,6 +30,7 @@ class TestSagaContract:
         assert "saga:cmd:payment:p{partition}" in content
         assert "saga:res:stock:p{partition}" in content
         assert "saga:res:payment:p{partition}" in content
+        assert "saga:mq:lease:p{partition}" in content
         assert "correlation_id" in content
         assert "msg_id" in content
         assert "ok" in content
