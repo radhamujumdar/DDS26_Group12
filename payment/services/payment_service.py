@@ -119,6 +119,21 @@ class PaymentService:
         self._log("pay", user_id=user_id, amount=amount, credit=new_credit)
         return new_credit
 
+    async def saga_debit(self, txn_id: str, user_id: str, amount: int) -> dict:
+        self._require_positive(amount, "amount")
+        self._log("saga_debit_todo", level="warning", tx_id=txn_id, user_id=user_id, amount=amount)
+        raise HTTPException(
+            status_code=400,
+            detail="TODO: implement /saga/debit/{tx_id}/{user_id}/{amount} with idempotent durable debit",
+        )
+
+    async def saga_refund(self, txn_id: str) -> dict:
+        self._log("saga_refund_todo", level="warning", tx_id=txn_id)
+        raise HTTPException(
+            status_code=400,
+            detail="TODO: implement /saga/refund/{tx_id} with idempotent durable refund",
+        )
+
     async def get_prepare_record(self, txn_id: str) -> PrepareRecord | None:
         return await self.repo.get_prepare_record(txn_id)
 

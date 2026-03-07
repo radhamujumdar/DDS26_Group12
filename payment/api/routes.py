@@ -42,6 +42,24 @@ async def abort_txn(
     return await service.abort(txn_id)
 
 
+@router.post("/saga/debit/{txn_id}/{user_id}/{amount}")
+async def saga_debit(
+    txn_id: NonEmptyStr,
+    user_id: NonEmptyStr,
+    amount: IntValue,
+    service: PaymentService = Depends(get_payment_service),
+):
+    return await service.saga_debit(txn_id=txn_id, user_id=user_id, amount=amount)
+
+
+@router.post("/saga/refund/{txn_id}")
+async def saga_refund(
+    txn_id: NonEmptyStr,
+    service: PaymentService = Depends(get_payment_service),
+):
+    return await service.saga_refund(txn_id=txn_id)
+
+
 @router.post("/create_user")
 async def create_user(service: PaymentService = Depends(get_payment_service)):
     return await service.create_user()
