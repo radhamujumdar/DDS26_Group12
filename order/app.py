@@ -50,8 +50,16 @@ async def lifespan(app: FastAPI):
         saga_bus = SagaCommandBus(
             db=saga_broker_db,
             logger=logger,
+            stream_partitions=int(os.environ.get("SAGA_MQ_STREAM_PARTITIONS", "4")),
             response_timeout_ms=int(os.environ.get("SAGA_MQ_RESPONSE_TIMEOUT_MS", "3000")),
             command_stream_maxlen=int(os.environ.get("SAGA_MQ_COMMAND_STREAM_MAXLEN", "100000")),
+            result_stream_maxlen=int(os.environ.get("SAGA_MQ_RESULT_STREAM_MAXLEN", "100000")),
+            pending_ttl_seconds=int(os.environ.get("SAGA_MQ_PENDING_TTL_SECONDS", "3600")),
+            poll_interval_seconds=float(os.environ.get("SAGA_MQ_POLL_INTERVAL_SECONDS", "0.05")),
+        )
+        await saga_bus.start()
+        await saga_bus.recover_stale_pending(
+            stale_after_ms=int(os.environ.get("SAGA_MQ_PENDING_STALE_AFTER_MS", "3000"))
         )
 
     http_client = httpx.AsyncClient()
@@ -98,6 +106,8 @@ async def lifespan(app: FastAPI):
     yield
 
     await http_client.aclose()
+    if saga_bus is not None:
+        await saga_bus.stop()
     if saga_broker_db is not None:
         await saga_broker_db.aclose()
     await db.aclose()

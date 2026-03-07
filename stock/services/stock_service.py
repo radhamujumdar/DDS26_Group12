@@ -133,19 +133,58 @@ class StockService:
 
     async def saga_reserve(self, tx_id: str, item_id: str, amount: int) -> dict:
         self._require_positive(amount, "amount")
-        self._log("saga_reserve_todo", level="warning", tx_id=tx_id, item_id=item_id, amount=amount)
-        raise HTTPException(
-            status_code=400,
-            detail="TODO: implement /saga/reserve/{tx_id}/{item_id}/{amount} with durable idempotent reserve/subtract",
+        ok, retryable, detail = await self.handle_saga_command(
+            action="reserve",
+            tx_id=tx_id,
+            payload={"item_id": item_id, "amount": int(amount)},
         )
+        if not ok:
+            raise HTTPException(status_code=400, detail=detail or "Saga reserve failed")
+        return {"status": "done", "retryable": retryable}
 
     async def saga_release(self, tx_id: str, item_id: str, amount: int) -> dict:
         self._require_positive(amount, "amount")
-        self._log("saga_release_todo", level="warning", tx_id=tx_id, item_id=item_id, amount=amount)
-        raise HTTPException(
-            status_code=400,
-            detail="TODO: implement /saga/release/{tx_id}/{item_id}/{amount} with durable idempotent release/restock",
+        ok, retryable, detail = await self.handle_saga_command(
+            action="release",
+            tx_id=tx_id,
+            payload={"item_id": item_id, "amount": int(amount)},
         )
+        if not ok:
+            raise HTTPException(status_code=400, detail=detail or "Saga release failed")
+        return {"status": "done", "retryable": retryable}
+
+    async def handle_saga_command(self, action: str, tx_id: str, payload: dict) -> tuple[bool, bool, str]:
+        if action == "reserve":
+            return await self._handle_saga_reserve_placeholder(tx_id=tx_id, payload=payload)
+        if action == "release":
+            return await self._handle_saga_release_placeholder(tx_id=tx_id, payload=payload)
+        return False, False, f"Unsupported stock saga action: {action}"
+
+    async def _handle_saga_reserve_placeholder(self, tx_id: str, payload: dict) -> tuple[bool, bool, str]:
+        item_id = str(payload.get("item_id", ""))
+        amount = int(payload.get("amount", 0) or 0)
+        self._log(
+            "saga_reserve_todo",
+            level="warning",
+            tx_id=tx_id,
+            item_id=item_id,
+            amount=amount,
+            detail="TODO for teammate: durable idempotent reserve by (tx_id, item_id)",
+        )
+        return False, False, "TODO(stock): implement durable idempotent saga reserve"
+
+    async def _handle_saga_release_placeholder(self, tx_id: str, payload: dict) -> tuple[bool, bool, str]:
+        item_id = str(payload.get("item_id", ""))
+        amount = int(payload.get("amount", 0) or 0)
+        self._log(
+            "saga_release_todo",
+            level="warning",
+            tx_id=tx_id,
+            item_id=item_id,
+            amount=amount,
+            detail="TODO for teammate: durable idempotent release by (tx_id, item_id)",
+        )
+        return False, False, "TODO(stock): implement durable idempotent saga release"
 
     async def list_prepared_reservations(self):
         return await self.repo.list_prepared_reservations()

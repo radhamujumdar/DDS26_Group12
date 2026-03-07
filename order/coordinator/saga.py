@@ -137,7 +137,12 @@ class SagaCoordinator:
 
             result = await self._call_with_retries(
                 operation_name="reserve",
-                operation=lambda item_id=item_id, amount=amount: self.stock_client.saga_reserve_item(tx.tx_id, item_id, amount),
+                operation=lambda attempt, item_id=item_id, amount=amount: self.stock_client.saga_reserve_item(
+                    tx.tx_id,
+                    item_id,
+                    amount,
+                    attempt,
+                ),
                 tx=tx,
                 phase="forward",
                 participant="stock",
@@ -164,7 +169,12 @@ class SagaCoordinator:
             tx = await self._transition_state(tx, SagaState.DEBITTING_PAYMENT)
             result = await self._call_with_retries(
                 operation_name="debit",
-                operation=lambda: self.payment_client.saga_debit(tx.tx_id, tx.user_id, tx.total_cost),
+                operation=lambda attempt: self.payment_client.saga_debit(
+                    tx.tx_id,
+                    tx.user_id,
+                    tx.total_cost,
+                    attempt,
+                ),
                 tx=tx,
                 phase="forward",
                 participant="payment",
@@ -196,7 +206,7 @@ class SagaCoordinator:
         if tx.payment_debited and not tx.payment_refunded:
             result = await self._call_with_retries(
                 operation_name="refund",
-                operation=lambda: self.payment_client.saga_refund(tx.tx_id),
+                operation=lambda attempt: self.payment_client.saga_refund(tx.tx_id, attempt),
                 tx=tx,
                 phase="compensation",
                 participant="payment",
@@ -220,7 +230,12 @@ class SagaCoordinator:
 
             result = await self._call_with_retries(
                 operation_name="release",
-                operation=lambda item_id=item_id, amount=amount: self.stock_client.saga_release_item(tx.tx_id, item_id, amount),
+                operation=lambda attempt, item_id=item_id, amount=amount: self.stock_client.saga_release_item(
+                    tx.tx_id,
+                    item_id,
+                    amount,
+                    attempt,
+                ),
                 tx=tx,
                 phase="compensation",
                 participant="stock",
@@ -255,7 +270,7 @@ class SagaCoordinator:
     async def _call_with_retries(
         self,
         operation_name: str,
-        operation: Callable[[], Awaitable[ParticipantResult]],
+        operation: Callable[[int], Awaitable[ParticipantResult]],
         tx: SagaTxRecord,
         phase: str,
         participant: str,
@@ -264,7 +279,7 @@ class SagaCoordinator:
         for attempt in range(1, self.RETRY_LIMIT + 1):
             started = time.perf_counter()
             try:
-                result = await operation()
+                result = await operation(attempt)
             except HTTPException as exc:
                 detail = str(exc.detail)
                 retryable = detail == REQ_ERROR_STR

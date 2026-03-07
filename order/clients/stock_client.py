@@ -31,7 +31,7 @@ class StockClient:
         response = await self._safe_post(f"/2pc/abort/{tx_id}/{item_id}/{amount}")
         return self._status_to_result(response)
 
-    async def saga_reserve_item(self, tx_id: str, item_id: str, amount: int) -> ParticipantResult:
+    async def saga_reserve_item(self, tx_id: str, item_id: str, amount: int, attempt: int) -> ParticipantResult:
         if self.saga_bus is None:
             raise HTTPException(status_code=400, detail="Saga MQ bus is not configured")
         return await self.saga_bus.request(
@@ -39,9 +39,10 @@ class StockClient:
             action="reserve",
             tx_id=tx_id,
             payload={"item_id": item_id, "amount": int(amount)},
+            attempt=attempt,
         )
 
-    async def saga_release_item(self, tx_id: str, item_id: str, amount: int) -> ParticipantResult:
+    async def saga_release_item(self, tx_id: str, item_id: str, amount: int, attempt: int) -> ParticipantResult:
         if self.saga_bus is None:
             raise HTTPException(status_code=400, detail="Saga MQ bus is not configured")
         return await self.saga_bus.request(
@@ -49,6 +50,7 @@ class StockClient:
             action="release",
             tx_id=tx_id,
             payload={"item_id": item_id, "amount": int(amount)},
+            attempt=attempt,
         )
 
     @staticmethod

@@ -36,6 +36,29 @@ async def lifespan(the_app: FastAPI):
         gateway_url=config.gateway_url,
         logger=logger,
     )
+    saga_broker_db: Redis | None = None
+    saga_worker_task: asyncio.Task | None = None
+    saga_worker = None
+    if config.saga_mq_enabled:
+        saga_broker_db = Redis(
+            host=config.saga_mq_redis_host,
+            port=config.saga_mq_redis_port,
+            password=config.saga_mq_redis_password,
+            db=config.saga_mq_redis_db,
+        )
+        from services import StockSagaMqWorkerService
+
+        saga_worker = StockSagaMqWorkerService(
+            db=saga_broker_db,
+            stock_service=stock_service,
+            logger=logger,
+            stream_partitions=config.saga_mq_stream_partitions,
+            consumer_group=config.saga_mq_consumer_group,
+            block_ms=config.saga_mq_block_ms,
+            batch_size=config.saga_mq_batch_size,
+            command_stream_maxlen=config.saga_mq_command_stream_maxlen,
+            result_stream_maxlen=config.saga_mq_result_stream_maxlen,
+        )
 
     the_app.state.config = config
     the_app.state.db = db
@@ -43,6 +66,8 @@ async def lifespan(the_app: FastAPI):
     the_app.state.stock_service = stock_service
     the_app.state.recovery_service = recovery_service
     the_app.state.gateway_client = gateway_client
+    the_app.state.saga_broker_db = saga_broker_db
+    the_app.state.saga_worker = saga_worker
 
     log_event(logger, "startup_begin", service="stock-service")
     the_app.state.recovery_task = asyncio.create_task(
@@ -51,6 +76,9 @@ async def lifespan(the_app: FastAPI):
             interval_seconds=config.recovery_interval_seconds,
         )
     )
+    if saga_worker is not None:
+        saga_worker_task = asyncio.create_task(saga_worker.run_loop())
+    the_app.state.saga_worker_task = saga_worker_task
     log_event(logger, "startup_complete", service="stock-service")
 
     yield
@@ -59,7 +87,13 @@ async def lifespan(the_app: FastAPI):
     the_app.state.recovery_task.cancel()
     with suppress(asyncio.CancelledError):
         await the_app.state.recovery_task
+    if the_app.state.saga_worker_task is not None:
+        the_app.state.saga_worker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await the_app.state.saga_worker_task
     await gateway_client.aclose()
+    if saga_broker_db is not None:
+        await saga_broker_db.aclose()
     await db.aclose()
     log_event(logger, "shutdown_complete", service="stock-service")
 

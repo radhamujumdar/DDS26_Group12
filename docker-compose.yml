@@ -23,8 +23,13 @@ services:
       - SAGA_MQ_REDIS_PORT=6379
       - SAGA_MQ_REDIS_PASSWORD=redis
       - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
       - SAGA_MQ_RESPONSE_TIMEOUT_MS=${SAGA_MQ_RESPONSE_TIMEOUT_MS:-3000}
       - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_PENDING_TTL_SECONDS=${SAGA_MQ_PENDING_TTL_SECONDS:-3600}
+      - SAGA_MQ_PENDING_STALE_AFTER_MS=${SAGA_MQ_PENDING_STALE_AFTER_MS:-3000}
+      - SAGA_MQ_POLL_INTERVAL_SECONDS=${SAGA_MQ_POLL_INTERVAL_SECONDS:-0.05}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
@@ -54,6 +59,13 @@ services:
       - SAGA_MQ_REDIS_PORT=6379
       - SAGA_MQ_REDIS_PASSWORD=redis
       - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
+      - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
+      - SAGA_MQ_CONSUMER_GROUP=${STOCK_SAGA_MQ_CONSUMER_GROUP:-saga-stock-workers}
+      - SAGA_MQ_BLOCK_MS=${SAGA_MQ_BLOCK_MS:-1000}
+      - SAGA_MQ_BATCH_SIZE=${SAGA_MQ_BATCH_SIZE:-16}
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
@@ -77,6 +89,13 @@ services:
       - SAGA_MQ_REDIS_PORT=6379
       - SAGA_MQ_REDIS_PASSWORD=redis
       - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
+      - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
+      - SAGA_MQ_CONSUMER_GROUP=${PAYMENT_SAGA_MQ_CONSUMER_GROUP:-saga-payment-workers}
+      - SAGA_MQ_BLOCK_MS=${SAGA_MQ_BLOCK_MS:-1000}
+      - SAGA_MQ_BATCH_SIZE=${SAGA_MQ_BATCH_SIZE:-16}
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env

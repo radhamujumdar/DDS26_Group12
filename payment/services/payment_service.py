@@ -121,18 +121,53 @@ class PaymentService:
 
     async def saga_debit(self, txn_id: str, user_id: str, amount: int) -> dict:
         self._require_positive(amount, "amount")
-        self._log("saga_debit_todo", level="warning", tx_id=txn_id, user_id=user_id, amount=amount)
-        raise HTTPException(
-            status_code=400,
-            detail="TODO: implement /saga/debit/{tx_id}/{user_id}/{amount} with idempotent durable debit",
+        ok, retryable, detail = await self.handle_saga_command(
+            action="debit",
+            tx_id=txn_id,
+            payload={"user_id": user_id, "amount": int(amount)},
         )
+        if not ok:
+            raise HTTPException(status_code=400, detail=detail or "Saga debit failed")
+        return {"status": "done", "retryable": retryable}
 
     async def saga_refund(self, txn_id: str) -> dict:
-        self._log("saga_refund_todo", level="warning", tx_id=txn_id)
-        raise HTTPException(
-            status_code=400,
-            detail="TODO: implement /saga/refund/{tx_id} with idempotent durable refund",
+        ok, retryable, detail = await self.handle_saga_command(
+            action="refund",
+            tx_id=txn_id,
+            payload={},
         )
+        if not ok:
+            raise HTTPException(status_code=400, detail=detail or "Saga refund failed")
+        return {"status": "done", "retryable": retryable}
+
+    async def handle_saga_command(self, action: str, tx_id: str, payload: dict) -> tuple[bool, bool, str]:
+        if action == "debit":
+            return await self._handle_saga_debit_placeholder(tx_id=tx_id, payload=payload)
+        if action == "refund":
+            return await self._handle_saga_refund_placeholder(tx_id=tx_id)
+        return False, False, f"Unsupported payment saga action: {action}"
+
+    async def _handle_saga_debit_placeholder(self, tx_id: str, payload: dict) -> tuple[bool, bool, str]:
+        user_id = str(payload.get("user_id", ""))
+        amount = int(payload.get("amount", 0) or 0)
+        self._log(
+            "saga_debit_todo",
+            level="warning",
+            tx_id=tx_id,
+            user_id=user_id,
+            amount=amount,
+            detail="TODO for teammate: durable idempotent debit by (tx_id, action)",
+        )
+        return False, False, "TODO(payment): implement durable idempotent saga debit"
+
+    async def _handle_saga_refund_placeholder(self, tx_id: str) -> tuple[bool, bool, str]:
+        self._log(
+            "saga_refund_todo",
+            level="warning",
+            tx_id=tx_id,
+            detail="TODO for teammate: durable idempotent refund by tx_id",
+        )
+        return False, False, "TODO(payment): implement durable idempotent saga refund"
 
     async def get_prepare_record(self, txn_id: str) -> PrepareRecord | None:
         return await self.repo.get_prepare_record(txn_id)
