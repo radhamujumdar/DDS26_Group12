@@ -16,7 +16,7 @@ kind: Deployment
 metadata:
   name: stock-deployment
 spec:
-  replicas: 1
+  replicas: 5
   selector:
     matchLabels:
       component: stock
@@ -28,23 +28,37 @@ spec:
       containers:
         - name: stock
           image: stock:latest
-          resources:
-            limits:
-              memory: "1Gi"
-              cpu: "1"
-            requests:
-              memory: "1Gi"
-              cpu: "1"
+          imagePullPolicy: IfNotPresent
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
+          args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "2", "app:app"]
           ports:
             - containerPort: 5000
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 5
           env:
+            - name: GATEWAY_URL
+              value: "http://gateway:8000"
             - name: REDIS_HOST
-              value: redis-master
+              value: "stock-db"
             - name: REDIS_PORT
-              value: '6379'
+              value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
               value: "0"
+            - name: SAGA_MQ_REDIS_HOST
+              value: "saga-broker"
+            - name: SAGA_MQ_REDIS_PORT
+              value: "6379"
+            - name: SAGA_MQ_REDIS_PASSWORD
+              value: "redis"

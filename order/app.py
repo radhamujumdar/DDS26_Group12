@@ -129,6 +129,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="order-service", lifespan=lifespan)
 
 
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
+
 @app.post("/create/{user_id}")
 async def create_order(user_id: str):
     key = await app.state.order_repo.create_order(user_id)

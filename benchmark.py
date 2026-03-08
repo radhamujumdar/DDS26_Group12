@@ -19,8 +19,6 @@ import sys
 import time
 import threading
 
-# from order.app import GATEWAY_URL
-
 # ---------------------------------------------------------------------------
 # Paths (adjust if your layout differs)
 # ---------------------------------------------------------------------------
@@ -32,14 +30,6 @@ STRESS_TEST_DIR = os.path.join(BENCHMARK_DIR, "stress-test")
 CONSISTENCY_TEST_DIR = os.path.join(BENCHMARK_DIR, "consistency-test")
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "benchmark-results")
 
-print(SCRIPT_DIR)
-print(PROJECT_DIR)
-print(BASELINE_DIR)
-print(BENCHMARK_DIR)
-print(STRESS_TEST_DIR)
-print(CONSISTENCY_TEST_DIR)
-print(RESULTS_DIR)
-
 GATEWAY_URL = "http://localhost:8000"
 
 # ---------------------------------------------------------------------------
@@ -47,9 +37,9 @@ GATEWAY_URL = "http://localhost:8000"
 # One kill at a time, ~20 s recovery between each.
 # ---------------------------------------------------------------------------
 DEFAULT_KILL_SCHEDULE = [
-    (30, "payment-service"),
-    (50, "stock-service"),
-    (70, "order-service"),
+    (30, "payment-deployment"),
+    (50, "stock-deployment"),
+    (70, "order-deployment"),
     (90, "payment-db"),
     (110, "stock-db"),
     (130, "order-db"),
@@ -65,42 +55,82 @@ def log(msg: str):
 # Docker helpers
 # ---------------------------------------------------------------------------
 def docker_compose_down(project_dir: str):
-    log(f"  docker compose down -v  ({os.path.basename(project_dir)})")
+    log(f"  Cleaning up K8s resources... ({os.path.basename(project_dir)})")
+    
+    # 1. Delete all resources in the k8s folder
     subprocess.run(
-        ["docker", "compose", "down", "-v", "--remove-orphans"],
+        ["kubectl", "delete", "-f", "k8s/", "--ignore-not-found", "--wait=false"],
         cwd=project_dir,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    
+    # 2. Delete Persistent Volume Claims to ensure clean databases
+    log("    Deleting persistent storage (PVCs)...")
+    subprocess.run(
+        ["kubectl", "delete", "pvc", "--all"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    
+    # 3. Hard wait for pods to actually disappear (timeout 60s)
+    log("    Waiting for all pods to terminate...")
+    subprocess.run(
+        ["kubectl", "wait", "--for=delete", "pods", "--all", "--timeout=60s"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    
+    # 4. Small pause for network/loadbalancer stabilization
+    time.sleep(2)
 
 
 def docker_compose_up(project_dir: str, env_overrides: dict | None = None):
-    log(f"  docker compose up -d --build  ({os.path.basename(project_dir)})")
-    env = {**os.environ, **(env_overrides or {})}
-    result = subprocess.run(
-        ["docker", "compose", "up", "-d", "--build"],
+    log(f"  Building images and applying K8s manifests... ({os.path.basename(project_dir)})")
+
+    # 1. Build images
+    for svc in ["order", "stock", "payment"]:
+        log(f"    docker build -t {svc}:latest ./{svc}")
+        subprocess.run(
+            ["docker", "build", "-t", f"{svc}:latest", f"./{svc}"],
+            cwd=project_dir,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+
+    # 2. Apply K8s manifests
+    log(f"    kubectl apply -f k8s/")
+    subprocess.run(
+        ["kubectl", "apply", "-f", "k8s/"],
         cwd=project_dir,
-        env=env,
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
-        log(f"  ERROR: docker compose up failed:\n{result.stderr}")
-        sys.exit(1)
+
 
 
 def docker_kill_container(project_dir: str, service_name: str):
-    """Kill a single container by its compose service name."""
+    """Kill a single pod by its deployment name."""
+    # Find a pod name for the deployment
     result = subprocess.run(
-        ["docker", "compose", "kill", service_name],
-        cwd=project_dir,
+        ["kubectl", "get", "pods", "-l", f"component={service_name.replace('-deployment', '')}", "-o", "jsonpath={.items[0].metadata.name}"],
         capture_output=True,
         text=True,
     )
-    if result.returncode != 0:
-        log(f"  WARNING: failed to kill {service_name}: {result.stderr.strip()}")
+    # If that fails (it might be a DB name which uses 'app' label)
+    if not result.stdout:
+        result = subprocess.run(
+            ["kubectl", "get", "pods", "-l", f"app={service_name}", "-o", "jsonpath={.items[0].metadata.name}"],
+            capture_output=True,
+            text=True,
+        )
+    
+    pod_name = result.stdout.strip()
+    if pod_name:
+        subprocess.run(["kubectl", "delete", "pod", pod_name])
+        log(f"  KILLED POD {pod_name}")
     else:
-        log(f"  KILLED {service_name}")
+        log(f"  WARNING: could not find pod for {service_name}")
 
 
 def wait_for_gateway(timeout: int = 120, interval: int = 3):
@@ -109,9 +139,9 @@ def wait_for_gateway(timeout: int = 120, interval: int = 3):
     import urllib.error
 
     endpoints = [
-        "/orders/find/healthcheck",
-        "payment/healthcheck",
-        "stock/healthcheck",
+        "/orders/health",
+        "/payment/health",
+        "/stock/health",
     ]
 
     deadline = time.time() + timeout
@@ -162,7 +192,6 @@ def run_init_orders():
     log("  Databases populated")
     return True
 
-
 def run_locust(duration: str, users: int, spawn_rate: int, csv_prefix: str) -> subprocess.Popen:
     """Start locust in headless mode. Returns the Popen object."""
     cmd = [
@@ -176,13 +205,20 @@ def run_locust(duration: str, users: int, spawn_rate: int, csv_prefix: str) -> s
         "--csv-full-history",
         "-f", os.path.join(STRESS_TEST_DIR, "locustfile.py"),
     ]
-    log(f"  Starting locust: {users} users, spawn-rate {spawn_rate}, duration {duration}")
+    
+    # --processes is not supported on native Windows
+    if sys.platform != "win32":
+        cmd.append("--processes=-1")
+        log(f"  Starting locust (multi-core): {users} users, spawn-rate {spawn_rate}, duration {duration}")
+    else:
+        log(f"  Starting locust (single-core): {users} users, spawn-rate {spawn_rate}, duration {duration}")
     proc = subprocess.Popen(
         cmd,
         cwd=STRESS_TEST_DIR,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        bufsize=1, # Line buffered
     )
     return proc
 
@@ -206,6 +242,13 @@ def run_consistency_test(output_file: str) -> bool:
     """Run the consistency test and capture output."""
     log("  Running consistency test ...")
     try:
+        # Check if run_consistency_test.py exists in CONSISTENCY_TEST_DIR
+        if not os.path.isfile(os.path.join(CONSISTENCY_TEST_DIR, "run_consistency_test.py")):
+            log(f"  WARNING: Consistency test script not found in {CONSISTENCY_TEST_DIR}")
+            with open(output_file, "w") as f:
+                f.write("SKIPPED: Consistency test script not found\n")
+            return False
+
         result = subprocess.run(
             [sys.executable, "run_consistency_test.py"],
             cwd=CONSISTENCY_TEST_DIR,
@@ -303,8 +346,8 @@ def run_single_benchmark(
         return False
 
     # Extra wait for services to fully initialize (recovery, saga workers, etc.)
-    log("  Waiting 10s for services to fully initialize ...")
-    time.sleep(10)
+    log("  Waiting 20s for services to fully initialize ...")
+    time.sleep(20)
 
     # 4. Populate databases
     if not run_init_orders():
@@ -414,7 +457,11 @@ def main():
         sys.exit(1)
 
     if not os.path.isdir(BENCHMARK_DIR):
-        log(f"ERROR: Benchmark scripts not found at {BENCHMARK_DIR}")
+        log(f"ERROR: Benchmark directory not found at {BENCHMARK_DIR}")
+        sys.exit(1)
+
+    if not os.path.isdir(STRESS_TEST_DIR):
+        log(f"ERROR: Stress test directory not found at {STRESS_TEST_DIR}")
         sys.exit(1)
 
     # Clean previous results if requested

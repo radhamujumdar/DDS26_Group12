@@ -1,11 +1,11 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: order-service
+  name: payment-service
 spec:
   type: ClusterIP
   selector:
-    component: order
+    component: payment
   ports:
     - port: 5000
       name: http
@@ -14,20 +14,20 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: order-deployment
+  name: payment-deployment
 spec:
   replicas: 5
   selector:
     matchLabels:
-      component: order
+      component: payment
   template:
     metadata:
       labels:
-        component: order
+        component: payment
     spec:
       containers:
-        - name: order
-          image: order:latest
+        - name: payment
+          image: payment:latest
           imagePullPolicy: IfNotPresent
           command: ["gunicorn"]
           args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "2", "app:app"]
@@ -49,15 +49,13 @@ spec:
             - name: GATEWAY_URL
               value: "http://gateway:8000"
             - name: REDIS_HOST
-              value: "order-db"
+              value: "payment-db"
             - name: REDIS_PORT
               value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
               value: "0"
-            - name: TX_MODE
-              value: "2pc"
             - name: SAGA_MQ_REDIS_HOST
               value: "saga-broker"
             - name: SAGA_MQ_REDIS_PORT
