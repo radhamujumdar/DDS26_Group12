@@ -56,6 +56,10 @@ spec:
               value: "redis"
             - name: REDIS_DB
               value: "0"
+            - name: REDIS_SENTINEL_HOSTS
+              value: "sentinel:26379"
+            - name: REDIS_MASTER_NAME
+              value: "order-db"
             - name: TX_MODE
               value: "2pc"
             - name: SAGA_MQ_REDIS_HOST
@@ -64,3 +68,7 @@ spec:
               value: "6379"
             - name: SAGA_MQ_REDIS_PASSWORD
               value: "redis"
+            - name: SAGA_MQ_SENTINEL_HOSTS
+              value: "sentinel:26379"
+            - name: SAGA_MQ_MASTER_NAME
+              value: "saga-broker"

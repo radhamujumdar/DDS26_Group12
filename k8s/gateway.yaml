@@ -54,6 +54,9 @@ data:
             proxy_connect_timeout 60s;
             proxy_send_timeout 60s;
             proxy_read_timeout 300s;
+            proxy_next_upstream error timeout http_502 http_503 http_504;
+            proxy_next_upstream_tries 3;
+            proxy_next_upstream_timeout 10s;
             location /orders/ { proxy_pass http://order-app/; }
             location /payment/ { proxy_pass http://payment-app/; }
             location /stock/ { proxy_pass http://stock-app/; }

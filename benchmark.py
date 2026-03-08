@@ -117,7 +117,7 @@ def docker_kill_container(project_dir: str, service_name: str):
         capture_output=True,
         text=True,
     )
-    # If that fails (it might be a DB name which uses 'app' label)
+    # If that fails (it might be a DB name or replica which uses 'app' label)
     if not result.stdout:
         result = subprocess.run(
             ["kubectl", "get", "pods", "-l", f"app={service_name}", "-o", "jsonpath={.items[0].metadata.name}"],
@@ -345,9 +345,9 @@ def run_single_benchmark(
         docker_compose_down(project_dir)
         return False
 
-    # Extra wait for services to fully initialize (recovery, saga workers, etc.)
-    log("  Waiting 20s for services to fully initialize ...")
-    time.sleep(20)
+    # Extra wait for services to fully initialize (Sentinel master discovery, replicas syncing, etc.)
+    log("  Waiting 45s for HA services to fully stabilize ...")
+    time.sleep(45)
 
     # 4. Populate databases
     if not run_init_orders():
