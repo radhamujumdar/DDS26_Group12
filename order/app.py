@@ -16,6 +16,7 @@ from clients.stock_client import StockClient
 from coordinator.saga import SagaCoordinator
 from coordinator.two_pc import TwoPCCoordinator
 from logging_utils import log_event
+from redis_utils import create_redis_client
 from models import OrderValue, TxMode
 from repository.order_repo import OrderRepository
 from repository.saga_repo import SagaTxRepository
@@ -33,20 +34,24 @@ async def lifespan(app: FastAPI):
     if TX_MODE not in (TxMode.TWO_PC.value, TxMode.SAGA.value):
         raise RuntimeError(f"Unsupported TX_MODE={TX_MODE}. Expected one of: 2pc, saga")
 
-    db = Redis(
+    db = create_redis_client(
         host=os.environ["REDIS_HOST"],
         port=int(os.environ["REDIS_PORT"]),
         password=os.environ["REDIS_PASSWORD"],
         db=int(os.environ["REDIS_DB"]),
+        sentinel_hosts=os.environ.get("REDIS_SENTINEL_HOSTS"),
+        master_name=os.environ.get("REDIS_MASTER_NAME"),
     )
     saga_broker_db: Redis | None = None
     saga_bus: SagaCommandBus | None = None
     if TX_MODE == TxMode.SAGA.value:
-        saga_broker_db = Redis(
+        saga_broker_db = create_redis_client(
             host=os.environ.get("SAGA_MQ_REDIS_HOST", os.environ["REDIS_HOST"]),
             port=int(os.environ.get("SAGA_MQ_REDIS_PORT", os.environ["REDIS_PORT"])),
             password=os.environ.get("SAGA_MQ_REDIS_PASSWORD", os.environ["REDIS_PASSWORD"]),
             db=int(os.environ.get("SAGA_MQ_REDIS_DB", "0")),
+            sentinel_hosts=os.environ.get("SAGA_MQ_SENTINEL_HOSTS"),
+            master_name=os.environ.get("SAGA_MQ_MASTER_NAME"),
         )
         saga_bus = SagaCommandBus(
             db=saga_broker_db,

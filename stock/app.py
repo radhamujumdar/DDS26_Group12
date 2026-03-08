@@ -10,6 +10,7 @@ from redis.asyncio import Redis
 from api import router
 from config import StockConfig
 from logging_utils import log_event
+from redis_utils import create_redis_client
 from repository.stock_repo import StockRepository
 from services import StockRecoveryService, StockService
 
@@ -20,11 +21,13 @@ logger = logging.getLogger("stock-service")
 @asynccontextmanager
 async def lifespan(the_app: FastAPI):
     config = StockConfig.from_env()
-    db = Redis(
+    db = create_redis_client(
         host=config.redis_host,
         port=config.redis_port,
         password=config.redis_password,
         db=config.redis_db,
+        sentinel_hosts=config.redis_sentinel_hosts,
+        master_name=config.redis_master_name,
     )
     gateway_client = httpx.AsyncClient(timeout=2.0)
     stock_repo = StockRepository(db)
@@ -44,11 +47,13 @@ async def lifespan(the_app: FastAPI):
     saga_worker_task: asyncio.Task | None = None
     saga_worker = None
     if config.saga_mq_enabled and config.enable_saga_worker:
-        saga_broker_db = Redis(
+        saga_broker_db = create_redis_client(
             host=config.saga_mq_redis_host,
             port=config.saga_mq_redis_port,
             password=config.saga_mq_redis_password,
             db=config.saga_mq_redis_db,
+            sentinel_hosts=config.saga_mq_sentinel_hosts,
+            master_name=config.saga_mq_master_name,
         )
         from services import StockSagaMqWorkerService
 

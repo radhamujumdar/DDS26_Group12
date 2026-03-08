@@ -49,6 +49,10 @@ class StockConfig:
     saga_mq_batch_size: int
     saga_mq_command_stream_maxlen: int
     saga_mq_result_stream_maxlen: int
+    redis_sentinel_hosts: str | None
+    redis_master_name: str | None
+    saga_mq_sentinel_hosts: str | None
+    saga_mq_master_name: str | None
 
     @classmethod
     def from_env(cls) -> "StockConfig":
@@ -88,4 +92,8 @@ class StockConfig:
             saga_mq_result_stream_maxlen=int(
                 os.environ.get("SAGA_MQ_RESULT_STREAM_MAXLEN", DEFAULT_SAGA_MQ_RESULT_STREAM_MAXLEN)
             ),
+            redis_sentinel_hosts=os.environ.get("REDIS_SENTINEL_HOSTS"),
+            redis_master_name=os.environ.get("REDIS_MASTER_NAME"),
+            saga_mq_sentinel_hosts=os.environ.get("SAGA_MQ_SENTINEL_HOSTS"),
+            saga_mq_master_name=os.environ.get("SAGA_MQ_MASTER_NAME"),
         )
