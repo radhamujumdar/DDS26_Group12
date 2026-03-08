@@ -4,7 +4,7 @@ from msgspec import DecodeError, msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
-from models import DB_ERROR_STR, PrepareRecord, TxnState, UserValue
+from models import DB_ERROR_STR, PrepareRecord, SagaDebitRecord, SagaDebitState, TxnState, UserValue
 
 
 def txn_key(txn_id: str) -> str:
@@ -297,6 +297,121 @@ class PaymentRepository:
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
+    async def saga_debit(self, tx_id: str, user_id: str, amount: int) -> tuple[bool, bool, str | None]:
+        debit_key = f"saga:payment:debit:{tx_id}"
+        try:
+            async with self.db.pipeline(transaction=True) as pipe:
+                while True:
+                    try:
+                        await pipe.watch(user_id, debit_key)
+
+                        existing_raw = await pipe.get(debit_key)
+                        if existing_raw is not None:
+                            existing = self._decode_saga_debit(existing_raw)
+                            await pipe.unwatch()
+                            if existing.user_id != user_id or existing.amount != amount:
+                                return False, False, f"Debit tx {tx_id} parameter mismatch"
+                            if existing.state in (SagaDebitState.DEBITED, SagaDebitState.REFUNDED):
+                                return True, False, None
+                            return False, False, "Debit previously failed (insufficient credit)"
+
+                        user_raw = await pipe.get(user_id)
+                        if user_raw is None:
+                            await pipe.unwatch()
+                            return False, False, f"User: {user_id} not found!"
+
+                        user = self._decode_user(user_raw)
+                        if user.credit < amount:
+                            rec = SagaDebitRecord(
+                                tx_id=tx_id,
+                                user_id=user_id,
+                                amount=amount,
+                                old_credit=user.credit,
+                                new_credit=user.credit,
+                                state=SagaDebitState.FAILED,
+                            )
+                            pipe.multi()
+                            pipe.set(debit_key, msgpack.encode(rec))
+                            await pipe.execute()
+                            return False, False, f"Insufficient credit for user {user_id}"
+
+                        new_credit = user.credit - amount
+                        rec = SagaDebitRecord(
+                            tx_id=tx_id,
+                            user_id=user_id,
+                            amount=amount,
+                            old_credit=user.credit,
+                            new_credit=new_credit,
+                            state=SagaDebitState.DEBITED,
+                        )
+                        pipe.multi()
+                        pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
+                        pipe.set(debit_key, msgpack.encode(rec))
+                        await pipe.execute()
+                        return True, False, None
+                    except redis.WatchError:
+                        continue
+        except HTTPException:
+            raise
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+
+    async def saga_refund(self, tx_id: str) -> tuple[bool, bool, str | None]:
+        debit_key = f"saga:payment:debit:{tx_id}"
+        try:
+            existing_raw = await self.db.get(debit_key)
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+
+        if existing_raw is None:
+            return True, False, None
+
+        existing = self._decode_saga_debit(existing_raw)
+        if existing.state in (SagaDebitState.REFUNDED, SagaDebitState.FAILED):
+            return True, False, None
+
+        try:
+            async with self.db.pipeline(transaction=True) as pipe:
+                while True:
+                    try:
+                        await pipe.watch(existing.user_id, debit_key)
+
+                        rec_raw = await pipe.get(debit_key)
+                        if rec_raw is None:
+                            await pipe.unwatch()
+                            return True, False, None
+
+                        rec = self._decode_saga_debit(rec_raw)
+                        if rec.state in (SagaDebitState.REFUNDED, SagaDebitState.FAILED):
+                            await pipe.unwatch()
+                            return True, False, None
+
+                        user_raw = await pipe.get(rec.user_id)
+                        if user_raw is None:
+                            await pipe.unwatch()
+                            return False, True, f"User: {rec.user_id} not found during refund"
+
+                        user = self._decode_user(user_raw)
+                        updated_rec = SagaDebitRecord(
+                            tx_id=rec.tx_id,
+                            user_id=rec.user_id,
+                            amount=rec.amount,
+                            old_credit=rec.old_credit,
+                            new_credit=rec.new_credit,
+                            state=SagaDebitState.REFUNDED,
+                        )
+                        pipe.multi()
+                        pipe.set(rec.user_id, msgpack.encode(UserValue(credit=user.credit + rec.amount)))
+                        pipe.set(debit_key, msgpack.encode(updated_rec))
+                        await pipe.execute()
+                        return True, False, None
+                    except redis.WatchError:
+                        continue
+        except HTTPException:
+            raise
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+
     @staticmethod
     def _decode_user(raw: bytes) -> UserValue:
         try:
@@ -308,5 +423,12 @@ class PaymentRepository:
     def _decode_prepare(raw: bytes) -> PrepareRecord:
         try:
             return msgpack.decode(raw, type=PrepareRecord)
+        except DecodeError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+
+    @staticmethod
+    def _decode_saga_debit(raw: bytes) -> SagaDebitRecord:
+        try:
+            return msgpack.decode(raw, type=SagaDebitRecord)
         except DecodeError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
