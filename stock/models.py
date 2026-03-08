@@ -3,7 +3,7 @@ from enum import StrEnum
 from msgspec import Struct
 
 
-DB_ERROR_STR = "DB error"
+DB_ERROR_STR = "DB error stock"
 
 
 class ReservationState(StrEnum):
