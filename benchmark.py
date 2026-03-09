@@ -94,6 +94,53 @@ def docker_compose_down(project_dir: str):
 
 _port_forward_proc = None
 
+def ensure_port_forward():
+    """Ensure the kubectl port-forward process is running and responsive."""
+    global _port_forward_proc
+    
+    # Check if the process is still alive
+    if _port_forward_proc is not None and _port_forward_proc.poll() is None:
+        # Check if it's actually responding
+        import urllib.request
+        try:
+            req = urllib.request.Request(f"{GATEWAY_URL}/orders/health")
+            urllib.request.urlopen(req, timeout=2)
+            return True
+        except Exception:
+            log("    Port-forward process exists but is not responding. Restarting...")
+            _port_forward_proc.kill()
+            _port_forward_proc.wait()
+            _port_forward_proc = None
+
+    log("    (Re)starting port-forward on port 8000...")
+    # Kill any leftover port-forward processes on port 8000
+    subprocess.run(
+        ["pkill", "-f", "kubectl port-forward.*8000"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(1)
+    _port_forward_proc = subprocess.Popen(
+        ["kubectl", "port-forward", "svc/gateway", "8000:8000"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    
+    # Wait for the port to be available
+    deadline = time.time() + 15
+    import socket
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            if sock.connect_ex(('127.0.0.1', 8000)) == 0:
+                log("    Port 8000 is open")
+                time.sleep(1) # Extra stability
+                return True
+        time.sleep(0.5)
+    
+    log("    WARNING: Failed to establish port-forward on port 8000")
+    return False
+
+
 def docker_compose_up(project_dir: str, env_overrides: dict | None = None):
     global _port_forward_proc
     log(f"  Building images and applying K8s manifests... ({os.path.basename(project_dir)})")
@@ -143,19 +190,8 @@ def docker_compose_up(project_dir: str, env_overrides: dict | None = None):
         time.sleep(2)
     else:
         log("    WARNING: gateway pod did not become ready in 90s")
-    # Kill any leftover port-forward processes on port 8000
-    subprocess.run(
-        ["pkill", "-f", "kubectl port-forward.*8000"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(1)
-    _port_forward_proc = subprocess.Popen(
-        ["kubectl", "port-forward", "svc/gateway", "8000:8000"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(2)  # Give port-forward a moment to bind
+    
+    ensure_port_forward()
 
 
 
@@ -292,6 +328,7 @@ def run_kill_schedule(project_dir: str, schedule: list, stop_event: threading.Ev
 def run_consistency_test(output_file: str) -> bool:
     """Run the consistency test and capture output."""
     log("  Running consistency test ...")
+    ensure_port_forward()
     try:
         # Check if run_consistency_test.py exists in CONSISTENCY_TEST_DIR
         if not os.path.isfile(os.path.join(CONSISTENCY_TEST_DIR, "run_consistency_test.py")):
@@ -397,10 +434,11 @@ def run_single_benchmark(
         return False
 
     # Extra wait for services to fully initialize (Sentinel master discovery, replicas syncing, etc.)
-    log("  Waiting 45s for HA services to fully stabilize ...")
-    time.sleep(45)
+    log("  Waiting 30s for HA services to fully stabilize ...")
+    time.sleep(30)
 
     # 4. Populate databases
+    ensure_port_forward()
     if not run_init_orders():
         log("  SKIPPING run - database population failed")
         docker_compose_down(project_dir)

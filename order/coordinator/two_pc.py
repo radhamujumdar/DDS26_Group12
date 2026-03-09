@@ -112,6 +112,7 @@ class TwoPCCoordinator:
 
     async def _prepare_phase(self, tx: TxRecord) -> TxRecord:
         prepared_set = set(tx.stock_prepared_items)
+        payment_was_prepared = tx.payment_prepared
 
         # Prepare all stock items + payment in parallel
         items_to_prepare = [(iid, amt) for iid, amt in tx.items if (iid, amt) not in prepared_set]
@@ -142,26 +143,36 @@ class TwoPCCoordinator:
             results = await asyncio.gather(*tasks)
             abort_detail = None
 
-            for kind, iid, amt, result in results:
-                if not result.ok:
+            for result_tuple in results:
+                kind, iid, amt, result = result_tuple
+                if result.ok:
                     if kind == "stock":
-                        abort_detail = result.detail or f"Out of stock on item_id: {iid}"
-                    else:
-                        abort_detail = result.detail or "User out of credit"
-                    break
-                if kind == "stock":
-                    prepared_set.add((iid, amt))
+                        prepared_set.add((iid, amt))
+                    elif kind == "payment":
+                        payment_was_prepared = True
+                else:
+                    if abort_detail is None:
+                        if kind == "stock":
+                            abort_detail = result.detail or f"Out of stock on item_id: {iid}"
+                        else:
+                            abort_detail = result.detail or "User out of credit"
 
             if abort_detail:
                 # Save any successful prepares before aborting
+                update_kwargs = {}
                 if prepared_set != set(tx.stock_prepared_items):
-                    await self.tx_repo.update(tx.tx_id, stock_prepared_items=list(prepared_set))
+                    update_kwargs["stock_prepared_items"] = list(prepared_set)
+                if payment_was_prepared != tx.payment_prepared:
+                    update_kwargs["payment_prepared"] = payment_was_prepared
+                
+                if update_kwargs:
+                    await self.tx_repo.update(tx.tx_id, **update_kwargs)
                 return await self._start_abort(tx.tx_id, abort_detail)
 
             # Single write: save prepare results + transition to PREPARED
             update_kwargs = {
                 "stock_prepared_items": list(prepared_set),
-                "payment_prepared": True if need_payment else tx.payment_prepared,
+                "payment_prepared": payment_was_prepared,
                 "state": TxState.PREPARED.value,
                 "attempts": tx.attempts + len(tasks),
             }
@@ -173,6 +184,7 @@ class TwoPCCoordinator:
 
     async def _commit_phase(self, tx: TxRecord) -> TxRecord:
         committed_set = set(tx.stock_committed_items)
+        payment_committed = tx.payment_committed
 
         # Commit all stock items in parallel + payment commit
         items_to_commit = [(iid, amt) for iid, amt in tx.items if (iid, amt) not in committed_set]
@@ -187,7 +199,7 @@ class TwoPCCoordinator:
 
         # Run stock commits and payment commit in parallel
         tasks = [_commit_stock(iid, amt) for iid, amt in items_to_commit]
-        if not tx.payment_committed:
+        if not payment_committed:
             async def _commit_payment() -> ParticipantResult:
                 return await self._call_with_retries(
                     operation_name="commit",
@@ -199,23 +211,34 @@ class TwoPCCoordinator:
         results = await asyncio.gather(*tasks)
 
         # Process results
+        error_detail = None
         for r in results:
             if isinstance(r, tuple):
                 item_id, amount, result = r
-                if not result.ok:
-                    return await self.tx_repo.update(
-                        tx.tx_id,
-                        state=TxState.COMMITTING.value,
-                        error=result.detail or f"Stock commit failed for item {item_id}",
-                    )
-                committed_set.add((item_id, amount))
+                if result.ok:
+                    committed_set.add((item_id, amount))
+                else:
+                    if error_detail is None:
+                        error_detail = result.detail or f"Stock commit failed for item {item_id}"
             else:
-                if not r.ok:
-                    return await self.tx_repo.update(
-                        tx.tx_id,
-                        state=TxState.COMMITTING.value,
-                        error=r.detail or "Payment commit failed",
-                    )
+                if r.ok:
+                    payment_committed = True
+                else:
+                    if error_detail is None:
+                        error_detail = r.detail or "Payment commit failed"
+
+        if error_detail:
+            update_kwargs = {
+                "state": TxState.COMMITTING.value,
+                "error": error_detail,
+                "attempts": tx.attempts + len(tasks),
+            }
+            if committed_set != set(tx.stock_committed_items):
+                update_kwargs["stock_committed_items"] = list(committed_set)
+            if payment_committed != tx.payment_committed:
+                update_kwargs["payment_committed"] = payment_committed
+            
+            return await self.tx_repo.update(tx.tx_id, **update_kwargs)
 
         # Single write: save commit results + transition to COMMITTED
         tx = await self.tx_repo.update(
