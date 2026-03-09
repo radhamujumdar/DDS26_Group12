@@ -17,6 +17,12 @@ class RecoveryAction(StrEnum):
     ABORT = "abort"
 
 
+class SagaDebitState(StrEnum):
+    DEBITED = "debited"
+    REFUNDED = "refunded"
+    FAILED = "failed"
+
+
 class UserValue(Struct):
     credit: int
 
@@ -28,3 +34,12 @@ class PrepareRecord(Struct):
     old_credit: int
     new_credit: int
     state: TxnState
+
+
+class SagaDebitRecord(Struct):
+    tx_id: str
+    user_id: str
+    amount: int
+    old_credit: int
+    new_credit: int
+    state: SagaDebitState
