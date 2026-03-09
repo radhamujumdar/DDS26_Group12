@@ -187,7 +187,7 @@ class TxRepository:
         except redis.exceptions.RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
-    async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 30) -> bool:
+    async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 120) -> bool:
         try:
             was_set = await self.db.set(self._tx_lock_key(tx_id), "1", nx=True, ex=ttl_seconds)
         except redis.exceptions.RedisError as exc:

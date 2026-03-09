@@ -75,7 +75,10 @@ async def lifespan(app: FastAPI):
             stale_after_ms=int(os.environ.get("SAGA_MQ_PENDING_STALE_AFTER_MS", "3000"))
         )
 
-    http_client = httpx.AsyncClient()
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
+        timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=30.0),
+    )
     stock_client = StockClient(http_client, GATEWAY_URL, saga_bus=saga_bus)
     payment_client = PaymentClient(http_client, GATEWAY_URL, saga_bus=saga_bus)
     tx_repo = TxRepository(db)

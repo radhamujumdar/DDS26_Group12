@@ -30,7 +30,7 @@ spec:
           image: order:latest
           imagePullPolicy: IfNotPresent
           command: ["gunicorn"]
-          args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "2", "app:app"]
+          args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "4", "--timeout", "30", "app:app"]
           ports:
             - containerPort: 5000
           livenessProbe:
