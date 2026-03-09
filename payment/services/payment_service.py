@@ -142,32 +142,20 @@ class PaymentService:
 
     async def handle_saga_command(self, action: str, tx_id: str, payload: dict) -> tuple[bool, bool, str]:
         if action == "debit":
-            return await self._handle_saga_debit_placeholder(tx_id=tx_id, payload=payload)
+            return await self._handle_saga_debit(tx_id=tx_id, payload=payload)
         if action == "refund":
-            return await self._handle_saga_refund_placeholder(tx_id=tx_id)
+            return await self._handle_saga_refund(tx_id=tx_id)
         return False, False, f"Unsupported payment saga action: {action}"
 
-    async def _handle_saga_debit_placeholder(self, tx_id: str, payload: dict) -> tuple[bool, bool, str]:
+    async def _handle_saga_debit(self, tx_id: str, payload: dict) -> tuple[bool, bool, str | None]:
         user_id = str(payload.get("user_id", ""))
         amount = int(payload.get("amount", 0) or 0)
-        self._log(
-            "saga_debit_todo",
-            level="warning",
-            tx_id=tx_id,
-            user_id=user_id,
-            amount=amount,
-            detail="TODO for teammate: durable idempotent debit by (tx_id, action)",
-        )
-        return False, False, "TODO(payment): implement durable idempotent saga debit"
+        if not user_id or amount <= 0:
+            return False, False, "Invalid debit payload"
+        return await self.repo.saga_debit(tx_id=tx_id, user_id=user_id, amount=amount)
 
-    async def _handle_saga_refund_placeholder(self, tx_id: str) -> tuple[bool, bool, str]:
-        self._log(
-            "saga_refund_todo",
-            level="warning",
-            tx_id=tx_id,
-            detail="TODO for teammate: durable idempotent refund by tx_id",
-        )
-        return False, False, "TODO(payment): implement durable idempotent saga refund"
+    async def _handle_saga_refund(self, tx_id: str) -> tuple[bool, bool, str | None]:
+        return await self.repo.saga_refund(tx_id=tx_id)
 
     async def get_prepare_record(self, txn_id: str) -> PrepareRecord | None:
         return await self.repo.get_prepare_record(txn_id)
