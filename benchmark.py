@@ -55,8 +55,15 @@ def log(msg: str):
 # Docker helpers
 # ---------------------------------------------------------------------------
 def docker_compose_down(project_dir: str):
+    global _port_forward_proc
     log(f"  Cleaning up K8s resources... ({os.path.basename(project_dir)})")
-    
+
+    # 0. Kill port-forward if running
+    if _port_forward_proc is not None:
+        _port_forward_proc.kill()
+        _port_forward_proc.wait()
+        _port_forward_proc = None
+
     # 1. Delete all resources in the k8s folder
     subprocess.run(
         ["kubectl", "delete", "-f", "k8s/", "--ignore-not-found", "--wait=false"],
@@ -85,10 +92,23 @@ def docker_compose_down(project_dir: str):
     time.sleep(2)
 
 
+_port_forward_proc = None
+
 def docker_compose_up(project_dir: str, env_overrides: dict | None = None):
+    global _port_forward_proc
     log(f"  Building images and applying K8s manifests... ({os.path.basename(project_dir)})")
 
-    # 1. Build images
+    # 1. Build images inside minikube's Docker daemon so K8s can find them
+    minikube_env = os.environ.copy()
+    result = subprocess.run(
+        ["minikube", "docker-env", "--shell", "none"],
+        capture_output=True, text=True,
+    )
+    for line in result.stdout.strip().splitlines():
+        if "=" in line and not line.startswith("#"):
+            key, val = line.split("=", 1)
+            minikube_env[key] = val
+
     for svc in ["order", "stock", "payment"]:
         log(f"    docker build -t {svc}:latest ./{svc}")
         subprocess.run(
@@ -96,6 +116,7 @@ def docker_compose_up(project_dir: str, env_overrides: dict | None = None):
             cwd=project_dir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
+            env=minikube_env,
         )
 
     # 2. Apply K8s manifests
@@ -106,6 +127,35 @@ def docker_compose_up(project_dir: str, env_overrides: dict | None = None):
         capture_output=True,
         text=True,
     )
+
+    # 3. Wait for gateway pod to be ready, then start port-forward
+    log("    Waiting for gateway pod to be ready...")
+    # Retry kubectl wait because the pod may not exist yet right after apply
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        result = subprocess.run(
+            ["kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=gateway",
+             "--timeout=10s"],
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            break
+        time.sleep(2)
+    else:
+        log("    WARNING: gateway pod did not become ready in 90s")
+    # Kill any leftover port-forward processes on port 8000
+    subprocess.run(
+        ["pkill", "-f", "kubectl port-forward.*8000"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(1)
+    _port_forward_proc = subprocess.Popen(
+        ["kubectl", "port-forward", "svc/gateway", "8000:8000"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(2)  # Give port-forward a moment to bind
 
 
 
@@ -202,16 +252,17 @@ def run_locust(duration: str, users: int, spawn_rate: int, csv_prefix: str) -> s
         f"--spawn-rate={spawn_rate}",
         f"--run-time={duration}",
         f"--csv={csv_prefix}",
-        "--csv-full-history",
         "-f", os.path.join(STRESS_TEST_DIR, "locustfile.py"),
     ]
-    
-    # --processes is not supported on native Windows
+
+    # Use all CPU cores on non-Windows (--processes forks workers automatically).
+    # NOTE: --csv-full-history is omitted because locust strips --csv from worker
+    # args but not --csv-full-history, causing workers to error out.
     if sys.platform != "win32":
         cmd.append("--processes=-1")
         log(f"  Starting locust (multi-core): {users} users, spawn-rate {spawn_rate}, duration {duration}")
     else:
-        log(f"  Starting locust (single-core): {users} users, spawn-rate {spawn_rate}, duration {duration}")
+        log(f"  Starting locust: {users} users, spawn-rate {spawn_rate}, duration {duration}")
     proc = subprocess.Popen(
         cmd,
         cwd=STRESS_TEST_DIR,
