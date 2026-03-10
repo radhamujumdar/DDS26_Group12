@@ -137,45 +137,56 @@ class SagaCoordinator:
                 self._log("tx_lock_release_skipped_not_owner", level="warning", tx_id=tx_id)
 
     async def _forward_phase(self, tx: SagaTxRecord) -> SagaTxRecord:
-        tx = await self._transition_state(tx, SagaState.RESERVING_STOCK)
         reserved_items = list(tx.stock_reserved_items)
 
-        for item_id, amount in tx.items:
-            if (item_id, amount) in reserved_items:
-                continue
+        # --- Reserve stock (parallel) ---
+        items_to_reserve = [
+            (item_id, amount) for item_id, amount in tx.items
+            if (item_id, amount) not in reserved_items
+        ]
 
-            result = await self._call_with_retries(
-                operation_name="reserve",
-                operation=lambda attempt, item_id=item_id, amount=amount: self.stock_client.saga_reserve_item(
-                    tx.tx_id,
-                    item_id,
-                    amount,
-                    attempt,
-                ),
-                tx=tx,
-                phase="forward",
-                participant="stock",
-                item_id=item_id,
-            )
-            if not result.ok:
-                tx = await self.saga_repo.update(
-                    tx.tx_id,
-                    state=SagaState.COMPENSATING.value,
-                    error=result.detail or f"Stock reserve failed for item {item_id}",
+        if items_to_reserve:
+            async def _reserve_one(item_id: str, amount: int) -> tuple[str, int, ParticipantResult]:
+                result = await self._call_with_retries(
+                    operation_name="reserve",
+                    operation=lambda attempt, iid=item_id, amt=amount: self.stock_client.saga_reserve_item(
+                        tx.tx_id, iid, amt, attempt,
+                    ),
+                    tx=tx,
+                    phase="forward",
+                    participant="stock",
+                    item_id=item_id,
                 )
-                return await self._compensation_phase(tx)
+                return item_id, amount, result
 
-            reserved_items.append((item_id, amount))
+            results = await asyncio.gather(
+                *[_reserve_one(iid, amt) for iid, amt in items_to_reserve]
+            )
+
+            first_error: str | None = None
+            for item_id, amount, result in results:
+                if result.ok:
+                    reserved_items.append((item_id, amount))
+                elif first_error is None:
+                    first_error = result.detail or f"Stock reserve failed for item {item_id}"
+
+            # Persist which items were reserved (for crash recovery)
             tx = await self.saga_repo.update(
                 tx.tx_id,
                 stock_reserved_items=reserved_items,
-                attempts=tx.attempts + 1,
+                state=SagaState.STOCK_RESERVED.value if first_error is None else SagaState.COMPENSATING.value,
+                error=first_error,
+                attempts=tx.attempts + len(results),
             )
 
-        tx = await self._transition_state(tx, SagaState.STOCK_RESERVED)
+            if first_error is not None:
+                return await self._compensation_phase(tx)
 
+        else:
+            tx = await self.saga_repo.update(tx.tx_id, state=SagaState.STOCK_RESERVED.value)
+
+        # --- Debit payment ---
         if not tx.payment_debited:
-            tx = await self._transition_state(tx, SagaState.DEBITTING_PAYMENT)
             result = await self._call_with_retries(
                 operation_name="debit",
                 operation=lambda attempt: self.payment_client.saga_debit(
@@ -202,16 +213,17 @@ class SagaCoordinator:
                 attempts=tx.attempts + 1,
             )
 
-        tx = await self._transition_state(tx, SagaState.PAYMENT_DEBITED)
-        tx = await self._transition_state(tx, SagaState.COMPLETED, error=None)
+        tx = await self.saga_repo.update(tx.tx_id, state=SagaState.COMPLETED.value, error=None)
         await self.order_repo.mark_paid(tx.order_id)
         await self.saga_repo.remove_active(tx.tx_id)
         self._log("tx_terminal", tx_id=tx.tx_id, order_id=tx.order_id, tx_state=tx.state)
         return tx
 
     async def _compensation_phase(self, tx: SagaTxRecord) -> SagaTxRecord:
-        tx = await self._transition_state(tx, SagaState.COMPENSATING, error=tx.error)
+        if tx.state != SagaState.COMPENSATING.value:
+            tx = await self.saga_repo.update(tx.tx_id, state=SagaState.COMPENSATING.value, error=tx.error)
 
+        # --- Refund payment ---
         if tx.payment_debited and not tx.payment_refunded:
             result = await self._call_with_retries(
                 operation_name="refund",
@@ -232,39 +244,56 @@ class SagaCoordinator:
                 attempts=tx.attempts + 1,
             )
 
+        # --- Release stock (parallel) ---
         released_items = list(tx.stock_released_items)
-        for item_id, amount in reversed(tx.stock_reserved_items):
-            if (item_id, amount) in released_items:
-                continue
+        items_to_release = [
+            (item_id, amount) for item_id, amount in tx.stock_reserved_items
+            if (item_id, amount) not in released_items
+        ]
 
-            result = await self._call_with_retries(
-                operation_name="release",
-                operation=lambda attempt, item_id=item_id, amount=amount: self.stock_client.saga_release_item(
-                    tx.tx_id,
-                    item_id,
-                    amount,
-                    attempt,
-                ),
-                tx=tx,
-                phase="compensation",
-                participant="stock",
-                item_id=item_id,
-            )
-            if not result.ok:
-                return await self.saga_repo.update(
-                    tx.tx_id,
-                    state=SagaState.COMPENSATING.value,
-                    error=result.detail or f"Stock compensation failed for item {item_id}",
+        if items_to_release:
+            async def _release_one(item_id: str, amount: int) -> tuple[str, int, ParticipantResult]:
+                result = await self._call_with_retries(
+                    operation_name="release",
+                    operation=lambda attempt, iid=item_id, amt=amount: self.stock_client.saga_release_item(
+                        tx.tx_id, iid, amt, attempt,
+                    ),
+                    tx=tx,
+                    phase="compensation",
+                    participant="stock",
+                    item_id=item_id,
                 )
+                return item_id, amount, result
 
-            released_items.append((item_id, amount))
+            results = await asyncio.gather(
+                *[_release_one(iid, amt) for iid, amt in items_to_release]
+            )
+
+            first_error: str | None = None
+            for item_id, amount, result in results:
+                if result.ok:
+                    released_items.append((item_id, amount))
+                elif first_error is None:
+                    first_error = result.detail or f"Stock compensation failed for item {item_id}"
+
             tx = await self.saga_repo.update(
                 tx.tx_id,
                 stock_released_items=released_items,
-                attempts=tx.attempts + 1,
+                attempts=tx.attempts + len(results),
             )
 
-        tx = await self._transition_state(tx, SagaState.COMPENSATED, error=tx.error)
+            if first_error is not None:
+                return await self.saga_repo.update(
+                    tx.tx_id,
+                    state=SagaState.COMPENSATING.value,
+                    error=first_error,
+                )
+
+        tx = await self.saga_repo.update(
+            tx.tx_id,
+            state=SagaState.COMPENSATED.value,
+            error=tx.error,
+        )
         await self.saga_repo.remove_active(tx.tx_id)
         await self.saga_repo.clear_order_tx(tx.order_id)
         self._log(
@@ -333,24 +362,6 @@ class SagaCoordinator:
                 return tx
             await asyncio.sleep(self.IN_FLIGHT_POLL_SECONDS)
         return None
-
-    async def _transition_state(
-        self,
-        tx: SagaTxRecord,
-        next_state: SagaState,
-        error: str | None = None,
-    ) -> SagaTxRecord:
-        prev_state = tx.state
-        updated = await self.saga_repo.update(tx.tx_id, state=next_state.value, error=error)
-        self._log(
-            "tx_state_transition",
-            tx_id=updated.tx_id,
-            order_id=updated.order_id,
-            from_state=prev_state,
-            to_state=updated.state,
-            detail=error,
-        )
-        return updated
 
     async def _renew_tx_lock_loop(self, tx_id: str, token: str):
         while True:

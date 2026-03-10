@@ -76,7 +76,7 @@ async def lifespan(app: FastAPI):
         )
 
     http_client = httpx.AsyncClient(
-        limits=httpx.Limits(max_connections=200, max_keepalive_connections=100),
+        limits=httpx.Limits(max_connections=2000, max_keepalive_connections=1000),
         timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=30.0),
     )
     stock_client = StockClient(http_client, GATEWAY_URL, saga_bus=saga_bus)

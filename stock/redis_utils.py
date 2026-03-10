@@ -18,6 +18,7 @@ COMMON_REDIS_KWARGS = dict(
     retry_on_timeout=True,
     retry_on_error=[ConnectionError, TimeoutError, ConnectionRefusedError],
     retry=Retry(ExponentialBackoff(cap=2, base=1), 3),
+    max_connections=2000,
 )
 
 
