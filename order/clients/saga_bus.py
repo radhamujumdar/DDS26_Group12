@@ -66,7 +66,6 @@ class SagaCommandBus:
         self._dispatcher_task: asyncio.Task | None = None
         self._owned_partitions: set[int] = set()
         self._stream_cursors: dict[str, str] = {}
-        self._pending_events: dict[str, asyncio.Event] = {}
 
     async def start(self):
         if self._dispatcher_task is not None and not self._dispatcher_task.done():
@@ -232,46 +231,41 @@ class SagaCommandBus:
             command_stream=command_stream,
         )
 
-        event = asyncio.Event()
-        self._pending_events[correlation_id] = event
-        try:
-            result = await self._await_result(correlation_id, event, self.response_timeout_ms)
-        finally:
-            self._pending_events.pop(correlation_id, None)
+        result = await self._await_result(correlation_id, self.response_timeout_ms)
         return ParticipantResult(ok=result.ok, retryable=result.retryable, detail=result.detail)
 
-    async def _await_result(self, correlation_id: str, event: asyncio.Event, timeout_ms: int) -> PendingCommandResult:
+    async def _await_result(self, correlation_id: str, timeout_ms: int) -> PendingCommandResult:
         pending_key = self._pending_key(correlation_id)
-        timeout_s = int(timeout_ms) / 1000.0
+        deadline = asyncio.get_running_loop().time() + (int(timeout_ms) / 1000.0)
 
-        try:
-            await asyncio.wait_for(event.wait(), timeout=timeout_s)
-        except asyncio.TimeoutError:
-            await self.db.hset(
-                pending_key,
-                mapping={
-                    "status": "timed_out",
-                    "ok": "0",
-                    "retryable": "1",
-                    "detail": "Saga MQ response timeout",
-                    "completed_at_ms": str(int(time.time() * 1000)),
-                },
-            )
-            await self._incr_metric("response_timeout_total")
-            return PendingCommandResult(
-                status="timed_out",
-                ok=False,
-                retryable=True,
-                detail="Saga MQ response timeout",
-            )
+        while asyncio.get_running_loop().time() < deadline:
+            raw = await self.db.hgetall(pending_key)
+            decoded = self._decode_dict(raw)
+            status = decoded.get("status", "")
+            if status in ("completed", "failed", "timed_out"):
+                ok = decoded.get("ok", "0").lower() in ("1", "true", "yes")
+                retryable = decoded.get("retryable", "0").lower() in ("1", "true", "yes")
+                detail = decoded.get("detail") or None
+                return PendingCommandResult(status=status, ok=ok, retryable=retryable, detail=detail)
+            await asyncio.sleep(self.poll_interval_seconds)
 
-        raw = await self.db.hgetall(pending_key)
-        decoded = self._decode_dict(raw)
-        status = decoded.get("status", "")
-        ok = decoded.get("ok", "0").lower() in ("1", "true", "yes")
-        retryable = decoded.get("retryable", "0").lower() in ("1", "true", "yes")
-        detail = decoded.get("detail") or None
-        return PendingCommandResult(status=status, ok=ok, retryable=retryable, detail=detail)
+        await self.db.hset(
+            pending_key,
+            mapping={
+                "status": "timed_out",
+                "ok": "0",
+                "retryable": "1",
+                "detail": "Saga MQ response timeout",
+                "completed_at_ms": str(int(time.time() * 1000)),
+            },
+        )
+        await self._incr_metric("response_timeout_total")
+        return PendingCommandResult(
+            status="timed_out",
+            ok=False,
+            retryable=True,
+            detail="Saga MQ response timeout",
+        )
 
     async def _dispatcher_loop(self):
         while True:
@@ -374,12 +368,6 @@ class SagaCommandBus:
             await self._incr_metric("result_ok_total")
         else:
             await self._incr_metric("result_fail_total")
-
-        # Signal the in-memory event so _await_result wakes up immediately
-        event = self._pending_events.get(correlation_id)
-        if event is not None:
-            event.set()
-
         self._log(
             "saga_mq_result_applied",
             tx_id=fields.get("tx_id"),
