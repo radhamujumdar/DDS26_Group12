@@ -12,12 +12,14 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
 import time
 import threading
+from datetime import datetime
 
 # ---------------------------------------------------------------------------
 # Paths (adjust if your layout differs)
@@ -25,12 +27,25 @@ import threading
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = SCRIPT_DIR  # DDS_Group12
 BASELINE_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "wdm-project-template")
-BENCHMARK_DIR = os.path.join(os.path.dirname(SCRIPT_DIR), "bm")
+
+
+def resolve_benchmark_dir() -> str:
+    candidates = [
+        os.path.join(os.path.dirname(SCRIPT_DIR), "bm"),
+        os.path.join(os.path.dirname(SCRIPT_DIR), "wdm-project-benchmark"),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidates[0]
+
+
+BENCHMARK_DIR = resolve_benchmark_dir()
 STRESS_TEST_DIR = os.path.join(BENCHMARK_DIR, "stress-test")
 CONSISTENCY_TEST_DIR = os.path.join(BENCHMARK_DIR, "consistency-test")
 RESULTS_DIR = os.path.join(SCRIPT_DIR, "benchmark-results")
 
-GATEWAY_URL = "http://localhost:8000"
+GATEWAY_URL: str | None = None
 
 # ---------------------------------------------------------------------------
 # Kill schedule: (seconds_after_locust_start, container_name)
@@ -55,14 +70,7 @@ def log(msg: str):
 # Docker helpers
 # ---------------------------------------------------------------------------
 def docker_compose_down(project_dir: str):
-    global _port_forward_proc
     log(f"  Cleaning up K8s resources... ({os.path.basename(project_dir)})")
-
-    # 0. Kill port-forward if running
-    if _port_forward_proc is not None:
-        _port_forward_proc.kill()
-        _port_forward_proc.wait()
-        _port_forward_proc = None
 
     # 1. Delete all resources in the k8s folder
     subprocess.run(
@@ -92,57 +100,73 @@ def docker_compose_down(project_dir: str):
     time.sleep(2)
 
 
-_port_forward_proc = None
+def _normalize_gateway_url(url: str) -> str:
+    return url.strip().rstrip("/")
 
-def ensure_port_forward():
-    """Ensure the kubectl port-forward process is running and responsive."""
-    global _port_forward_proc
-    
-    # Check if the process is still alive
-    if _port_forward_proc is not None and _port_forward_proc.poll() is None:
-        # Check if it's actually responding
-        import urllib.request
-        try:
-            req = urllib.request.Request(f"{GATEWAY_URL}/orders/health")
-            urllib.request.urlopen(req, timeout=2)
-            return True
-        except Exception:
-            log("    Port-forward process exists but is not responding. Restarting...")
-            _port_forward_proc.kill()
-            _port_forward_proc.wait()
-            _port_forward_proc = None
 
-    log("    (Re)starting port-forward on port 8000...")
-    # Kill any leftover port-forward processes on port 8000
-    subprocess.run(
-        ["pkill", "-f", "kubectl port-forward.*8000"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    time.sleep(1)
-    _port_forward_proc = subprocess.Popen(
-        ["kubectl", "port-forward", "svc/gateway", "8000:8000"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    
-    # Wait for the port to be available
-    deadline = time.time() + 15
-    import socket
+def resolve_gateway_url(project_dir: str, timeout: int = 120, interval: int = 3) -> str:
+    configured_url = os.environ.get("BENCHMARK_GATEWAY_URL")
+    if configured_url:
+        return _normalize_gateway_url(configured_url)
+
+    deadline = time.time() + timeout
     while time.time() < deadline:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            if sock.connect_ex(('127.0.0.1', 8000)) == 0:
-                log("    Port 8000 is open")
-                time.sleep(1) # Extra stability
-                return True
-        time.sleep(0.5)
-    
-    log("    WARNING: Failed to establish port-forward on port 8000")
-    return False
+        lb_ip_result = subprocess.run(
+            ["kubectl", "get", "svc", "gateway", "-o", "jsonpath={.status.loadBalancer.ingress[0].ip}"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        if lb_ip_result.returncode == 0:
+            lb_ip = lb_ip_result.stdout.strip()
+            if lb_ip:
+                return f"http://{lb_ip}:8000"
+
+        lb_hostname_result = subprocess.run(
+            ["kubectl", "get", "svc", "gateway", "-o", "jsonpath={.status.loadBalancer.ingress[0].hostname}"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        if lb_hostname_result.returncode == 0:
+            lb_hostname = lb_hostname_result.stdout.strip()
+            if lb_hostname:
+                return f"http://{lb_hostname}:8000"
+
+        get_svc_result = subprocess.run(
+            ["kubectl", "get", "svc", "gateway"],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        if get_svc_result.returncode != 0:
+            log("    Waiting for gateway service to be created...")
+        else:
+            log("    Waiting for gateway service EXTERNAL-IP...")
+        time.sleep(interval)
+
+    raise RuntimeError(
+        "Failed to resolve a direct gateway URL. "
+        "For minikube LoadBalancer services on Docker/WSL, run 'minikube tunnel' "
+        "in a separate terminal until the gateway service gets an EXTERNAL-IP, "
+        "or set BENCHMARK_GATEWAY_URL explicitly."
+    )
+
+
+def configure_benchmark_urls(gateway_url: str):
+    urls_payload = {
+        "ORDER_URL": gateway_url,
+        "PAYMENT_URL": gateway_url,
+        "STOCK_URL": gateway_url,
+    }
+    urls_path = os.path.join(BENCHMARK_DIR, "urls.json")
+    with open(urls_path, "w", encoding="utf-8") as urls_file:
+        json.dump(urls_payload, urls_file, indent=2)
+        urls_file.write("\n")
 
 
 def docker_compose_up(project_dir: str, env_overrides: dict | None = None):
-    global _port_forward_proc
+    global GATEWAY_URL
     log(f"  Building images and applying K8s manifests... ({os.path.basename(project_dir)})")
 
     # 1. Build images inside minikube's Docker daemon so K8s can find them
@@ -175,7 +199,13 @@ def docker_compose_up(project_dir: str, env_overrides: dict | None = None):
         text=True,
     )
 
-    # 3. Wait for gateway pod to be ready, then start port-forward
+    apply_k8s_env_overrides(project_dir, env_overrides)
+
+    GATEWAY_URL = resolve_gateway_url(project_dir)
+    configure_benchmark_urls(GATEWAY_URL)
+    log(f"    Using gateway URL: {GATEWAY_URL}")
+
+    # 3. Wait for gateway routing to become ready
     log("    Waiting for gateway pod to be ready...")
     # Retry kubectl wait because the pod may not exist yet right after apply
     deadline = time.time() + 90
@@ -190,8 +220,35 @@ def docker_compose_up(project_dir: str, env_overrides: dict | None = None):
         time.sleep(2)
     else:
         log("    WARNING: gateway pod did not become ready in 90s")
-    
-    ensure_port_forward()
+
+
+def apply_k8s_env_overrides(project_dir: str, env_overrides: dict | None = None):
+    if not env_overrides:
+        return
+
+    # Only the order deployment needs checkout mode overrides today.
+    deployment_envs: dict[str, list[str]] = {"order-deployment": []}
+    for key, value in env_overrides.items():
+        if key == "TX_MODE":
+            deployment_envs["order-deployment"].append(f"{key}={value}")
+
+    for deployment, entries in deployment_envs.items():
+        if not entries:
+            continue
+
+        log(f"    Applying env overrides to {deployment}: {', '.join(entries)}")
+        result = subprocess.run(
+            ["kubectl", "set", "env", f"deployment/{deployment}", *entries],
+            cwd=project_dir,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"Failed to apply env overrides to {deployment}: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+        log(f"    Env overrides applied to {deployment}; rollout will be validated by health checks")
 
 
 
@@ -220,9 +277,13 @@ def docker_kill_container(project_dir: str, service_name: str):
 
 
 def wait_for_gateway(timeout: int = 120, interval: int = 3):
-    """Poll the gateway until it responds or timeout is reached."""
+    """Wait until gateway routing works for all service health endpoints."""
     import urllib.request
     import urllib.error
+
+    if not GATEWAY_URL:
+        log("  ERROR: Gateway URL is not configured")
+        return False
 
     endpoints = [
         "/orders/health",
@@ -232,27 +293,27 @@ def wait_for_gateway(timeout: int = 120, interval: int = 3):
 
     deadline = time.time() + timeout
     while time.time() < deadline:
-        all_services_up = True
+        healthy_endpoints: list[str] = []
+        failed_endpoints: list[str] = []
 
         for endpoint in endpoints:
             try:
                 req = urllib.request.Request(f"{GATEWAY_URL}{endpoint}")
-                urllib.request.urlopen(req, timeout=5)
-                # Any response (even 4xx) means the gateway is up
-                log("  Gateway is responding")
-                return True
-            except urllib.error.HTTPError:
-                # 4xx/5xx means gateway is up and routing works
-                log("  Gateway is responding")
-                return True
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    if 200 <= response.status < 300:
+                        healthy_endpoints.append(endpoint)
+                    else:
+                        failed_endpoints.append(f"{endpoint} -> HTTP {response.status}")
+            except urllib.error.HTTPError as exc:
+                failed_endpoints.append(f"{endpoint} -> HTTP {exc.code}")
             except Exception:
-                all_services_up = False
-                break
+                failed_endpoints.append(f"{endpoint} -> unavailable")
 
-        if all_services_up:
+        if len(healthy_endpoints) == len(endpoints):
             log("  Gateway and all services are responding")
             return True
 
+        log(f"  Waiting for healthy services: {', '.join(failed_endpoints)}")
         time.sleep(interval)
 
     log("  ERROR: Gateway did not become available in time")
@@ -280,6 +341,9 @@ def run_init_orders():
 
 def run_locust(duration: str, users: int, spawn_rate: int, csv_prefix: str) -> subprocess.Popen:
     """Start locust in headless mode. Returns the Popen object."""
+    if not GATEWAY_URL:
+        raise RuntimeError("Gateway URL is not configured")
+
     cmd = [
         sys.executable, "-m", "locust",
         "--headless",
@@ -328,8 +392,13 @@ def run_kill_schedule(project_dir: str, schedule: list, stop_event: threading.Ev
 def run_consistency_test(output_file: str) -> bool:
     """Run the consistency test and capture output."""
     log("  Running consistency test ...")
-    ensure_port_forward()
     try:
+        if not wait_for_gateway(timeout=120, interval=3):
+            log("  WARNING: Services did not recover before consistency test")
+            with open(output_file, "w") as f:
+                f.write("SKIPPED: Services did not recover before consistency test\n")
+            return False
+
         # Check if run_consistency_test.py exists in CONSISTENCY_TEST_DIR
         if not os.path.isfile(os.path.join(CONSISTENCY_TEST_DIR, "run_consistency_test.py")):
             log(f"  WARNING: Consistency test script not found in {CONSISTENCY_TEST_DIR}")
@@ -391,6 +460,7 @@ def collect_locust_csvs(csv_prefix: str, output_dir: str):
 def run_single_benchmark(
     mode: str,
     run_number: int,
+    run_timestamp: str,
     duration: str,
     users: int,
     spawn_rate: int,
@@ -413,11 +483,13 @@ def run_single_benchmark(
         return False
 
     # Create output directory
-    output_dir = os.path.join(RESULTS_DIR, mode, f"run_{run_number}")
-    os.makedirs(output_dir, exist_ok=True)
+    run_folder_name = f"run_{run_number}_{run_timestamp}"
+    output_dir = os.path.join(RESULTS_DIR, mode, run_folder_name)
+    os.makedirs(output_dir, exist_ok=False)
 
     log(f"\n{'='*60}")
     log(f"MODE: {mode.upper()} | RUN: {run_number}")
+    log(f"RUN FOLDER: {run_folder_name}")
     log(f"{'='*60}")
 
     # 1. Clean start
@@ -425,7 +497,12 @@ def run_single_benchmark(
     time.sleep(2)
 
     # 2. Start services
-    docker_compose_up(project_dir, env_overrides)
+    try:
+        docker_compose_up(project_dir, env_overrides)
+    except RuntimeError as exc:
+        log(f"  SKIPPING run - deployment failed: {exc}")
+        docker_compose_down(project_dir)
+        return False
 
     # 3. Wait for gateway
     if not wait_for_gateway():
@@ -438,7 +515,6 @@ def run_single_benchmark(
     time.sleep(30)
 
     # 4. Populate databases
-    ensure_port_forward()
     if not run_init_orders():
         log("  SKIPPING run - database population failed")
         docker_compose_down(project_dir)
@@ -478,9 +554,10 @@ def run_single_benchmark(
     # 8. Collect locust CSVs
     collect_locust_csvs(csv_prefix, output_dir)
 
-    # 9. Wait a bit for system to stabilize after locust
-    log("  Waiting 5s for system to stabilize ...")
-    time.sleep(5)
+    # 9. Wait for services to recover after the load test before running consistency checks
+    log("  Waiting for services to recover after locust ...")
+    if not wait_for_gateway(timeout=120, interval=3):
+        log("  WARNING: Services did not fully recover after locust")
 
     # 10. Run consistency test
     consistency_file = os.path.join(output_dir, "consistency.txt")
@@ -553,14 +630,11 @@ def main():
         log(f"ERROR: Stress test directory not found at {STRESS_TEST_DIR}")
         sys.exit(1)
 
-    # Clean previous results if requested
-    if args.clean and os.path.isdir(RESULTS_DIR):
-        shutil.rmtree(RESULTS_DIR)
-        log("Cleaned previous benchmark results")
-
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
     kill_schedule = None if args.no_kills else DEFAULT_KILL_SCHEDULE
+
+    run_timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
 
     log(f"Benchmark configuration:")
     log(f"  Modes:      {', '.join(args.modes)}")
@@ -570,6 +644,7 @@ def main():
     log(f"  Spawn rate: {args.spawn_rate}")
     log(f"  Kills:      {'disabled' if args.no_kills else 'enabled'}")
     log(f"  Results:    {RESULTS_DIR}")
+    log(f"  Timestamp:  {run_timestamp}")
     log("")
 
     total_runs = len(args.modes) * args.runs
@@ -581,6 +656,7 @@ def main():
             success = run_single_benchmark(
                 mode=mode,
                 run_number=run_number,
+                run_timestamp=run_timestamp,
                 duration=args.duration,
                 users=args.users,
                 spawn_rate=args.spawn_rate,
