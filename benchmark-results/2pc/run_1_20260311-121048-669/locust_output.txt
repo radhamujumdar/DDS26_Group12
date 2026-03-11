@@ -1,0 +1,155 @@
+[2026-03-11 12:13:36,887] ASUS-DR/INFO/root: Waiting for workers to be ready, 0 of 8 connected
+[2026-03-11 12:13:36,902] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_67f354d804094a8d824d1f61db6d9ede (index 0) reported as ready. 1 workers connected.
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+[2026-03-11 12:13:36,966] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 12:13:36,992] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_52ecb06a15b44a8b8d58a79a47d13681 (index 1) reported as ready. 2 workers connected.
+[2026-03-11 12:13:37,002] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_e7465d81fec14e38a04764a2e3c526f9 (index 2) reported as ready. 3 workers connected.
+[2026-03-11 12:13:37,003] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_a089d036df5947b5b46fd06e8e40e27f (index 3) reported as ready. 4 workers connected.
+[2026-03-11 12:13:37,009] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_56ed0826239444828b7cd7e92fd3ad2a (index 4) reported as ready. 5 workers connected.
+[2026-03-11 12:13:37,010] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_cb97d385a1ae4d358224fa6bac818309 (index 5) reported as ready. 6 workers connected.
+[2026-03-11 12:13:37,035] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_1ad00cf7ae01464fbed0ce3e05ab371d (index 6) reported as ready. 7 workers connected.
+[2026-03-11 12:13:37,036] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_277be8f42d67438da309b752654e6f8d (index 7) reported as ready. 8 workers connected.
+[2026-03-11 12:13:37,065] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 12:13:37,065] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 12:13:37,067] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 12:13:37,070] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 12:13:37,084] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 12:13:37,113] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 12:13:37,117] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 12:13:37,891] ASUS-DR/INFO/locust.main: Run time limit set to 30 seconds
+[2026-03-11 12:13:37,892] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 12:13:37,893] ASUS-DR/INFO/locust.runners: Sending spawn jobs of 1000 users at 200.00 spawn rate to 8 ready workers
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+[2026-03-11 12:13:41,951] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_e7465d81fec14e38a04764a2e3c526f9 failed to send heartbeat, setting state to missing.
+[2026-03-11 12:13:41,955] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_56ed0826239444828b7cd7e92fd3ad2a failed to send heartbeat, setting state to missing.
+[2026-03-11 12:13:41,964] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_cb97d385a1ae4d358224fa6bac818309 failed to send heartbeat, setting state to missing.
+[2026-03-11 12:13:41,965] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_1ad00cf7ae01464fbed0ce3e05ab371d failed to send heartbeat, setting state to missing.
+[2026-03-11 12:13:42,945] ASUS-DR/INFO/locust.runners: Spawning is complete and report waittime is expired, but not all reports received from workers: {"MicroservicesUser": 675} (675 total users)
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+[2026-03-11 12:13:42,971] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_e7465d81fec14e38a04764a2e3c526f9 failed to send heartbeat, setting state to missing.
+[2026-03-11 12:13:42,980] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_56ed0826239444828b7cd7e92fd3ad2a failed to send heartbeat, setting state to missing.
+[2026-03-11 12:13:42,996] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_cb97d385a1ae4d358224fa6bac818309 failed to send heartbeat, setting state to missing.
+[2026-03-11 12:13:43,406] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_cb97d385a1ae4d358224fa6bac818309 self-healed with heartbeat, setting state to running.
+[2026-03-11 12:13:43,407] ASUS-DR/INFO/locust.runners: Sending spawn jobs of 1000 users at 200.00 spawn rate to 5 ready workers
+[2026-03-11 12:13:44,412] ASUS-DR/INFO/locust.runners: Spawning is complete and report waittime is expired, but not all reports received from workers: {"MicroservicesUser": 550} (550 total users)
+[2026-03-11 12:13:44,445] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_56ed0826239444828b7cd7e92fd3ad2a self-healed with heartbeat, setting state to running.
+[2026-03-11 12:13:44,450] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_e7465d81fec14e38a04764a2e3c526f9 self-healed with heartbeat, setting state to running.
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                        1     0(0.00%) |   2788    2788    2788   2788 |    0.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         1     0(0.00%) |   2788    2788    2788   2788 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                      209     0(0.00%) |   2970    1431    6077   2400 |    0.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                       209     0(0.00%) |   2970    1431    6077   2400 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                      880     0(0.00%) |   1427      34    6170    620 |   36.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                       880     0(0.00%) |   1427      34    6170    620 |   36.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                     1111     0(0.00%) |   1271      34    6170    620 |   83.50        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                      1111     0(0.00%) |   1271      34    6170    620 |   83.50        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                     1451     0(0.00%) |   1181      34    6170    670 |  102.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                      1451     0(0.00%) |   1181      34    6170    670 |  102.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                     1871     0(0.00%) |   1039      34    6170    640 |  158.40        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                      1871     0(0.00%) |   1039      34    6170    640 |  158.40        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                     2169     0(0.00%) |   1054      34    6170    670 |  196.80        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                      2169     0(0.00%) |   1054      34    6170    670 |  196.80        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                     2470     0(0.00%) |   1086      34    6170    730 |  207.50        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                      2470     0(0.00%) |   1086      34    6170    730 |  207.50        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                     2885     0(0.00%) |   1143      34    6170    850 |  169.70        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                      2885     0(0.00%) |   1143      34    6170    850 |  169.70        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                     3015     0(0.00%) |   1140      34    6170    860 |  161.80        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                      3015     0(0.00%) |   1140      34    6170    860 |  161.80        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                     3383     0(0.00%) |   1230      34   24749    880 |  160.90        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                      3383     0(0.00%) |   1230      34   24749    880 |  160.90        0.00
+
+[2026-03-11 12:14:07,821] ASUS-DR/INFO/locust.main: --run-time limit reached, shutting down
+[2026-03-11 12:14:07,823] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 12:14:07,831] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 12:14:07,834] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 12:14:07,836] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 12:14:07,838] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 12:14:07,973] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 12:14:08,151] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 12:14:08,192] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 12:14:08,880] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                     3496     0(0.00%) |   1248      34   24749    890 |  117.53        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                      3496     0(0.00%) |   1248      34   24749    890 |  117.53        0.00
+
+Response time percentiles (approximated)
+Type     Name                                                                                  50%    66%    75%    80%    90%    95%    98%    99%  99.9% 99.99%   100% # reqs
+--------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+POST     /orders/checkout/[order_id]                                                           890   1100   1600   1800   2300   3100   4200   5800  24000  25000  25000   3496
+--------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+         Aggregated                                                                            890   1100   1600   1800   2300   3100   4200   5800  24000  25000  25000   3496
+
+[2026-03-11 12:14:40,972] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 12:14:41,207] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 12:14:42,360] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 12:14:42,831] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 12:14:42,954] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 12:14:43,284] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 12:14:44,871] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 12:14:45,048] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
