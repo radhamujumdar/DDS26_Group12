@@ -77,7 +77,7 @@ class SagaTxRepository:
         total_cost: int,
         items: list[tuple[str, int]],
         state: SagaState = SagaState.INIT,
-        wait_timeout_seconds: float = 2.0,
+        wait_timeout_seconds: float = 60.0,
     ) -> tuple[SagaTxRecord, bool]:
         deadline = time.monotonic() + wait_timeout_seconds
         while True:

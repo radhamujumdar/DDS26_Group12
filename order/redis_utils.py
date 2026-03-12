@@ -13,8 +13,11 @@ from redis.exceptions import ConnectionError, TimeoutError
 
 COMMON_REDIS_KWARGS = dict(
     health_check_interval=2,
-    socket_timeout=1.0,
-    socket_connect_timeout=1.0,
+    # Saga stream consumers use blocking reads (XREAD/XREADGROUP with block=1000),
+    # so the socket timeout must be comfortably above 1s to avoid self-induced
+    # read timeouts and retry backoff during normal operation.
+    socket_timeout=5.0,
+    socket_connect_timeout=5.0,
     retry_on_timeout=True,
     retry_on_error=[ConnectionError, TimeoutError, ConnectionRefusedError],
     retry=Retry(ExponentialBackoff(cap=2, base=1), 3),

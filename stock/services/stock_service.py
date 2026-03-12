@@ -6,9 +6,9 @@ from fastapi import HTTPException
 from msgspec import msgpack
 
 from logging_utils import log_event
-from models import ReservationState, StockValue
+from models import DB_ERROR_STR, ReservationState, StockValue
 from repository.stock_repo import StockRepository
-from redis.exceptions import RedisError, WatchError
+from redis.exceptions import RedisError
 
 class StockService:
     SAGA_KEY_TTL_SECONDS = 24 * 60 * 60
@@ -172,102 +172,38 @@ class StockService:
             return False, False, "item_id is required"
         if amount <= 0:
             return False, False, "amount must be greater than zero"
-
-        saga_key = f"saga:stock:tx:{tx_id}:item:{item_id}"
-        max_watch_retries = 32
-
-        for _ in range(max_watch_retries):
-            try:
-                async with self.repo.db.pipeline(transaction=True) as pipe:
-                    await pipe.watch(item_id, saga_key)
-
-                    existing_raw = await pipe.hgetall(saga_key)
-                    if existing_raw:
-                        existing = {
-                            (k.decode() if isinstance(k, bytes) else str(k)): (
-                                v.decode() if isinstance(v, bytes) else str(v)
-                            )
-                            for k, v in existing_raw.items()
-                        }
-
-                        try:
-                            existing_amount = int(existing.get("amount", "0") or "0")
-                        except ValueError:
-                            await pipe.unwatch()
-                            return False, False, "Corrupt saga record amount"
-
-                        existing_state = existing.get("state", "")
-                        if existing_amount != amount:
-                            await pipe.unwatch()
-                            return False, False, f"Saga reserve amount mismatch for tx={tx_id}, item={item_id}"
-                        if existing_state == "reserved":
-                            await pipe.unwatch()
-                            return True, False, "already reserved"
-                        if existing_state == "released":
-                            await pipe.unwatch()
-                            return False, False, f"Saga tx={tx_id}, item={item_id} already released"
-
-                        await pipe.unwatch()
-                        return False, False, f"Invalid saga stock state: {existing_state}"
-
-                    item_raw = await pipe.get(item_id)
-                    if item_raw is None:
-                        await pipe.unwatch()
-                        return False, False, f"Item: {item_id} not found!"
-
-                    item = self.repo._decode_stock(item_raw)
-                    if item.stock < amount:
-                        await pipe.unwatch()
-                        return False, False, f"Item: {item_id} insufficient stock (have {item.stock}, need {amount})"
-
-                    item.stock -= amount
-                    now_ms = str(int(time.time() * 1000))
-
-                    pipe.multi()
-                    pipe.set(item_id, msgpack.encode(item))
-                    pipe.hset(
-                        saga_key,
-                        mapping={
-                            "tx_id": tx_id,
-                            "item_id": item_id,
-                            "amount": str(amount),
-                            "state": "reserved",
-                            "created_at_ms": now_ms,
-                            "updated_at_ms": now_ms,
-                        },
-                    )
-                    pipe.expire(saga_key, self.SAGA_KEY_TTL_SECONDS)
-                    await pipe.execute()
-                    self._log("saga_reserve_complete", tx_id=tx_id, item_id=item_id, amount=amount, status="reserved")
-                    return True, False, "reserved"
-
-            except WatchError:
-                continue
-            except HTTPException as exc:
-                detail = str(exc.detail)
-                return False, (detail == "DB error"), detail
-            except RedisError as exc:
-                self._log(
-                    "saga_reserve_redis_error",
-                    level="warning",
-                    tx_id=tx_id,
-                    item_id=item_id,
-                    amount=amount,
-                    detail=str(exc),
-                )
-                return False, True, "DB error"
-            except Exception as exc:
-                self._log(
-                    "saga_reserve_failed",
-                    level="warning",
-                    tx_id=tx_id,
-                    item_id=item_id,
-                    amount=amount,
-                    detail=str(exc),
-                )
-                return False, True, "Transient stock saga reserve error"
-
-        return False, True, "Saga reserve contention timeout"
+        try:
+            status = await self.repo.saga_reserve_item(
+                tx_id=tx_id,
+                item_id=item_id,
+                amount=amount,
+                ttl_seconds=self.SAGA_KEY_TTL_SECONDS,
+            )
+            self._log("saga_reserve_complete", tx_id=tx_id, item_id=item_id, amount=amount, status=status)
+            return True, False, status
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            return False, (detail == DB_ERROR_STR), detail
+        except RedisError as exc:
+            self._log(
+                "saga_reserve_redis_error",
+                level="warning",
+                tx_id=tx_id,
+                item_id=item_id,
+                amount=amount,
+                detail=str(exc),
+            )
+            return False, True, "DB error"
+        except Exception as exc:
+            self._log(
+                "saga_reserve_failed",
+                level="warning",
+                tx_id=tx_id,
+                item_id=item_id,
+                amount=amount,
+                detail=str(exc),
+            )
+            return False, True, "Transient stock saga reserve error"
 
 
     async def _handle_saga_release(self, tx_id: str, payload: dict) -> tuple[bool, bool, str]:
@@ -281,109 +217,38 @@ class StockService:
             return False, False, "item_id is required"
         if amount <= 0:
             return False, False, "amount must be greater than zero"
-
-        saga_key = f"saga:stock:tx:{tx_id}:item:{item_id}"
-        max_watch_retries = 32
-
-        for _ in range(max_watch_retries):
-            try:
-                async with self.repo.db.pipeline(transaction=True) as pipe:
-                    await pipe.watch(item_id, saga_key)
-
-                    existing_raw = await pipe.hgetall(saga_key)
-                    if not existing_raw:
-                        now_ms = str(int(time.time() * 1000))
-                        pipe.multi()
-                        pipe.hset(
-                            saga_key,
-                            mapping={
-                                "tx_id": tx_id,
-                                "item_id": item_id,
-                                "amount": str(amount),
-                                "state": "released",
-                                "created_at_ms": now_ms,
-                                "updated_at_ms": now_ms,
-                            },
-                        )
-                        pipe.expire(saga_key, self.SAGA_KEY_TTL_SECONDS)
-                        await pipe.execute()
-                        return True, False, "already released"
-
-                    existing = {
-                        (k.decode() if isinstance(k, bytes) else str(k)): (
-                            v.decode() if isinstance(v, bytes) else str(v)
-                        )
-                        for k, v in existing_raw.items()
-                    }
-
-                    try:
-                        existing_amount = int(existing.get("amount", "0") or "0")
-                    except ValueError:
-                        await pipe.unwatch()
-                        return False, False, "Corrupt saga record amount"
-
-                    existing_state = existing.get("state", "")
-                    if existing_amount != amount:
-                        await pipe.unwatch()
-                        return False, False, f"Saga release amount mismatch for tx={tx_id}, item={item_id}"
-                    if existing_state == "released":
-                        await pipe.unwatch()
-                        return True, False, "already released"
-                    if existing_state != "reserved":
-                        await pipe.unwatch()
-                        return False, False, f"Invalid saga stock state: {existing_state}"
-
-                    item_raw = await pipe.get(item_id)
-                    if item_raw is None:
-                        await pipe.unwatch()
-                        return False, False, f"Item: {item_id} not found!"
-
-                    item = self.repo._decode_stock(item_raw)
-                    item.stock += amount
-                    now_ms = str(int(time.time() * 1000))
-
-                    pipe.multi()
-                    pipe.set(item_id, msgpack.encode(item))
-                    pipe.hset(
-                        saga_key,
-                        mapping={
-                            "state": "released",
-                            "updated_at_ms": now_ms,
-                        },
-                    )
-                    pipe.expire(saga_key, self.SAGA_KEY_TTL_SECONDS)
-                    await pipe.execute()
-
-                    self._log("saga_release_complete", tx_id=tx_id, item_id=item_id, amount=amount, status="released")
-                    return True, False, "released"
-
-            except WatchError:
-                continue
-            except HTTPException as exc:
-                detail = str(exc.detail)
-                return False, (detail == "DB error"), detail
-            except RedisError as exc:
-                self._log(
-                    "saga_release_redis_error",
-                    level="warning",
-                    tx_id=tx_id,
-                    item_id=item_id,
-                    amount=amount,
-                    detail=str(exc),
-                )
-                return False, True, "DB error"
-            except Exception as exc:
-                self._log(
-                    "saga_release_failed",
-                    level="warning",
-                    tx_id=tx_id,
-                    item_id=item_id,
-                    amount=amount,
-                    detail=str(exc),
-                )
-                return False, True, "Transient stock saga release error"
-
-        return False, True, "Saga release contention timeout"
+        try:
+            status = await self.repo.saga_release_item(
+                tx_id=tx_id,
+                item_id=item_id,
+                amount=amount,
+                ttl_seconds=self.SAGA_KEY_TTL_SECONDS,
+            )
+            self._log("saga_release_complete", tx_id=tx_id, item_id=item_id, amount=amount, status=status)
+            return True, False, status
+        except HTTPException as exc:
+            detail = str(exc.detail)
+            return False, (detail == DB_ERROR_STR), detail
+        except RedisError as exc:
+            self._log(
+                "saga_release_redis_error",
+                level="warning",
+                tx_id=tx_id,
+                item_id=item_id,
+                amount=amount,
+                detail=str(exc),
+            )
+            return False, True, "DB error"
+        except Exception as exc:
+            self._log(
+                "saga_release_failed",
+                level="warning",
+                tx_id=tx_id,
+                item_id=item_id,
+                amount=amount,
+                detail=str(exc),
+            )
+            return False, True, "Transient stock saga release error"
 
 
 

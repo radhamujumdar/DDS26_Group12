@@ -18,7 +18,7 @@ from repository.saga_repo import SagaTxRepository
 class SagaCoordinator:
     RETRY_LIMIT = 3
     RETRY_BACKOFF_SECONDS = 0.2
-    IN_FLIGHT_WAIT_SECONDS = 5.0
+    IN_FLIGHT_WAIT_SECONDS = 60.0
     IN_FLIGHT_POLL_SECONDS = 0.1
     TX_LOCK_TTL_SECONDS = 30
     TX_LOCK_RENEW_INTERVAL_SECONDS = 10.0
