@@ -36,7 +36,7 @@ if existing_raw then
     if existing['state'] == 'aborted' then
         return {-2, 'Insufficient credit for user ' .. user_id}
     end
-    return {1, existing['state']}
+    return {1, existing_raw}
 end
 
 local user_raw = redis.call('GET', user_key)
@@ -57,55 +57,56 @@ local rec = {txn_id=txn_id, user_id=user_id, delta=-amount, old_credit=credit, n
 redis.call('SET', user_key, cmsgpack.pack({credit=new_credit}))
 redis.call('SET', tx_key, cmsgpack.pack(rec))
 redis.call('SADD', prep_user_key, txn_id)
-return {0, 'prepared'}
+return {0, cmsgpack.pack(rec)}
 """
 
 # Lua script for atomic commit_transaction
-# KEYS[1] = txn_key, KEYS[2] = prepared_user_key
+# KEYS[1] = txn_key
 PAYMENT_COMMIT_LUA = """
 local tx_key = KEYS[1]
-local prep_user_key = KEYS[2]
 
 local raw = redis.call('GET', tx_key)
 if not raw then
     return {-1, 'Unknown transaction'}
 end
 local rec = cmsgpack.unpack(raw)
+local prep_user_key = 'txn:user:' .. rec['user_id'] .. ':prepared'
 if rec['state'] == 'aborted' then
     return {-1, 'Transaction was already aborted'}
 end
 if rec['state'] == 'committed' then
     redis.call('SREM', prep_user_key, rec['txn_id'])
-    return {0, 'committed'}
+    return {0, raw}
 end
 if rec['state'] ~= 'prepared' then
     return {-1, 'Transaction in invalid state'}
 end
 
 rec['state'] = 'committed'
-redis.call('SET', tx_key, cmsgpack.pack(rec))
+local packed = cmsgpack.pack(rec)
+redis.call('SET', tx_key, packed)
 redis.call('SREM', prep_user_key, rec['txn_id'])
-return {0, 'committed'}
+return {0, packed}
 """
 
 # Lua script for atomic abort_transaction
-# KEYS[1] = user_key, KEYS[2] = txn_key, KEYS[3] = prepared_user_key
+# KEYS[1] = txn_key
 PAYMENT_ABORT_LUA = """
-local user_key = KEYS[1]
-local tx_key = KEYS[2]
-local prep_user_key = KEYS[3]
+local tx_key = KEYS[1]
 
 local raw = redis.call('GET', tx_key)
 if not raw then
     return {0, 'aborted'}
 end
 local rec = cmsgpack.unpack(raw)
+local user_key = rec['user_id']
+local prep_user_key = 'txn:user:' .. rec['user_id'] .. ':prepared'
 if rec['state'] == 'committed' then
     return {-1, 'Cannot abort committed transaction'}
 end
 if rec['state'] == 'aborted' then
     redis.call('SREM', prep_user_key, rec['txn_id'])
-    return {0, 'aborted'}
+    return {0, raw}
 end
 if rec['state'] ~= 'prepared' then
     return {-1, 'Transaction in invalid state'}
@@ -119,9 +120,10 @@ if user_raw then
 end
 
 rec['state'] = 'aborted'
-redis.call('SET', tx_key, cmsgpack.pack(rec))
+local packed = cmsgpack.pack(rec)
+redis.call('SET', tx_key, packed)
 redis.call('SREM', prep_user_key, rec['txn_id'])
-return {0, 'aborted'}
+return {0, packed}
 """
 
 
@@ -131,6 +133,14 @@ class PaymentRepository:
         self._prepare_script = db.register_script(PAYMENT_PREPARE_LUA)
         self._commit_script = db.register_script(PAYMENT_COMMIT_LUA)
         self._abort_script = db.register_script(PAYMENT_ABORT_LUA)
+
+    @staticmethod
+    def _decode_str(value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bytes):
+            return value.decode()
+        return str(value)
 
     async def create_user(self, user_id: str, credit: int = 0):
         try:
@@ -214,19 +224,14 @@ class PaymentRepository:
                 args=[txn_id, user_id, amount],
             )
             status_code = int(result[0])
-            detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
+            payload = result[1]
             if status_code == -2:
-                raise HTTPException(status_code=400, detail=detail)
+                raise HTTPException(status_code=400, detail=self._decode_str(payload))
             if status_code == -1:
-                raise HTTPException(status_code=400, detail=detail)
-            # Read back the record for compatibility
-            raw = await self.db.get(tx_key)
-            if raw:
-                return self._decode_prepare(raw)
-            return PrepareRecord(
-                txn_id=txn_id, user_id=user_id, delta=-int(amount),
-                old_credit=0, new_credit=0, state=TxnState.PREPARED,
-            )
+                raise HTTPException(status_code=400, detail=self._decode_str(payload))
+            if not isinstance(payload, (bytes, bytearray)):
+                raise HTTPException(status_code=400, detail=DB_ERROR_STR)
+            return self._decode_prepare(bytes(payload))
         except HTTPException:
             raise
         except RedisError as exc:
@@ -235,20 +240,14 @@ class PaymentRepository:
     async def commit_transaction(self, txn_id: str) -> PrepareRecord:
         tx_key = txn_key(txn_id)
         try:
-            raw = await self.db.get(tx_key)
-            if raw is None:
-                raise HTTPException(status_code=400, detail=f"Unknown transaction {txn_id}")
-            rec = self._decode_prepare(raw)
-            prep_key = prepared_user_key(rec.user_id)
-            result = await self._commit_script(keys=[tx_key, prep_key], args=[txn_id])
+            result = await self._commit_script(keys=[tx_key], args=[txn_id])
             status_code = int(result[0])
-            detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
+            payload = result[1]
             if status_code == 0:
-                return PrepareRecord(
-                    txn_id=rec.txn_id, user_id=rec.user_id, delta=rec.delta,
-                    old_credit=rec.old_credit, new_credit=rec.new_credit,
-                    state=TxnState.COMMITTED,
-                )
+                if not isinstance(payload, (bytes, bytearray)):
+                    raise HTTPException(status_code=400, detail=DB_ERROR_STR)
+                return self._decode_prepare(bytes(payload))
+            detail = self._decode_str(payload)
             raise HTTPException(status_code=400, detail=f"Transaction {txn_id}: {detail}")
         except HTTPException:
             raise
@@ -258,12 +257,7 @@ class PaymentRepository:
     async def abort_transaction(self, txn_id: str) -> bool:
         tx_key = txn_key(txn_id)
         try:
-            raw = await self.db.get(tx_key)
-            if raw is None:
-                return True
-            rec = self._decode_prepare(raw)
-            prep_key = prepared_user_key(rec.user_id)
-            result = await self._abort_script(keys=[rec.user_id, tx_key, prep_key], args=[])
+            result = await self._abort_script(keys=[tx_key], args=[])
             status_code = int(result[0])
             return status_code == 0
         except HTTPException:

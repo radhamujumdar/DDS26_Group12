@@ -158,27 +158,28 @@ class TwoPCCoordinator:
                             abort_detail = result.detail or "User out of credit"
 
             if abort_detail:
-                # Save any successful prepares before aborting
-                update_kwargs = {}
-                if prepared_set != set(tx.stock_prepared_items):
-                    update_kwargs["stock_prepared_items"] = list(prepared_set)
-                if payment_was_prepared != tx.payment_prepared:
-                    update_kwargs["payment_prepared"] = payment_was_prepared
-                
-                if update_kwargs:
-                    await self.tx_repo.update(tx.tx_id, **update_kwargs)
-                return await self._start_abort(tx.tx_id, abort_detail)
+                tx = await self.tx_repo.persist_prepare_outcome(
+                    tx_id=tx.tx_id,
+                    stock_prepared_items=list(prepared_set),
+                    payment_prepared=payment_was_prepared,
+                    attempts_increment=len(tasks),
+                    error=abort_detail,
+                )
+                return await self._abort_phase(tx)
 
-            # Single write: save prepare results + transition to PREPARED
-            update_kwargs = {
-                "stock_prepared_items": list(prepared_set),
-                "payment_prepared": payment_was_prepared,
-                "state": TxState.PREPARED.value,
-                "attempts": tx.attempts + len(tasks),
-            }
-            tx = await self.tx_repo.update(tx.tx_id, **update_kwargs)
+            tx = await self.tx_repo.persist_prepare_outcome(
+                tx_id=tx.tx_id,
+                stock_prepared_items=list(prepared_set),
+                payment_prepared=payment_was_prepared,
+                attempts_increment=len(tasks),
+            )
         else:
-            tx = await self._transition_state(tx, TxState.PREPARED)
+            tx = await self.tx_repo.persist_prepare_outcome(
+                tx_id=tx.tx_id,
+                stock_prepared_items=list(tx.stock_prepared_items),
+                payment_prepared=tx.payment_prepared,
+                attempts_increment=0,
+            )
 
         return tx
 
@@ -228,35 +229,24 @@ class TwoPCCoordinator:
                         error_detail = r.detail or "Payment commit failed"
 
         if error_detail:
-            update_kwargs = {
-                "state": TxState.COMMITTING.value,
-                "error": error_detail,
-                "attempts": tx.attempts + len(tasks),
-            }
-            if committed_set != set(tx.stock_committed_items):
-                update_kwargs["stock_committed_items"] = list(committed_set)
-            if payment_committed != tx.payment_committed:
-                update_kwargs["payment_committed"] = payment_committed
-            
-            return await self.tx_repo.update(tx.tx_id, **update_kwargs)
+            return await self.tx_repo.persist_commit_progress(
+                tx_id=tx.tx_id,
+                stock_committed_items=list(committed_set),
+                payment_committed=payment_committed,
+                attempts_increment=len(tasks),
+                error=error_detail,
+            )
 
-        # Single write: save commit results + transition to COMMITTED
-        tx = await self.tx_repo.update(
-            tx.tx_id,
+        tx = await self.tx_repo.finalize_commit(
+            tx_id=tx.tx_id,
             stock_committed_items=list(committed_set),
             payment_committed=True,
-            state=TxState.COMMITTED.value,
-            error=None,
-            attempts=tx.attempts + len(tasks),
+            attempts_increment=len(tasks),
         )
-        await self.order_repo.mark_paid(tx.order_id)
-        await self.tx_repo.remove_active(tx.tx_id)
         self._log("tx_terminal", tx_id=tx.tx_id, order_id=tx.order_id, tx_state=tx.state)
         return tx
 
     async def _abort_phase(self, tx: TxRecord) -> TxRecord:
-        tx = await self._transition_state(tx, TxState.ABORTING, error=tx.error)
-
         # Abort all stock items + payment in parallel
         tasks = []
         for item_id, amount in tx.stock_prepared_items:
@@ -283,16 +273,12 @@ class TwoPCCoordinator:
             results = await asyncio.gather(*tasks)
             for kind, iid, result in results:
                 if not result.ok:
-                    tx = await self.tx_repo.update(
-                        tx.tx_id,
-                        state=TxState.ABORTING.value,
+                    return await self.tx_repo.persist_abort_failure(
+                        tx_id=tx.tx_id,
                         error=result.detail or f"{kind} rollback failed",
                     )
-                    return tx
 
-        tx = await self._transition_state(tx, TxState.ABORTED, error=tx.error)
-        await self.tx_repo.remove_active(tx.tx_id)
-        await self.tx_repo.clear_order_tx(tx.order_id)
+        tx = await self.tx_repo.finalize_abort(tx.tx_id, error=tx.error)
         self._log(
             "tx_terminal",
             tx_id=tx.tx_id,
@@ -301,13 +287,6 @@ class TwoPCCoordinator:
             detail=tx.error,
         )
         return tx
-
-    async def _start_abort(self, tx_id: str, error_detail: str) -> TxRecord:
-        tx = await self.tx_repo.get(tx_id)
-        if tx is None:
-            raise HTTPException(status_code=400, detail="Transaction not found")
-        tx = await self._transition_state(tx, TxState.ABORTING, error=error_detail)
-        return await self._abort_phase(tx)
 
     async def _call_with_retries(
         self,
@@ -354,9 +333,6 @@ class TwoPCCoordinator:
                 return tx
             await asyncio.sleep(self.IN_FLIGHT_POLL_SECONDS)
         return None
-
-    async def _transition_state(self, tx: TxRecord, next_state: TxState, error: str | None = None) -> TxRecord:
-        return await self.tx_repo.update(tx.tx_id, state=next_state.value, error=error)
 
     def _log(self, event: str, level: str = "info", **fields):
         log_event(
