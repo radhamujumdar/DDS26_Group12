@@ -51,3 +51,40 @@ but you can find any database you want in https://artifacthub.io/ and adapt the 
 Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
 
 ***Requirements:*** You need to have access to kubectl of a k8s cluster.
+
+### Benchmark runner
+
+The benchmark entrypoint is now a thin shim around the `benchmark` package:
+
+```bash
+python benchmark.py --backends docker-compose --scenarios throughput --modes 2pc saga --users 500 1000 2000 --locust-workers 2
+```
+
+Supported backend/scenario combinations:
+
+* `docker-compose + throughput`
+* `docker-compose + ha`
+* `minikube + throughput`
+* `minikube + ha`
+
+Laptop-safe defaults:
+
+* `--users 500 1000 2000`
+* `--locust-workers 2`
+
+Example commands:
+
+```bash
+python benchmark.py --backends docker-compose --scenarios throughput --modes 2pc saga --users 500 --runs 1 --duration 30s
+python benchmark.py --backends docker-compose --scenarios ha --modes 2pc saga --users 500 --runs 1 --duration 30s
+python benchmark.py --backends minikube --scenarios throughput --modes 2pc saga --users 500 --runs 1 --duration 30s
+python benchmark.py --backends minikube --scenarios ha --modes 2pc saga --users 500 --runs 1 --duration 30s
+```
+
+Results are stored under:
+
+```text
+benchmark-results/<backend>/<scenario>/<mode>/users_<n>/run_<i>_<timestamp>/
+```
+
+Each run directory includes `metadata.json`, Locust CSVs and stdout, the consistency output, and diagnostics when startup or recovery fails.
