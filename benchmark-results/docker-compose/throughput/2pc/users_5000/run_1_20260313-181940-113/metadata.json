@@ -1,0 +1,14 @@
+{
+  "mode": "2pc",
+  "backend": "docker-compose",
+  "scenario": "throughput",
+  "users": 5000,
+  "run_number": 1,
+  "timestamp": "20260313-181940-113",
+  "spawn_rate": 10,
+  "duration": "360s",
+  "locust_workers": 2,
+  "startup_timeout": 300,
+  "kill_schedule_enabled": false,
+  "kill_schedule": []
+}
