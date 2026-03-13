@@ -16,7 +16,7 @@ kind: Deployment
 metadata:
   name: stock-deployment
 spec:
-  replicas: 5
+  replicas: 1
   selector:
     matchLabels:
       component: stock
@@ -30,7 +30,7 @@ spec:
           image: stock:latest
           imagePullPolicy: IfNotPresent
           command: ["gunicorn"]
-          args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "1", "--timeout", "120", "app:app"]
+          args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "$(STOCK_GUNICORN_WORKERS)", "--timeout", "120", "app:app"]
           ports:
             - containerPort: 5000
           livenessProbe:
@@ -46,8 +46,10 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 5
           env:
-            - name: GATEWAY_URL
-              value: "http://gateway:8000"
+            - name: ORDER_SERVICE_URL
+              value: "http://order-service:5000"
+            - name: STOCK_GUNICORN_WORKERS
+              value: "1"
             - name: REDIS_HOST
               value: "stock-db"
             - name: REDIS_PORT

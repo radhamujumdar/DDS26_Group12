@@ -35,8 +35,8 @@ async def lifespan(the_app: FastAPI):
     recovery_service = StockRecoveryService(
         repo=stock_repo,
         stock_service=stock_service,
-        gateway_client=gateway_client,
-        gateway_url=config.gateway_url,
+        order_client=gateway_client,
+        order_service_url=config.order_service_url,
         logger=logger,
         enable_loop=config.enable_recovery_loop,
         lease_key=config.recovery_lease_key,

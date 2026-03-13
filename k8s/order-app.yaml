@@ -16,7 +16,7 @@ kind: Deployment
 metadata:
   name: order-deployment
 spec:
-  replicas: 5
+  replicas: 1
   selector:
     matchLabels:
       component: order
@@ -30,7 +30,7 @@ spec:
           image: order:latest
           imagePullPolicy: IfNotPresent
           command: ["gunicorn"]
-          args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "2", "--timeout", "120", "app:app"]
+          args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "$(ORDER_GUNICORN_WORKERS)", "--timeout", "120", "app:app"]
           ports:
             - containerPort: 5000
           livenessProbe:
@@ -46,8 +46,12 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 5
           env:
-            - name: GATEWAY_URL
-              value: "http://gateway:8000"
+            - name: STOCK_SERVICE_URL
+              value: "http://stock-service:5000"
+            - name: PAYMENT_SERVICE_URL
+              value: "http://payment-service:5000"
+            - name: ORDER_GUNICORN_WORKERS
+              value: "2"
             - name: REDIS_HOST
               value: "order-db"
             - name: REDIS_PORT

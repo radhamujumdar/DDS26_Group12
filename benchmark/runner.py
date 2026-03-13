@@ -47,6 +47,14 @@ def build_metadata_payload(
         "duration": config.duration,
         "locust_workers": config.locust_workers,
         "startup_timeout": config.startup_timeout,
+        "order_replicas": config.sizing.order_replicas,
+        "payment_replicas": config.sizing.payment_replicas,
+        "stock_replicas": config.sizing.stock_replicas,
+        "order_db_replica_count": config.sizing.order_db_replica_count,
+        "payment_db_replica_count": config.sizing.payment_db_replica_count,
+        "stock_db_replica_count": config.sizing.stock_db_replica_count,
+        "saga_broker_replica_count": config.sizing.saga_broker_replica_count,
+        "sentinel_replicas": config.sizing.sentinel_replicas,
         "kill_schedule_enabled": scenario.kill_schedule is not None,
         "kill_schedule": [
             {"delay_seconds": delay_seconds, "target": target}
@@ -310,6 +318,13 @@ def log_configuration(config: BenchmarkConfig, run_specs: Sequence[RunSpec]) -> 
     log(f"  Spawn rate:      {config.spawn_rate}")
     log(f"  Locust workers:  {config.locust_workers}")
     log(f"  Startup timeout: {config.startup_timeout}s")
+    log(
+        "  Sizing:          "
+        f"order={config.sizing.order_replicas}, "
+        f"payment={config.sizing.payment_replicas}, "
+        f"stock={config.sizing.stock_replicas}, "
+        f"sentinel={config.sizing.sentinel_replicas}"
+    )
     log(f"  Results:         {config.paths.results_dir}")
     log(f"  Total runs:      {len(run_specs)}")
 

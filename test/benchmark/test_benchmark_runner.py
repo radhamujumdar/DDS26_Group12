@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from benchmark.config import BenchmarkConfig, BenchmarkPaths, RunSpec
+from benchmark.config import BenchmarkConfig, BenchmarkPaths, RunSpec, read_deployment_sizing
 from benchmark.runner import build_locust_command, build_metadata_payload, build_result_path, write_metadata
 from benchmark.scenarios.ha import SCENARIO as HA_SCENARIO
 from benchmark.scenarios.throughput import SCENARIO as THROUGHPUT_SCENARIO
@@ -39,16 +39,18 @@ def make_config(tmp_path: Path) -> BenchmarkConfig:
         locust_workers=2,
         startup_timeout=300,
         clean=False,
+        sizing=read_deployment_sizing({}),
         paths=make_paths(tmp_path),
     )
 
 
 class BenchmarkRunnerTests(unittest.TestCase):
-    def test_scenario_policies_match_phase_one_requirements(self) -> None:
+    def test_scenario_policies_differ_only_in_failure_behavior(self) -> None:
         self.assertIsNone(THROUGHPUT_SCENARIO.kill_schedule)
         self.assertEqual(THROUGHPUT_SCENARIO.extra_stabilization_seconds, 0)
         self.assertIsNotNone(HA_SCENARIO.kill_schedule)
         self.assertEqual(HA_SCENARIO.extra_stabilization_seconds, 30)
+        self.assertEqual(THROUGHPUT_SCENARIO.locust_defaults, HA_SCENARIO.locust_defaults)
 
     def test_locust_command_uses_explicit_worker_count(self) -> None:
         command = build_locust_command(
@@ -100,6 +102,10 @@ class BenchmarkRunnerTests(unittest.TestCase):
             self.assertEqual(metadata["mode"], "saga")
             self.assertEqual(metadata["users"], 1000)
             self.assertEqual(metadata["locust_workers"], 2)
+            self.assertEqual(metadata["order_replicas"], 1)
+            self.assertEqual(metadata["payment_replicas"], 1)
+            self.assertEqual(metadata["stock_replicas"], 1)
+            self.assertEqual(metadata["sentinel_replicas"], 3)
             self.assertTrue(metadata["kill_schedule_enabled"])
 
 

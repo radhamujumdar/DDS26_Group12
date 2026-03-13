@@ -7,21 +7,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-from benchmark.config import BenchmarkPaths, ScenarioSpec
-
-THROUGHPUT_ENV_REMOVALS = (
-    "REDIS_SENTINEL_HOSTS-",
-    "REDIS_MASTER_NAME-",
-    "SAGA_MQ_SENTINEL_HOSTS-",
-    "SAGA_MQ_MASTER_NAME-",
-)
-APP_DEPLOYMENTS = ("order-deployment", "payment-deployment", "stock-deployment")
+from benchmark.config import BenchmarkPaths, DeploymentSizing, ScenarioSpec
 
 
 class MinikubeBackend:
-    def __init__(self, paths: BenchmarkPaths, startup_timeout: int):
+    def __init__(self, paths: BenchmarkPaths, startup_timeout: int, sizing: DeploymentSizing):
         self.paths = paths
         self.startup_timeout = startup_timeout
+        self.sizing = sizing
         self.current_gateway_url: str | None = None
         self.current_targets: tuple[str, ...] = ()
 
@@ -52,6 +45,7 @@ class MinikubeBackend:
         time.sleep(2)
 
     def up(self, mode: str, scenario: ScenarioSpec) -> None:
+        del scenario
         self._build_images()
         apply_result = subprocess.run(
             ["kubectl", "apply", "-f", str(self.paths.k8s_dir)],
@@ -65,11 +59,12 @@ class MinikubeBackend:
             raise RuntimeError(f"kubectl apply failed: {message}")
 
         self._set_mode(mode)
-        self._apply_scenario_targets(scenario)
-        self.current_targets = tuple(scenario.k8s_targets.keys())
+        self._apply_deployment_sizing()
+        self.current_targets = tuple(self.sizing.k8s_targets().keys())
 
     def wait_ready(self, scenario: ScenarioSpec) -> bool:
-        if not self._wait_for_deployments(scenario.k8s_targets, self.startup_timeout):
+        del scenario
+        if not self._wait_for_deployments(self.sizing.k8s_targets(), self.startup_timeout):
             return False
         gateway_url = self.resolve_gateway_url()
         return self._wait_for_gateway_health(gateway_url, self.startup_timeout)
@@ -224,8 +219,8 @@ class MinikubeBackend:
             message = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(f"Failed to set TX_MODE={mode}: {message}")
 
-    def _apply_scenario_targets(self, scenario: ScenarioSpec) -> None:
-        for deployment, replicas in scenario.k8s_targets.items():
+    def _apply_deployment_sizing(self) -> None:
+        for deployment, replicas in self.sizing.k8s_targets().items():
             scale_result = subprocess.run(
                 ["kubectl", "scale", f"deployment/{deployment}", f"--replicas={replicas}"],
                 cwd=self.paths.project_dir,
@@ -236,21 +231,6 @@ class MinikubeBackend:
             if scale_result.returncode != 0:
                 message = (scale_result.stderr or scale_result.stdout or "").strip()
                 raise RuntimeError(f"Failed to scale deployment/{deployment}: {message}")
-
-        if scenario.name != "throughput":
-            return
-
-        for deployment in APP_DEPLOYMENTS:
-            result = subprocess.run(
-                ["kubectl", "set", "env", f"deployment/{deployment}", *THROUGHPUT_ENV_REMOVALS],
-                cwd=self.paths.project_dir,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if result.returncode != 0:
-                message = (result.stderr or result.stdout or "").strip()
-                raise RuntimeError(f"Failed to remove sentinel env from {deployment}: {message}")
 
     def _wait_for_deployments(self, targets: dict[str, int] | object, timeout: int, interval: int = 5) -> bool:
         deadline = time.time() + timeout

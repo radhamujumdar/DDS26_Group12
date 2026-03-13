@@ -2,30 +2,13 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-from benchmark.config import BenchmarkPaths, ScenarioSpec
+from benchmark.config import BenchmarkPaths, DeploymentSizing, ScenarioSpec
 
-SENTINEL_ENV_VARS = (
-    "REDIS_SENTINEL_HOSTS",
-    "REDIS_MASTER_NAME",
-    "SAGA_MQ_SENTINEL_HOSTS",
-    "SAGA_MQ_MASTER_NAME",
-)
-THROUGHPUT_SERVICES = (
-    "gateway",
-    "order-service",
-    "stock-service",
-    "payment-service",
-    "order-db",
-    "stock-db",
-    "payment-db",
-    "saga-broker",
-)
 COMPOSE_KILL_TARGETS = {
     "payment-deployment": "payment-service",
     "stock-deployment": "stock-service",
@@ -37,31 +20,30 @@ COMPOSE_KILL_TARGETS = {
 
 
 class DockerComposeBackend:
-    def __init__(self, paths: BenchmarkPaths, startup_timeout: int):
+    def __init__(self, paths: BenchmarkPaths, startup_timeout: int, sizing: DeploymentSizing):
         self.paths = paths
         self.startup_timeout = startup_timeout
+        self.sizing = sizing
         self.compose_file = paths.compose_file
-        self.active_compose_file: Path | None = None
-        self.temp_compose_file: Path | None = None
 
     def down(self) -> None:
-        compose_file = self.active_compose_file or self.compose_file
         self._run_compose(
-            compose_file,
+            self.compose_file,
             ["down", "-v", "--remove-orphans"],
             capture_output=True,
         )
-        self._cleanup_temp_compose_file()
 
     def up(self, mode: str, scenario: ScenarioSpec) -> None:
-        if scenario.compose_profile == "throughput":
-            self.active_compose_file = self._create_throughput_compose_file()
-        else:
-            self.active_compose_file = self.compose_file
+        del scenario
 
         result = self._run_compose(
-            self.active_compose_file,
-            ["up", "-d", "--build"],
+            self.compose_file,
+            [
+                "up",
+                "-d",
+                "--build",
+                *self._compose_scale_args(),
+            ],
             env=self._compose_env(mode),
             capture_output=True,
         )
@@ -82,7 +64,7 @@ class DockerComposeBackend:
             raise RuntimeError(f"No Docker Compose kill target mapping for {target}")
 
         result = self._run_compose(
-            self.active_compose_file or self.compose_file,
+            self.compose_file,
             ["kill", service],
             capture_output=True,
         )
@@ -91,15 +73,14 @@ class DockerComposeBackend:
             raise RuntimeError(f"docker compose kill failed for {service}: {message}")
 
     def collect_diagnostics(self, output_dir: Path) -> None:
-        compose_file = self.active_compose_file or self.compose_file
         sections = [
             (
                 "docker compose ps",
-                self._capture_compose(compose_file, ["ps", "--all"]),
+                self._capture_compose(self.compose_file, ["ps", "--all"]),
             ),
             (
                 "docker compose logs",
-                self._capture_compose(compose_file, ["logs", "--no-color", "--tail", "200"]),
+                self._capture_compose(self.compose_file, ["logs", "--no-color", "--tail", "200"]),
             ),
         ]
 
@@ -114,6 +95,12 @@ class DockerComposeBackend:
         env = os.environ.copy()
         env["TX_MODE"] = mode
         return env
+
+    def _compose_scale_args(self) -> list[str]:
+        args: list[str] = []
+        for service, replicas in self.sizing.compose_scales().items():
+            args.extend(["--scale", f"{service}={replicas}"])
+        return args
 
     def _run_compose(
         self,
@@ -157,70 +144,3 @@ class DockerComposeBackend:
                 return True
             time.sleep(interval)
         return False
-
-    def _create_throughput_compose_file(self) -> Path:
-        try:
-            import yaml
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "docker-compose throughput runs require PyYAML. Install it with "
-                "`pip install PyYAML` in the benchmark environment."
-            ) from exc
-
-        with self.compose_file.open("r", encoding="utf-8") as handle:
-            document = yaml.safe_load(handle)
-
-        services = document.get("services", {})
-        throughput_services = {name: services[name] for name in THROUGHPUT_SERVICES}
-        for service_name in ("order-service", "stock-service", "payment-service"):
-            definition = throughput_services[service_name]
-            definition["environment"] = self._strip_sentinel_env(definition.get("environment"))
-            definition["depends_on"] = [
-                dependency
-                for dependency in self._normalize_depends_on(definition.get("depends_on"))
-                if dependency in THROUGHPUT_SERVICES
-            ]
-
-        document["services"] = throughput_services
-
-        temp_file = tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            suffix=".benchmark-compose.yml",
-            prefix="benchmark-",
-            dir=self.paths.project_dir,
-            delete=False,
-        )
-        with temp_file:
-            yaml.safe_dump(document, temp_file, sort_keys=False)
-
-        self.temp_compose_file = Path(temp_file.name)
-        return self.temp_compose_file
-
-    def _strip_sentinel_env(self, environment: object) -> dict[str, str | None]:
-        normalized: dict[str, str | None] = {}
-        if isinstance(environment, dict):
-            normalized.update(environment)
-        elif isinstance(environment, list):
-            for item in environment:
-                if not isinstance(item, str):
-                    continue
-                key, separator, value = item.partition("=")
-                normalized[key] = value if separator else None
-
-        for key in SENTINEL_ENV_VARS:
-            normalized.pop(key, None)
-        return normalized
-
-    def _normalize_depends_on(self, depends_on: object) -> list[str]:
-        if isinstance(depends_on, dict):
-            return list(depends_on.keys())
-        if isinstance(depends_on, list):
-            return [item for item in depends_on if isinstance(item, str)]
-        return []
-
-    def _cleanup_temp_compose_file(self) -> None:
-        if self.temp_compose_file and self.temp_compose_file.exists():
-            self.temp_compose_file.unlink()
-        self.temp_compose_file = None
-        self.active_compose_file = None

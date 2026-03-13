@@ -17,8 +17,8 @@ class PaymentRecoveryService:
         self,
         repo: PaymentRepository,
         payment_service: PaymentService,
-        gateway_client: httpx.AsyncClient,
-        gateway_url: str,
+        order_client: httpx.AsyncClient,
+        order_service_url: str,
         logger: logging.Logger,
         enable_loop: bool = True,
         lease_key: str = "payment:recovery:lease",
@@ -27,8 +27,8 @@ class PaymentRecoveryService:
     ):
         self.repo = repo
         self.payment_service = payment_service
-        self.gateway_client = gateway_client
-        self.gateway_url = gateway_url
+        self.order_client = order_client
+        self.order_service_url = order_service_url.rstrip("/")
         self.logger = logger
         self.enable_loop = bool(enable_loop)
         self.lease_key = lease_key
@@ -124,7 +124,7 @@ class PaymentRecoveryService:
 
     async def _get_coordinator_tx_state(self, txn_id: str) -> str | None:
         try:
-            response = await self.gateway_client.get(f"{self.gateway_url}/orders/2pc/tx/{txn_id}")
+            response = await self.order_client.get(f"{self.order_service_url}/2pc/tx/{txn_id}")
         except httpx.HTTPError:
             return None
 

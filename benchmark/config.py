@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +24,14 @@ DEFAULT_RUNS = 3
 DEFAULT_DURATION = "3m"
 DEFAULT_SPAWN_RATE = 10
 DEFAULT_LOCUST_WORKERS = 2
+DEFAULT_ORDER_REPLICAS = 1
+DEFAULT_PAYMENT_REPLICAS = 1
+DEFAULT_STOCK_REPLICAS = 1
+DEFAULT_ORDER_DB_REPLICA_COUNT = 1
+DEFAULT_PAYMENT_DB_REPLICA_COUNT = 1
+DEFAULT_STOCK_DB_REPLICA_COUNT = 1
+DEFAULT_SAGA_BROKER_REPLICA_COUNT = 1
+DEFAULT_SENTINEL_REPLICAS = 3
 
 
 @dataclass(frozen=True)
@@ -43,8 +52,42 @@ class ScenarioSpec:
     kill_schedule: tuple[tuple[int, str], ...] | None
     extra_stabilization_seconds: int
     locust_defaults: Mapping[str, object]
-    k8s_targets: Mapping[str, int]
-    compose_profile: str
+
+
+@dataclass(frozen=True)
+class DeploymentSizing:
+    order_replicas: int
+    payment_replicas: int
+    stock_replicas: int
+    order_db_replica_count: int
+    payment_db_replica_count: int
+    stock_db_replica_count: int
+    saga_broker_replica_count: int
+    sentinel_replicas: int
+
+    def k8s_targets(self) -> dict[str, int]:
+        return {
+            "gateway": 1,
+            "order-db": 1,
+            "stock-db": 1,
+            "payment-db": 1,
+            "saga-broker": 1,
+            "order-db-replica": self.order_db_replica_count,
+            "stock-db-replica": self.stock_db_replica_count,
+            "payment-db-replica": self.payment_db_replica_count,
+            "saga-broker-replica": self.saga_broker_replica_count,
+            "sentinel": self.sentinel_replicas,
+            "order-deployment": self.order_replicas,
+            "stock-deployment": self.stock_replicas,
+            "payment-deployment": self.payment_replicas,
+        }
+
+    def compose_scales(self) -> dict[str, int]:
+        return {
+            "order-service": self.order_replicas,
+            "stock-service": self.stock_replicas,
+            "payment-service": self.payment_replicas,
+        }
 
 
 @dataclass(frozen=True)
@@ -59,6 +102,7 @@ class BenchmarkConfig:
     locust_workers: int
     startup_timeout: int
     clean: bool
+    sizing: DeploymentSizing
     paths: BenchmarkPaths = field(repr=False)
 
 
@@ -187,6 +231,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def read_deployment_sizing(environment: Mapping[str, str] | None = None) -> DeploymentSizing:
+    env = environment or {}
+    return DeploymentSizing(
+        order_replicas=int(env.get("ORDER_REPLICAS", DEFAULT_ORDER_REPLICAS)),
+        payment_replicas=int(env.get("PAYMENT_REPLICAS", DEFAULT_PAYMENT_REPLICAS)),
+        stock_replicas=int(env.get("STOCK_REPLICAS", DEFAULT_STOCK_REPLICAS)),
+        order_db_replica_count=int(env.get("ORDER_DB_REPLICA_COUNT", DEFAULT_ORDER_DB_REPLICA_COUNT)),
+        payment_db_replica_count=int(env.get("PAYMENT_DB_REPLICA_COUNT", DEFAULT_PAYMENT_DB_REPLICA_COUNT)),
+        stock_db_replica_count=int(env.get("STOCK_DB_REPLICA_COUNT", DEFAULT_STOCK_DB_REPLICA_COUNT)),
+        saga_broker_replica_count=int(env.get("SAGA_BROKER_REPLICA_COUNT", DEFAULT_SAGA_BROKER_REPLICA_COUNT)),
+        sentinel_replicas=int(env.get("SENTINEL_REPLICAS", DEFAULT_SENTINEL_REPLICAS)),
+    )
+
+
 def parse_cli(argv: Sequence[str] | None = None, script_dir: str | Path | None = None) -> BenchmarkConfig:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -201,6 +259,7 @@ def parse_cli(argv: Sequence[str] | None = None, script_dir: str | Path | None =
         locust_workers=args.locust_workers,
         startup_timeout=args.startup_timeout,
         clean=args.clean,
+        sizing=read_deployment_sizing(os.environ),
         paths=resolve_paths(script_dir),
     )
 

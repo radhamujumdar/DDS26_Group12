@@ -1,5 +1,4 @@
 import logging
-import os
 import random
 from contextlib import asynccontextmanager
 
@@ -13,80 +12,75 @@ from redis.asyncio import Redis
 from clients.payment_client import PaymentClient
 from clients.saga_bus import SagaCommandBus
 from clients.stock_client import StockClient
+from config import OrderConfig
 from coordinator.saga import SagaCoordinator
 from coordinator.two_pc import TwoPCCoordinator
 from logging_utils import log_event
-from redis_utils import create_redis_client
 from models import OrderValue, TxMode
+from redis_utils import create_redis_client
 from repository.order_repo import OrderRepository
 from repository.saga_repo import SagaTxRepository
 from repository.tx_repo import TxRepository
 
-
-GATEWAY_URL = os.environ["GATEWAY_URL"]
-TX_MODE = os.environ.get("TX_MODE", TxMode.TWO_PC.value).lower()
-ENABLE_ORDER_DISPATCHER = os.environ.get("ENABLE_ORDER_DISPATCHER", "true").lower() in ("1", "true", "yes", "on")
 logger = logging.getLogger("order-service")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if TX_MODE not in (TxMode.TWO_PC.value, TxMode.SAGA.value):
-        raise RuntimeError(f"Unsupported TX_MODE={TX_MODE}. Expected one of: 2pc, saga")
+    config = OrderConfig.from_env()
+    if config.tx_mode not in (TxMode.TWO_PC.value, TxMode.SAGA.value):
+        raise RuntimeError(f"Unsupported TX_MODE={config.tx_mode}. Expected one of: 2pc, saga")
 
     db = create_redis_client(
-        host=os.environ["REDIS_HOST"],
-        port=int(os.environ["REDIS_PORT"]),
-        password=os.environ["REDIS_PASSWORD"],
-        db=int(os.environ["REDIS_DB"]),
-        sentinel_hosts=os.environ.get("REDIS_SENTINEL_HOSTS"),
-        master_name=os.environ.get("REDIS_MASTER_NAME"),
+        host=config.redis_host,
+        port=config.redis_port,
+        password=config.redis_password,
+        db=config.redis_db,
+        sentinel_hosts=config.redis_sentinel_hosts,
+        master_name=config.redis_master_name,
     )
     saga_broker_db: Redis | None = None
     saga_bus: SagaCommandBus | None = None
-    if TX_MODE == TxMode.SAGA.value:
+    if config.tx_mode == TxMode.SAGA.value:
         saga_broker_db = create_redis_client(
-            host=os.environ.get("SAGA_MQ_REDIS_HOST", os.environ["REDIS_HOST"]),
-            port=int(os.environ.get("SAGA_MQ_REDIS_PORT", os.environ["REDIS_PORT"])),
-            password=os.environ.get("SAGA_MQ_REDIS_PASSWORD", os.environ["REDIS_PASSWORD"]),
-            db=int(os.environ.get("SAGA_MQ_REDIS_DB", "0")),
-            sentinel_hosts=os.environ.get("SAGA_MQ_SENTINEL_HOSTS"),
-            master_name=os.environ.get("SAGA_MQ_MASTER_NAME"),
+            host=config.saga_mq_redis_host,
+            port=config.saga_mq_redis_port,
+            password=config.saga_mq_redis_password,
+            db=config.saga_mq_redis_db,
+            sentinel_hosts=config.saga_mq_sentinel_hosts,
+            master_name=config.saga_mq_master_name,
         )
         saga_bus = SagaCommandBus(
             db=saga_broker_db,
             logger=logger,
-            stream_partitions=int(os.environ.get("SAGA_MQ_STREAM_PARTITIONS", "4")),
-            response_timeout_ms=int(os.environ.get("SAGA_MQ_RESPONSE_TIMEOUT_MS", "3000")),
-            command_stream_maxlen=int(os.environ.get("SAGA_MQ_COMMAND_STREAM_MAXLEN", "100000")),
-            result_stream_maxlen=int(os.environ.get("SAGA_MQ_RESULT_STREAM_MAXLEN", "100000")),
-            pending_ttl_seconds=int(os.environ.get("SAGA_MQ_PENDING_TTL_SECONDS", "3600")),
-            poll_interval_seconds=float(os.environ.get("SAGA_MQ_POLL_INTERVAL_SECONDS", "0.05")),
-            enable_dispatcher=ENABLE_ORDER_DISPATCHER,
-            dispatcher_block_ms=int(os.environ.get("SAGA_MQ_DISPATCH_BLOCK_MS", "1000")),
-            dispatch_lease_ttl_seconds=int(os.environ.get("SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS", "10")),
-            dispatch_renew_interval_seconds=float(
-                os.environ.get("SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS", "2.0")
-            ),
-            owner_id=os.environ.get("SAGA_MQ_OWNER_ID"),
+            stream_partitions=config.saga_mq_stream_partitions,
+            response_timeout_ms=config.saga_mq_response_timeout_ms,
+            command_stream_maxlen=config.saga_mq_command_stream_maxlen,
+            result_stream_maxlen=config.saga_mq_result_stream_maxlen,
+            pending_ttl_seconds=config.saga_mq_pending_ttl_seconds,
+            poll_interval_seconds=config.saga_mq_poll_interval_seconds,
+            enable_dispatcher=config.enable_order_dispatcher,
+            dispatcher_block_ms=config.saga_mq_dispatch_block_ms,
+            dispatch_lease_ttl_seconds=config.saga_mq_dispatch_lease_ttl_seconds,
+            dispatch_renew_interval_seconds=config.saga_mq_dispatch_renew_interval_seconds,
+            owner_id=config.saga_mq_owner_id,
         )
         await saga_bus.start()
-        await saga_bus.recover_stale_pending(
-            stale_after_ms=int(os.environ.get("SAGA_MQ_PENDING_STALE_AFTER_MS", "3000"))
-        )
+        await saga_bus.recover_stale_pending(stale_after_ms=config.saga_mq_pending_stale_after_ms)
 
     http_client = httpx.AsyncClient(
         limits=httpx.Limits(max_connections=2000, max_keepalive_connections=1000),
         timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=30.0),
     )
-    stock_client = StockClient(http_client, GATEWAY_URL, saga_bus=saga_bus)
-    payment_client = PaymentClient(http_client, GATEWAY_URL, saga_bus=saga_bus)
+    stock_client = StockClient(http_client, config.stock_service_url, saga_bus=saga_bus)
+    payment_client = PaymentClient(http_client, config.payment_service_url, saga_bus=saga_bus)
     tx_repo = TxRepository(db)
     saga_repo = SagaTxRepository(db)
 
+    app.state.config = config
     app.state.order_repo = OrderRepository(db)
     app.state.stock_client = stock_client
-    app.state.tx_mode = TX_MODE
+    app.state.tx_mode = config.tx_mode
     app.state.saga_bus = saga_bus
     app.state.saga_broker_db = saga_broker_db
     app.state.coordinator = TwoPCCoordinator(
@@ -105,7 +99,7 @@ async def lifespan(app: FastAPI):
     )
     try:
         log_event(logger, "startup_recovery_begin", service="order-service")
-        if app.state.tx_mode == TxMode.SAGA.value:
+        if config.tx_mode == TxMode.SAGA.value:
             await app.state.saga_coordinator.recover_active_transactions()
         else:
             await app.state.coordinator.recover_active_transactions()
