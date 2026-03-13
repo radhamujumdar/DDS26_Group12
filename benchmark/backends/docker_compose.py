@@ -8,8 +8,6 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import yaml
-
 from benchmark.config import BenchmarkPaths, ScenarioSpec
 
 SENTINEL_ENV_VARS = (
@@ -161,6 +159,14 @@ class DockerComposeBackend:
         return False
 
     def _create_throughput_compose_file(self) -> Path:
+        try:
+            import yaml
+        except ModuleNotFoundError as exc:
+            raise RuntimeError(
+                "docker-compose throughput runs require PyYAML. Install it with "
+                "`pip install PyYAML` in the benchmark environment."
+            ) from exc
+
         with self.compose_file.open("r", encoding="utf-8") as handle:
             document = yaml.safe_load(handle)
 

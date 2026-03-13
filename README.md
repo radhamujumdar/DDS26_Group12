@@ -57,6 +57,7 @@ Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in
 The benchmark entrypoint is now a thin shim around the `benchmark` package:
 
 ```bash
+pip install -r requirements.txt
 python benchmark.py --backends docker-compose --scenarios throughput --modes 2pc saga --users 500 1000 2000 --locust-workers 2
 ```
 

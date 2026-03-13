@@ -102,7 +102,7 @@ def build_locust_command(
     return command
 
 
-def run_init_orders(stress_test_dir: Path) -> bool:
+def run_init_orders(stress_test_dir: Path) -> tuple[bool, str]:
     result = subprocess.run(
         [sys.executable, "init_orders.py"],
         cwd=stress_test_dir,
@@ -111,7 +111,8 @@ def run_init_orders(stress_test_dir: Path) -> bool:
         timeout=300,
         check=False,
     )
-    return result.returncode == 0
+    output = (result.stdout or "") + (("\n" if result.stderr and result.stdout else "") + (result.stderr or ""))
+    return result.returncode == 0, output
 
 
 def run_consistency_test(consistency_test_dir: Path, output_file: Path) -> bool:
@@ -222,7 +223,10 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
             time.sleep(scenario.extra_stabilization_seconds)
 
         log("Running init_orders.py")
-        if not run_init_orders(config.paths.stress_test_dir):
+        init_ok, init_output = run_init_orders(config.paths.stress_test_dir)
+        (output_dir / "init_orders.txt").write_text(init_output, encoding="utf-8")
+        if not init_ok:
+            log("init_orders.py failed; see init_orders.txt")
             diagnostics_needed = True
             return False
 
