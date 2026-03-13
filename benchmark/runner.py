@@ -275,7 +275,10 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
         if kill_thread:
             kill_thread.join(timeout=5)
 
-        log("Waiting for recovery before consistency test")
+        if scenario.kill_schedule:
+            log("Waiting for services to recover before consistency test")
+        else:
+            log("Waiting for services to become healthy before consistency test")
         if not backend.wait_ready(scenario):
             diagnostics_needed = True
             (output_dir / "consistency.txt").write_text(
