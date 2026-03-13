@@ -60,6 +60,19 @@ DEFAULT_KILL_SCHEDULE = [
     (130, "order-db"),
 ]
 
+DEFAULT_STARTUP_TIMEOUT_SECONDS = 300
+K8S_STARTUP_DEPLOYMENTS = (
+    "gateway",
+    "sentinel",
+    "order-db",
+    "stock-db",
+    "payment-db",
+    "saga-broker",
+    "order-deployment",
+    "stock-deployment",
+    "payment-deployment",
+)
+
 
 def log(msg: str):
     ts = time.strftime("%H:%M:%S")
@@ -276,7 +289,132 @@ def docker_kill_container(project_dir: str, service_name: str):
         log(f"  WARNING: could not find pod for {service_name}")
 
 
-def wait_for_gateway(timeout: int = 120, interval: int = 3):
+def wait_for_k8s_deployments(project_dir: str, timeout: int = DEFAULT_STARTUP_TIMEOUT_SECONDS, interval: int = 5):
+    """Wait for the key K8s deployments to have all desired replicas ready."""
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        pending: list[str] = []
+
+        for deployment in K8S_STARTUP_DEPLOYMENTS:
+            result = subprocess.run(
+                [
+                    "kubectl",
+                    "get",
+                    "deployment",
+                    deployment,
+                    "-o",
+                    "jsonpath={.status.readyReplicas}/{.status.replicas}",
+                ],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0:
+                pending.append(f"{deployment} -> missing")
+                continue
+
+            ready_raw = result.stdout.strip() or "0/0"
+            try:
+                ready_str, desired_str = ready_raw.split("/", 1)
+                ready = int(ready_str or "0")
+                desired = int(desired_str or "0")
+            except ValueError:
+                pending.append(f"{deployment} -> unknown ({ready_raw})")
+                continue
+
+            if desired == 0:
+                pending.append(f"{deployment} -> scaled to 0")
+            elif ready < desired:
+                pending.append(f"{deployment} -> {ready}/{desired} ready")
+
+        if not pending:
+            log("  Kubernetes deployments are ready")
+            return True
+
+        log(f"  Waiting for deployments: {', '.join(pending)}")
+        time.sleep(interval)
+
+    log("  ERROR: Kubernetes deployments did not become ready in time")
+    return False
+
+
+def collect_startup_diagnostics(project_dir: str, output_dir: str):
+    """Capture K8s state and recent logs when startup fails."""
+
+    def capture(command: list[str], timeout: int = 60) -> str:
+        try:
+            result = subprocess.run(
+                command,
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return f"Timed out after {timeout}s"
+        except Exception as exc:
+            return f"Failed to run command: {exc}"
+
+        output = result.stdout or ""
+        if result.stderr:
+            output += ("\n" if output else "") + result.stderr
+        return output.strip()
+
+    sections: list[tuple[str, str]] = [
+        ("kubectl get deployments", capture(["kubectl", "get", "deployments", "-o", "wide"])),
+        ("kubectl get pods", capture(["kubectl", "get", "pods", "-o", "wide"])),
+        ("kubectl get services", capture(["kubectl", "get", "services"])),
+        ("kubectl get endpoints", capture(["kubectl", "get", "endpoints"])),
+    ]
+
+    for deployment in K8S_STARTUP_DEPLOYMENTS:
+        sections.append(
+            (
+                f"kubectl describe deployment/{deployment}",
+                capture(["kubectl", "describe", f"deployment/{deployment}"]),
+            )
+        )
+
+    log_targets = [
+        ("component=order", "order"),
+        ("component=payment", "payment"),
+        ("component=stock", "stock"),
+        ("app=saga-broker", "saga-broker"),
+        ("app=sentinel", "sentinel"),
+        ("app=gateway", "gateway"),
+    ]
+    for selector, label in log_targets:
+        pods_raw = capture(["kubectl", "get", "pods", "-l", selector, "-o", "jsonpath={.items[*].metadata.name}"])
+        pod_names = [name for name in pods_raw.split() if name][:2]
+        if not pod_names:
+            sections.append((f"logs[{label}]", "No pods found"))
+            continue
+
+        for pod_name in pod_names:
+            sections.append(
+                (
+                    f"kubectl logs {pod_name}",
+                    capture(["kubectl", "logs", pod_name, "--all-containers=true", "--tail=200"]),
+                )
+            )
+            previous_logs = capture(
+                ["kubectl", "logs", pod_name, "--all-containers=true", "--previous", "--tail=200"]
+            )
+            if previous_logs:
+                sections.append((f"kubectl logs {pod_name} --previous", previous_logs))
+
+    diagnostics_path = os.path.join(output_dir, "startup-diagnostics.txt")
+    with open(diagnostics_path, "w", encoding="utf-8") as diagnostics_file:
+        for title, body in sections:
+            diagnostics_file.write(f"===== {title} =====\n")
+            diagnostics_file.write(body or "<no output>")
+            diagnostics_file.write("\n\n")
+
+    log(f"  Startup diagnostics saved to: {diagnostics_path}")
+
+
+def wait_for_gateway(timeout: int = DEFAULT_STARTUP_TIMEOUT_SECONDS, interval: int = 3):
     """Wait until gateway routing works for all service health endpoints."""
     import urllib.request
     import urllib.error
@@ -416,6 +554,9 @@ def run_consistency_test(output_file: str) -> bool:
         output = result.stdout + "\n" + result.stderr
         with open(output_file, "w") as f:
             f.write(output)
+        if result.returncode != 0:
+            log(f"  WARNING: Consistency test failed (exit code: {result.returncode})")
+            return False
         log("  Consistency test completed")
         return True
     except subprocess.TimeoutExpired:
@@ -465,6 +606,7 @@ def run_single_benchmark(
     users: int,
     spawn_rate: int,
     kill_schedule: list | None,
+    startup_timeout: int,
 ):
     """Run a single benchmark iteration for one mode."""
 
@@ -501,12 +643,20 @@ def run_single_benchmark(
         docker_compose_up(project_dir, env_overrides)
     except RuntimeError as exc:
         log(f"  SKIPPING run - deployment failed: {exc}")
+        collect_startup_diagnostics(project_dir, output_dir)
         docker_compose_down(project_dir)
         return False
 
-    # 3. Wait for gateway
-    if not wait_for_gateway():
+    # 3. Wait for K8s workloads and gateway routing
+    if not wait_for_k8s_deployments(project_dir, timeout=startup_timeout):
+        log("  SKIPPING run - Kubernetes deployments not ready")
+        collect_startup_diagnostics(project_dir, output_dir)
+        docker_compose_down(project_dir)
+        return False
+
+    if not wait_for_gateway(timeout=startup_timeout):
         log("  SKIPPING run - gateway not available")
+        collect_startup_diagnostics(project_dir, output_dir)
         docker_compose_down(project_dir)
         return False
 
@@ -614,6 +764,12 @@ def main():
         action="store_true",
         help="Delete previous benchmark results before starting",
     )
+    parser.add_argument(
+        "--startup-timeout",
+        type=int,
+        default=DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        help="Maximum seconds to wait for K8s deployments and gateway health before skipping a run (default: 300)",
+    )
     args = parser.parse_args()
 
     # Validate paths
@@ -643,6 +799,7 @@ def main():
     log(f"  Users:      {args.users}")
     log(f"  Spawn rate: {args.spawn_rate}")
     log(f"  Kills:      {'disabled' if args.no_kills else 'enabled'}")
+    log(f"  Startup:    {args.startup_timeout}s timeout")
     log(f"  Results:    {RESULTS_DIR}")
     log(f"  Timestamp:  {run_timestamp}")
     log("")
@@ -661,6 +818,7 @@ def main():
                 users=args.users,
                 spawn_rate=args.spawn_rate,
                 kill_schedule=kill_schedule,
+                startup_timeout=args.startup_timeout,
             )
             if success:
                 completed += 1

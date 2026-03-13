@@ -1,0 +1,173 @@
+[2026-03-11 16:28:00,658] ASUS-DR/INFO/root: Waiting for workers to be ready, 0 of 8 connected
+[2026-03-11 16:28:00,663] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_6b8097a0e7b04dec9b84e308ce601b0d (index 0) reported as ready. 1 workers connected.
+[2026-03-11 16:28:00,664] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_e8407303dc5c428c936772bd7b591c53 (index 1) reported as ready. 2 workers connected.
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+[2026-03-11 16:28:00,683] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 16:28:00,683] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 16:28:00,788] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_e3efad7e91534f71aa638cd1dfcc6db7 (index 2) reported as ready. 3 workers connected.
+[2026-03-11 16:28:00,790] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_9538de9798e84ffc9fedeb9f12e50bf6 (index 3) reported as ready. 4 workers connected.
+[2026-03-11 16:28:00,791] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_e106d5a6ea8d4b37904a61f7d7fa59a0 (index 4) reported as ready. 5 workers connected.
+[2026-03-11 16:28:00,792] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_a752a1bc80b54332b225ba5aad740d8c (index 5) reported as ready. 6 workers connected.
+[2026-03-11 16:28:00,793] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_f7ea47e8fe594e12881a2b27352243c2 (index 6) reported as ready. 7 workers connected.
+[2026-03-11 16:28:00,803] ASUS-DR/INFO/locust.runners: Worker ASUS-DR_06e8bdc4f90d4b06bcc8336fcdcd8b94 (index 7) reported as ready. 8 workers connected.
+[2026-03-11 16:28:00,820] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 16:28:00,827] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 16:28:00,829] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 16:28:00,838] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 16:28:00,843] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 16:28:00,850] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 16:28:01,662] ASUS-DR/INFO/locust.main: Run time limit set to 30 seconds
+[2026-03-11 16:28:01,662] ASUS-DR/INFO/locust.main: Starting Locust 2.25.0
+[2026-03-11 16:28:01,663] ASUS-DR/INFO/locust.runners: Sending spawn jobs of 1000 users at 200.00 spawn rate to 8 ready workers
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+[2026-03-11 16:28:06,739] ASUS-DR/INFO/locust.runners: Spawning is complete and report waittime is expired, but not all reports received from workers: {"MicroservicesUser": 800} (800 total users)
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         0     0(0.00%) |      0       0       0      0 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                        1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                        1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                        1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                        1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                        1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                        1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         1   1(100.00%) |   8093    8093    8093   8093 |    0.00        0.00
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                        3   3(100.00%) |  12695    8093   17189  13000 |    0.10        0.10
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         3   3(100.00%) |  12695    8093   17189  13000 |    0.10        0.10
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                        6   6(100.00%) |  15768    8093   22114  17000 |    0.20        0.20
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                         6   6(100.00%) |  15768    8093   22114  17000 |    0.20        0.20
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                       15  15(100.00%) |  17584    8093   22114  17000 |    0.20        0.20
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                        15  15(100.00%) |  17584    8093   22114  17000 |    0.20        0.20
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                       21  21(100.00%) |  18587    8093   22903  20000 |    1.40        1.40
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                        21  21(100.00%) |  18587    8093   22903  20000 |    1.40        1.40
+
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                       21  21(100.00%) |  18587    8093   22903  20000 |    1.40        1.40
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                        21  21(100.00%) |  18587    8093   22903  20000 |    1.40        1.40
+
+[2026-03-11 16:28:31,565] ASUS-DR/INFO/locust.main: --run-time limit reached, shutting down
+[2026-03-11 16:28:31,568] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 16:28:31,568] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 16:28:31,568] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 16:28:31,569] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 16:28:31,569] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 16:28:31,569] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 16:28:31,570] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 16:28:31,571] ASUS-DR/INFO/locust.runners: Got quit message from master, shutting down...
+[2026-03-11 16:28:32,583] ASUS-DR/INFO/locust.main: Shutting down (exit code 1)
+Type     Name                                                                          # reqs      # fails |    Avg     Min     Max    Med |   req/s  failures/s
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+POST     /orders/checkout/[order_id]                                                       25  25(100.00%) |  19876    8093   27782  20000 |    0.84        0.84
+--------|----------------------------------------------------------------------------|-------|-------------|-------|-------|-------|-------|--------|-----------
+         Aggregated                                                                        25  25(100.00%) |  19876    8093   27782  20000 |    0.84        0.84
+
+Response time percentiles (approximated)
+Type     Name                                                                                  50%    66%    75%    80%    90%    95%    98%    99%  99.9% 99.99%   100% # reqs
+--------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+POST     /orders/checkout/[order_id]                                                         20000  21000  22000  23000  27000  28000  28000  28000  28000  28000  28000     25
+--------|--------------------------------------------------------------------------------|--------|------|------|------|------|------|------|------|------|------|------|------
+         Aggregated                                                                          20000  21000  22000  23000  27000  28000  28000  28000  28000  28000  28000     25
+
+Error report
+# occurrences      Error                                                                                               
+------------------|---------------------------------------------------------------------------------------------------------------------------------------------
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 60413"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction 1ec6304c-bbe3-4056-91e2-5c81fe00c53b is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction 09ad73a9-de63-42eb-b155-ead857c4a3b9 is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 21430"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction 655e3721-a1fe-4f43-ba8d-61e7073dd73d is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 90755"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 85849"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction 8b867ca7-b788-453e-b7eb-5636b8618760 is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 24707"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 86978"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 39667"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction fe640baf-f6aa-4352-9374-de490fb88d6d is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 80336"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 89373"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 44805"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction 486b60c1-66be-481f-8b5d-6c46b9562131 is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction dc390a98-32c6-492a-8d00-f168a3b67561 is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction ce71eda1-c49b-4f7d-b2f2-7ff3a191fc61 is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction 1c07dc6a-e066-43ea-80b1-b31e2c05b685 is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction 47112bfe-e630-46a0-8067-3fb140af4920 is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction aff18067-8d86-42dd-803d-3c5682bab37a is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Timed out acquiring saga transaction-create lock for order 24749"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction a967ab8e-3890-4f38-92c9-a748f94e4c59 is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction d4cabb45-9e09-4a35-a5a7-7490dbe695f6 is already in progress"}'
+1                  POST /orders/checkout/[order_id]: '{"detail":"Saga transaction 9372698d-3c9e-4f5b-b80e-f3e675f65b9c is already in progress"}'
+------------------|---------------------------------------------------------------------------------------------------------------------------------------------
+
+[2026-03-11 16:28:58,662] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 16:28:58,720] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 16:28:58,837] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 16:28:59,460] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 16:29:00,421] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 16:29:01,222] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 16:29:01,383] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)
+[2026-03-11 16:29:01,705] ASUS-DR/INFO/locust.main: Shutting down (exit code 0)

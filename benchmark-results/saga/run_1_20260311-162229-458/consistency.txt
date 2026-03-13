@@ -1,0 +1,35 @@
+
+INFO - 04:29:10 - Consistency test - Creating tmp folder...
+INFO - 04:29:10 - Consistency test - tmp folder created
+INFO - 04:29:10 - Consistency test - Populating the databases...
+INFO - 04:29:10 - populate - Creating items ...
+INFO - 04:29:15 - populate - Items created
+INFO - 04:29:15 - populate - Creating users ...
+INFO - 04:29:30 - populate - Users created
+INFO - 04:29:30 - Consistency test - Databases populated
+INFO - 04:29:30 - Consistency test - Starting the load test...
+INFO - 04:29:30 - stress - Creating orders...
+Traceback (most recent call last):
+  File "/mnt/c/Users/Dani/Desktop/Workspace/University/MSc/Q3/CS4550-Distributed-Data-Systems/bm/consistency-test/run_consistency_test.py", line 34, in <module>
+    asyncio.run(stress(item_ids, user_ids))
+  File "/usr/lib/python3.12/asyncio/runners.py", line 194, in run
+    return runner.run(main)
+           ^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/asyncio/base_events.py", line 687, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/mnt/c/Users/Dani/Desktop/Workspace/University/MSc/Q3/CS4550-Distributed-Data-Systems/bm/consistency-test/stress.py", line 77, in stress
+    order_ids, orders_user_id = await create_orders(session, item_ids, user_ids, NUMBER_OF_ORDERS)
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/c/Users/Dani/Desktop/Workspace/University/MSc/Q3/CS4550-Distributed-Data-Systems/bm/consistency-test/stress.py", line 53, in create_orders
+    order_ids = list(await asyncio.gather(*tasks))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/mnt/c/Users/Dani/Desktop/Workspace/University/MSc/Q3/CS4550-Distributed-Data-Systems/bm/consistency-test/stress.py", line 28, in create_order
+    jsn = await resp.json()
+          ^^^^^^^^^^^^^^^^^
+  File "/mnt/c/Users/Dani/Desktop/Workspace/University/MSc/Q3/CS4550-Distributed-Data-Systems/.venv/lib/python3.12/site-packages/aiohttp/client_reqrep.py", line 1176, in json
+    raise ContentTypeError(
+aiohttp.client_exceptions.ContentTypeError: 0, message='Attempt to decode JSON with unexpected mimetype: text/html', url=URL('http://127.0.0.1:8000/orders/create/6c9714e9-0f55-4c2b-8d5d-2f3ac05e829e')
