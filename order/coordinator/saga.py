@@ -18,7 +18,7 @@ from repository.saga_repo import SagaTxRepository
 class SagaCoordinator:
     RETRY_LIMIT = 3
     RETRY_BACKOFF_SECONDS = 0.2
-    IN_FLIGHT_WAIT_SECONDS = 5.0
+    IN_FLIGHT_WAIT_SECONDS = 60.0
     IN_FLIGHT_POLL_SECONDS = 0.1
     TX_LOCK_TTL_SECONDS = 30
     TX_LOCK_RENEW_INTERVAL_SECONDS = 10.0
@@ -175,7 +175,11 @@ class SagaCoordinator:
         tx = await self._transition_state(tx, SagaState.STOCK_RESERVED)
 
         if not tx.payment_debited:
-            tx = await self._transition_state(tx, SagaState.DEBITTING_PAYMENT)
+            tx = await self.saga_repo.update(
+                tx.tx_id,
+                state=SagaState.DEBITTING_PAYMENT.value,
+                error=None,
+            )
             result = await self._call_with_retries(
                 operation_name="debit",
                 operation=lambda attempt: self.payment_client.saga_debit(
@@ -191,14 +195,15 @@ class SagaCoordinator:
             if not result.ok:
                 tx = await self.saga_repo.update(
                     tx.tx_id,
-                    state=SagaState.COMPENSATING.value,
                     error=result.detail or "Payment debit failed",
+                    attempts=tx.attempts + 1,
                 )
                 return await self._compensation_phase(tx)
 
             tx = await self.saga_repo.update(
                 tx.tx_id,
                 payment_debited=True,
+                state=SagaState.PAYMENT_DEBITED.value,
                 attempts=tx.attempts + 1,
             )
 

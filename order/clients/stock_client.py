@@ -9,11 +9,11 @@ class StockClient:
     def __init__(
         self,
         session: httpx.AsyncClient,
-        gateway_url: str,
+        service_url: str,
         saga_bus: SagaCommandBus | None = None,
     ):
         self.session = session
-        self.base_url = f"{gateway_url}/stock"
+        self.base_url = service_url.rstrip("/")
         self.saga_bus = saga_bus
 
     async def find_item(self, item_id: str) -> httpx.Response:

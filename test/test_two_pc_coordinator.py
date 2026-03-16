@@ -42,8 +42,10 @@ class FakeTxRepository:
         self.active: set[str] = set()
         self.tx_locks: set[str] = set()
         self.order_create_locks: dict[str, asyncio.Lock] = {}
+        self.order_repo: FakeOrderRepository | None = None
         self.create_count = 0
         self.create_delay_seconds = 0.0
+        self.update_calls = 0
 
     async def get_or_create_by_order(
         self,
@@ -97,6 +99,7 @@ class FakeTxRepository:
         return self.records.get(tx_id)
 
     async def update(self, tx_id: str, **changes) -> TxRecord:
+        self.update_calls += 1
         existing = self.records.get(tx_id)
         if existing is None:
             raise HTTPException(status_code=400, detail=f"Transaction {tx_id} not found")
@@ -117,6 +120,136 @@ class FakeTxRepository:
             error=changes.get("error", existing.error),
         )
         self.records[tx_id] = updated
+        return updated
+
+    async def persist_prepare_outcome(
+        self,
+        tx_id: str,
+        stock_prepared_items: list[tuple[str, int]],
+        payment_prepared: bool,
+        attempts_increment: int,
+        error: str | None = None,
+    ) -> TxRecord:
+        existing = self.records[tx_id]
+        updated = TxRecord(
+            tx_id=existing.tx_id,
+            order_id=existing.order_id,
+            user_id=existing.user_id,
+            total_cost=existing.total_cost,
+            items=list(existing.items),
+            state=(TxState.ABORTING if error else TxState.PREPARED).value,
+            created_at=existing.created_at,
+            updated_at=_now(),
+            stock_prepared_items=list(stock_prepared_items),
+            stock_committed_items=list(existing.stock_committed_items),
+            payment_prepared=payment_prepared,
+            payment_committed=existing.payment_committed,
+            attempts=existing.attempts + attempts_increment,
+            error=error,
+        )
+        self.records[tx_id] = updated
+        return updated
+
+    async def persist_commit_progress(
+        self,
+        tx_id: str,
+        stock_committed_items: list[tuple[str, int]],
+        payment_committed: bool,
+        attempts_increment: int,
+        error: str,
+    ) -> TxRecord:
+        existing = self.records[tx_id]
+        updated = TxRecord(
+            tx_id=existing.tx_id,
+            order_id=existing.order_id,
+            user_id=existing.user_id,
+            total_cost=existing.total_cost,
+            items=list(existing.items),
+            state=TxState.COMMITTING.value,
+            created_at=existing.created_at,
+            updated_at=_now(),
+            stock_prepared_items=list(existing.stock_prepared_items),
+            stock_committed_items=list(stock_committed_items),
+            payment_prepared=existing.payment_prepared,
+            payment_committed=payment_committed,
+            attempts=existing.attempts + attempts_increment,
+            error=error,
+        )
+        self.records[tx_id] = updated
+        return updated
+
+    async def persist_abort_failure(self, tx_id: str, error: str) -> TxRecord:
+        existing = self.records[tx_id]
+        updated = TxRecord(
+            tx_id=existing.tx_id,
+            order_id=existing.order_id,
+            user_id=existing.user_id,
+            total_cost=existing.total_cost,
+            items=list(existing.items),
+            state=TxState.ABORTING.value,
+            created_at=existing.created_at,
+            updated_at=_now(),
+            stock_prepared_items=list(existing.stock_prepared_items),
+            stock_committed_items=list(existing.stock_committed_items),
+            payment_prepared=existing.payment_prepared,
+            payment_committed=existing.payment_committed,
+            attempts=existing.attempts,
+            error=error,
+        )
+        self.records[tx_id] = updated
+        return updated
+
+    async def finalize_commit(
+        self,
+        tx_id: str,
+        stock_committed_items: list[tuple[str, int]],
+        payment_committed: bool,
+        attempts_increment: int,
+    ) -> TxRecord:
+        existing = self.records[tx_id]
+        updated = TxRecord(
+            tx_id=existing.tx_id,
+            order_id=existing.order_id,
+            user_id=existing.user_id,
+            total_cost=existing.total_cost,
+            items=list(existing.items),
+            state=TxState.COMMITTED.value,
+            created_at=existing.created_at,
+            updated_at=_now(),
+            stock_prepared_items=list(existing.stock_prepared_items),
+            stock_committed_items=list(stock_committed_items),
+            payment_prepared=existing.payment_prepared,
+            payment_committed=payment_committed,
+            attempts=existing.attempts + attempts_increment,
+            error=None,
+        )
+        self.records[tx_id] = updated
+        self.active.discard(tx_id)
+        if self.order_repo is not None:
+            await self.order_repo.mark_paid(updated.order_id)
+        return updated
+
+    async def finalize_abort(self, tx_id: str, error: str | None = None) -> TxRecord:
+        existing = self.records[tx_id]
+        updated = TxRecord(
+            tx_id=existing.tx_id,
+            order_id=existing.order_id,
+            user_id=existing.user_id,
+            total_cost=existing.total_cost,
+            items=list(existing.items),
+            state=TxState.ABORTED.value,
+            created_at=existing.created_at,
+            updated_at=_now(),
+            stock_prepared_items=list(existing.stock_prepared_items),
+            stock_committed_items=list(existing.stock_committed_items),
+            payment_prepared=existing.payment_prepared,
+            payment_committed=existing.payment_committed,
+            attempts=existing.attempts,
+            error=existing.error if error is None else error,
+        )
+        self.records[tx_id] = updated
+        self.active.discard(tx_id)
+        self.order_to_tx.pop(updated.order_id, None)
         return updated
 
     async def remove_active(self, tx_id: str):
@@ -210,6 +343,7 @@ class TestTwoPCCoordinator(unittest.IsolatedAsyncioTestCase):
 
         self.order_repo = FakeOrderRepository()
         self.tx_repo = FakeTxRepository()
+        self.tx_repo.order_repo = self.order_repo
         self.stock_client = FakeStockClient()
         self.payment_client = FakePaymentClient()
         self.coordinator = TwoPCCoordinator(
@@ -246,6 +380,7 @@ class TestTwoPCCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.stock_client.commit_calls[0][2], 3)
         self.assertEqual(len(self.payment_client.prepare_calls), 1)
         self.assertEqual(len(self.payment_client.commit_calls), 1)
+        self.assertEqual(self.tx_repo.update_calls, 0)
 
     async def test_prepare_failure_aborts_without_marking_order_paid(self):
         order_id = "order-2"
@@ -267,8 +402,10 @@ class TestTwoPCCoordinator(unittest.IsolatedAsyncioTestCase):
         tx = next(iter(self.tx_repo.records.values()))
         self.assertEqual(tx.state, TxState.ABORTED.value)
         self.assertFalse(self.order_repo.orders[order_id].paid)
-        self.assertEqual(len(self.payment_client.prepare_calls), 0)
+        self.assertEqual(len(self.payment_client.prepare_calls), 1)
+        self.assertEqual(len(self.payment_client.abort_calls), 1)
         self.assertNotIn(order_id, self.tx_repo.order_to_tx)
+        self.assertEqual(self.tx_repo.update_calls, 0)
 
     async def test_retryable_prepare_failure_retries_and_succeeds(self):
         order_id = "order-3"
@@ -292,6 +429,7 @@ class TestTwoPCCoordinator(unittest.IsolatedAsyncioTestCase):
         tx = next(iter(self.tx_repo.records.values()))
         self.assertEqual(tx.state, TxState.COMMITTED.value)
         self.assertEqual(len(self.stock_client.prepare_calls), 2)
+        self.assertEqual(self.tx_repo.update_calls, 0)
 
     async def test_duplicate_checkout_is_idempotent_and_creates_one_tx(self):
         order_id = "order-4"
@@ -315,6 +453,7 @@ class TestTwoPCCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.payment_client.commit_calls), 1)
         tx = next(iter(self.tx_repo.records.values()))
         self.assertEqual(tx.state, TxState.COMMITTED.value)
+        self.assertEqual(self.tx_repo.update_calls, 0)
 
     async def test_recovery_processes_prepared_transaction_to_commit(self):
         order_id = "order-5"
@@ -344,6 +483,70 @@ class TestTwoPCCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recovered.state, TxState.COMMITTED.value)
         self.assertTrue(self.order_repo.orders[order_id].paid)
         self.assertNotIn("tx-recover-1", self.tx_repo.active)
+        self.assertEqual(self.tx_repo.update_calls, 0)
+
+    async def test_recovery_retries_committing_transaction_until_terminal(self):
+        order_id = "order-6"
+        self.order_repo.orders[order_id] = OrderValue(
+            paid=False,
+            items=[("item-1", 2)],
+            user_id="user-6",
+            total_cost=20,
+        )
+        tx = TxRecord(
+            tx_id="tx-recover-2",
+            order_id=order_id,
+            user_id="user-6",
+            total_cost=20,
+            items=[("item-1", 2)],
+            state=TxState.COMMITTING.value,
+            created_at=_now(),
+            updated_at=_now(),
+            stock_prepared_items=[("item-1", 2)],
+            payment_prepared=True,
+            attempts=1,
+        )
+        self.tx_repo.insert_record(tx, active=True, map_order=True)
+
+        await self.coordinator.recover_active_transactions()
+
+        recovered = self.tx_repo.records["tx-recover-2"]
+        self.assertEqual(recovered.state, TxState.COMMITTED.value)
+        self.assertTrue(self.order_repo.orders[order_id].paid)
+        self.assertNotIn("tx-recover-2", self.tx_repo.active)
+        self.assertEqual(self.tx_repo.update_calls, 0)
+
+    async def test_recovery_retries_aborting_transaction_until_terminal(self):
+        order_id = "order-7"
+        self.order_repo.orders[order_id] = OrderValue(
+            paid=False,
+            items=[("item-1", 1)],
+            user_id="user-7",
+            total_cost=10,
+        )
+        tx = TxRecord(
+            tx_id="tx-recover-3",
+            order_id=order_id,
+            user_id="user-7",
+            total_cost=10,
+            items=[("item-1", 1)],
+            state=TxState.ABORTING.value,
+            created_at=_now(),
+            updated_at=_now(),
+            stock_prepared_items=[("item-1", 1)],
+            payment_prepared=True,
+            error="prepare failed",
+        )
+        self.tx_repo.insert_record(tx, active=True, map_order=True)
+
+        await self.coordinator.recover_active_transactions()
+
+        recovered = self.tx_repo.records["tx-recover-3"]
+        self.assertEqual(recovered.state, TxState.ABORTED.value)
+        self.assertFalse(self.order_repo.orders[order_id].paid)
+        self.assertNotIn(order_id, self.tx_repo.order_to_tx)
+        self.assertNotIn("tx-recover-3", self.tx_repo.active)
+        self.assertEqual(self.tx_repo.update_calls, 0)
 
 
 if __name__ == "__main__":

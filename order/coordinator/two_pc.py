@@ -1,6 +1,5 @@
 import asyncio
 import logging
-import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable
 
@@ -17,7 +16,7 @@ from repository.tx_repo import TxRepository
 class TwoPCCoordinator:
     RETRY_LIMIT = 3
     RETRY_BACKOFF_SECONDS = 0.2
-    IN_FLIGHT_WAIT_SECONDS = 5.0
+    IN_FLIGHT_WAIT_SECONDS = 60.0
     IN_FLIGHT_POLL_SECONDS = 0.1
 
     def __init__(
@@ -36,7 +35,6 @@ class TwoPCCoordinator:
 
     async def checkout(self, order_id: str, order_entry: OrderValue):
         if order_entry.paid:
-            self._log("checkout_skipped_already_paid", order_id=order_id)
             return
 
         tx, created = await self.tx_repo.get_or_create_by_order(
@@ -46,27 +44,10 @@ class TwoPCCoordinator:
             items=self._aggregate_items(order_entry),
             state=TxState.INIT,
         )
-        self._log(
-            "checkout_tx_selected",
-            tx_id=tx.tx_id,
-            order_id=order_id,
-            created=created,
-            tx_state=tx.state,
-        )
 
         tx = await self._process_transaction(tx.tx_id, from_recovery=False)
         if tx.state != TxState.COMMITTED.value:
-            self._log(
-                "checkout_failed",
-                level="warning",
-                tx_id=tx.tx_id,
-                order_id=order_id,
-                tx_state=tx.state,
-                detail=tx.error or "Checkout failed",
-            )
             raise HTTPException(status_code=400, detail=tx.error or "Checkout failed")
-
-        self._log("checkout_completed", tx_id=tx.tx_id, order_id=order_id, tx_state=tx.state)
 
     async def recover_active_transactions(self):
         tx_ids = await self.tx_repo.list_active()
@@ -130,141 +111,174 @@ class TwoPCCoordinator:
             await self.tx_repo.release_tx_lock(tx_id)
 
     async def _prepare_phase(self, tx: TxRecord) -> TxRecord:
-        tx = await self._transition_state(tx, TxState.PREPARING)
-        prepared_items = list(tx.stock_prepared_items)
+        prepared_set = set(tx.stock_prepared_items)
+        payment_was_prepared = tx.payment_prepared
 
-        for item_id, amount in tx.items:
-            if (item_id, amount) in prepared_items:
-                continue
-            result = await self._call_with_retries(
-                operation_name="prepare",
-                operation=lambda item_id=item_id, amount=amount: self.stock_client.prepare_item(tx.tx_id, item_id, amount),
-                tx=tx,
-                phase="prepare",
-                participant="stock",
-                item_id=item_id,
+        # Prepare all stock items + payment in parallel
+        items_to_prepare = [(iid, amt) for iid, amt in tx.items if (iid, amt) not in prepared_set]
+        need_payment = not tx.payment_prepared
+
+        tasks = []
+        for item_id, amount in items_to_prepare:
+            async def _prepare_stock(iid=item_id, a=amount):
+                r = await self._call_with_retries(
+                    operation_name="prepare",
+                    operation=lambda iid=iid, a=a: self.stock_client.prepare_item(tx.tx_id, iid, a),
+                    tx=tx, phase="prepare", participant="stock", item_id=iid,
+                )
+                return ("stock", iid, a, r)
+            tasks.append(_prepare_stock())
+
+        if need_payment:
+            async def _prepare_pay():
+                r = await self._call_with_retries(
+                    operation_name="prepare",
+                    operation=lambda: self.payment_client.prepare(tx.tx_id, tx.user_id, tx.total_cost),
+                    tx=tx, phase="prepare", participant="payment",
+                )
+                return ("payment", None, None, r)
+            tasks.append(_prepare_pay())
+
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            abort_detail = None
+
+            for result_tuple in results:
+                kind, iid, amt, result = result_tuple
+                if result.ok:
+                    if kind == "stock":
+                        prepared_set.add((iid, amt))
+                    elif kind == "payment":
+                        payment_was_prepared = True
+                else:
+                    if abort_detail is None:
+                        if kind == "stock":
+                            abort_detail = result.detail or f"Out of stock on item_id: {iid}"
+                        else:
+                            abort_detail = result.detail or "User out of credit"
+
+            if abort_detail:
+                tx = await self.tx_repo.persist_prepare_outcome(
+                    tx_id=tx.tx_id,
+                    stock_prepared_items=list(prepared_set),
+                    payment_prepared=payment_was_prepared,
+                    attempts_increment=len(tasks),
+                    error=abort_detail,
+                )
+                return await self._abort_phase(tx)
+
+            tx = await self.tx_repo.persist_prepare_outcome(
+                tx_id=tx.tx_id,
+                stock_prepared_items=list(prepared_set),
+                payment_prepared=payment_was_prepared,
+                attempts_increment=len(tasks),
             )
-            if not result.ok:
-                return await self._start_abort(tx.tx_id, result.detail or f"Out of stock on item_id: {item_id}")
-            prepared_items.append((item_id, amount))
-            tx = await self.tx_repo.update(
-                tx.tx_id,
-                stock_prepared_items=prepared_items,
-                attempts=tx.attempts + 1,
+        else:
+            tx = await self.tx_repo.persist_prepare_outcome(
+                tx_id=tx.tx_id,
+                stock_prepared_items=list(tx.stock_prepared_items),
+                payment_prepared=tx.payment_prepared,
+                attempts_increment=0,
             )
 
-        if not tx.payment_prepared:
-            result = await self._call_with_retries(
-                operation_name="prepare",
-                operation=lambda: self.payment_client.prepare(tx.tx_id, tx.user_id, tx.total_cost),
-                tx=tx,
-                phase="prepare",
-                participant="payment",
-            )
-            if not result.ok:
-                return await self._start_abort(tx.tx_id, result.detail or "User out of credit")
-            tx = await self.tx_repo.update(
-                tx.tx_id,
-                payment_prepared=True,
-                attempts=tx.attempts + 1,
-            )
-
-        tx = await self._transition_state(tx, TxState.PREPARED)
         return tx
 
     async def _commit_phase(self, tx: TxRecord) -> TxRecord:
-        tx = await self._transition_state(tx, TxState.COMMITTING)
-        committed_items = list(tx.stock_committed_items)
+        committed_set = set(tx.stock_committed_items)
+        payment_committed = tx.payment_committed
 
-        for item_id, amount in tx.items:
-            if (item_id, amount) in committed_items:
-                continue
-            result = await self._call_with_retries(
+        # Commit all stock items in parallel + payment commit
+        items_to_commit = [(iid, amt) for iid, amt in tx.items if (iid, amt) not in committed_set]
+
+        async def _commit_stock(item_id: str, amount: int) -> tuple[str, int, ParticipantResult]:
+            r = await self._call_with_retries(
                 operation_name="commit",
-                operation=lambda item_id=item_id, amount=amount: self.stock_client.commit_item(tx.tx_id, item_id, amount),
-                tx=tx,
-                phase="commit",
-                participant="stock",
-                item_id=item_id,
+                operation=lambda iid=item_id, a=amount: self.stock_client.commit_item(tx.tx_id, iid, a),
+                tx=tx, phase="commit", participant="stock", item_id=item_id,
             )
-            if not result.ok:
-                return await self.tx_repo.update(
-                    tx.tx_id,
-                    state=TxState.COMMITTING.value,
-                    error=result.detail or f"Stock commit failed for item {item_id}",
+            return item_id, amount, r
+
+        # Run stock commits and payment commit in parallel
+        tasks = [_commit_stock(iid, amt) for iid, amt in items_to_commit]
+        if not payment_committed:
+            async def _commit_payment() -> ParticipantResult:
+                return await self._call_with_retries(
+                    operation_name="commit",
+                    operation=lambda: self.payment_client.commit(tx.tx_id),
+                    tx=tx, phase="commit", participant="payment",
                 )
-            committed_items.append((item_id, amount))
-            tx = await self.tx_repo.update(
-                tx.tx_id,
-                stock_committed_items=committed_items,
-                attempts=tx.attempts + 1,
+            tasks.append(_commit_payment())
+
+        results = await asyncio.gather(*tasks)
+
+        # Process results
+        error_detail = None
+        for r in results:
+            if isinstance(r, tuple):
+                item_id, amount, result = r
+                if result.ok:
+                    committed_set.add((item_id, amount))
+                else:
+                    if error_detail is None:
+                        error_detail = result.detail or f"Stock commit failed for item {item_id}"
+            else:
+                if r.ok:
+                    payment_committed = True
+                else:
+                    if error_detail is None:
+                        error_detail = r.detail or "Payment commit failed"
+
+        if error_detail:
+            return await self.tx_repo.persist_commit_progress(
+                tx_id=tx.tx_id,
+                stock_committed_items=list(committed_set),
+                payment_committed=payment_committed,
+                attempts_increment=len(tasks),
+                error=error_detail,
             )
 
-        if not tx.payment_committed:
-            result = await self._call_with_retries(
-                operation_name="commit",
-                operation=lambda: self.payment_client.commit(tx.tx_id),
-                tx=tx,
-                phase="commit",
-                participant="payment",
-            )
-            if not result.ok:
-                return await self.tx_repo.update(
-                    tx.tx_id,
-                    state=TxState.COMMITTING.value,
-                    error=result.detail or "Payment commit failed",
-                )
-            tx = await self.tx_repo.update(
-                tx.tx_id,
-                payment_committed=True,
-                attempts=tx.attempts + 1,
-            )
-
-        tx = await self._transition_state(tx, TxState.COMMITTED, error=None)
-        await self.order_repo.mark_paid(tx.order_id)
-        await self.tx_repo.remove_active(tx.tx_id)
+        tx = await self.tx_repo.finalize_commit(
+            tx_id=tx.tx_id,
+            stock_committed_items=list(committed_set),
+            payment_committed=True,
+            attempts_increment=len(tasks),
+        )
         self._log("tx_terminal", tx_id=tx.tx_id, order_id=tx.order_id, tx_state=tx.state)
         return tx
 
     async def _abort_phase(self, tx: TxRecord) -> TxRecord:
-        tx = await self._transition_state(tx, TxState.ABORTING, error=tx.error)
-
+        # Abort all stock items + payment in parallel
+        tasks = []
         for item_id, amount in tx.stock_prepared_items:
-            result = await self._call_with_retries(
-                operation_name="abort",
-                operation=lambda item_id=item_id, amount=amount: self.stock_client.abort_item(tx.tx_id, item_id, amount),
-                tx=tx,
-                phase="abort",
-                participant="stock",
-                item_id=item_id,
-            )
-            if not result.ok:
-                tx = await self.tx_repo.update(
-                    tx.tx_id,
-                    state=TxState.ABORTING.value,
-                    error=result.detail or "Stock rollback failed",
+            async def _abort_stock(iid=item_id, a=amount):
+                r = await self._call_with_retries(
+                    operation_name="abort",
+                    operation=lambda iid=iid, a=a: self.stock_client.abort_item(tx.tx_id, iid, a),
+                    tx=tx, phase="abort", participant="stock", item_id=iid,
                 )
-                return tx
+                return ("stock", iid, r)
+            tasks.append(_abort_stock())
 
         if tx.payment_prepared and not tx.payment_committed:
-            result = await self._call_with_retries(
-                operation_name="abort",
-                operation=lambda: self.payment_client.abort(tx.tx_id),
-                tx=tx,
-                phase="abort",
-                participant="payment",
-            )
-            if not result.ok:
-                tx = await self.tx_repo.update(
-                    tx.tx_id,
-                    state=TxState.ABORTING.value,
-                    error=result.detail or "Payment rollback failed",
+            async def _abort_payment():
+                r = await self._call_with_retries(
+                    operation_name="abort",
+                    operation=lambda: self.payment_client.abort(tx.tx_id),
+                    tx=tx, phase="abort", participant="payment",
                 )
-                return tx
+                return ("payment", None, r)
+            tasks.append(_abort_payment())
 
-        tx = await self._transition_state(tx, TxState.ABORTED, error=tx.error)
-        await self.tx_repo.remove_active(tx.tx_id)
-        await self.tx_repo.clear_order_tx(tx.order_id)
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            for kind, iid, result in results:
+                if not result.ok:
+                    return await self.tx_repo.persist_abort_failure(
+                        tx_id=tx.tx_id,
+                        error=result.detail or f"{kind} rollback failed",
+                    )
+
+        tx = await self.tx_repo.finalize_abort(tx.tx_id, error=tx.error)
         self._log(
             "tx_terminal",
             tx_id=tx.tx_id,
@@ -273,13 +287,6 @@ class TwoPCCoordinator:
             detail=tx.error,
         )
         return tx
-
-    async def _start_abort(self, tx_id: str, error_detail: str) -> TxRecord:
-        tx = await self.tx_repo.get(tx_id)
-        if tx is None:
-            raise HTTPException(status_code=400, detail="Transaction not found")
-        tx = await self._transition_state(tx, TxState.ABORTING, error=error_detail)
-        return await self._abort_phase(tx)
 
     async def _call_with_retries(
         self,
@@ -291,7 +298,6 @@ class TwoPCCoordinator:
         item_id: str | None = None,
     ) -> ParticipantResult:
         for attempt in range(1, self.RETRY_LIMIT + 1):
-            started = time.perf_counter()
             try:
                 result = await operation()
             except HTTPException as exc:
@@ -299,26 +305,19 @@ class TwoPCCoordinator:
                 retryable = detail == REQ_ERROR_STR
                 result = ParticipantResult(ok=False, retryable=retryable, detail=detail)
 
-            duration_ms = round((time.perf_counter() - started) * 1000, 3)
-            self._log(
-                "participant_attempt",
-                level="info" if result.ok else "warning",
-                tx_id=tx.tx_id,
-                order_id=tx.order_id,
-                phase=phase,
-                participant=participant,
-                operation=operation_name,
-                item_id=item_id,
-                attempt=attempt,
-                ok=result.ok,
-                retryable=result.retryable,
-                detail=result.detail,
-                duration_ms=duration_ms,
-            )
-
             if result.ok:
                 return result
             if not result.retryable or attempt == self.RETRY_LIMIT:
+                self._log(
+                    "participant_failed",
+                    level="warning",
+                    tx_id=tx.tx_id,
+                    phase=phase,
+                    participant=participant,
+                    item_id=item_id,
+                    attempt=attempt,
+                    detail=result.detail,
+                )
                 return result
             await asyncio.sleep(self.RETRY_BACKOFF_SECONDS * attempt)
 
@@ -334,19 +333,6 @@ class TwoPCCoordinator:
                 return tx
             await asyncio.sleep(self.IN_FLIGHT_POLL_SECONDS)
         return None
-
-    async def _transition_state(self, tx: TxRecord, next_state: TxState, error: str | None = None) -> TxRecord:
-        prev_state = tx.state
-        updated = await self.tx_repo.update(tx.tx_id, state=next_state.value, error=error)
-        self._log(
-            "tx_state_transition",
-            tx_id=updated.tx_id,
-            order_id=updated.order_id,
-            from_state=prev_state,
-            to_state=updated.state,
-            detail=error,
-        )
-        return updated
 
     def _log(self, event: str, level: str = "info", **fields):
         log_event(

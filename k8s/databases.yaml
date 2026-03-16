@@ -1,0 +1,332 @@
+# --- Order DB HA ---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: order-db-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-db
+spec:
+  selector:
+    app: order-db
+  ports:
+    - port: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-db
+  template:
+    metadata:
+      labels:
+        app: order-db
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-bookworm
+        command: ["redis-server", "--requirepass", "redis", "--appendonly", "yes"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: order-db-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-db-replica
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-db-replica
+  template:
+    metadata:
+      labels:
+        app: order-db-replica
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-bookworm
+        command: ["redis-server", "--requirepass", "redis", "--appendonly", "yes", "--replicaof", "order-db", "6379", "--masterauth", "redis"]
+
+# --- Stock DB HA ---
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: stock-db-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: stock-db
+spec:
+  selector:
+    app: stock-db
+  ports:
+    - port: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stock-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stock-db
+  template:
+    metadata:
+      labels:
+        app: stock-db
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-bookworm
+        command: ["redis-server", "--requirepass", "redis", "--appendonly", "yes"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: stock-db-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stock-db-replica
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: stock-db-replica
+  template:
+    metadata:
+      labels:
+        app: stock-db-replica
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-bookworm
+        command: ["redis-server", "--requirepass", "redis", "--appendonly", "yes", "--replicaof", "stock-db", "6379", "--masterauth", "redis"]
+
+# --- Payment DB HA ---
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: payment-db-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-db
+spec:
+  selector:
+    app: payment-db
+  ports:
+    - port: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-db
+  template:
+    metadata:
+      labels:
+        app: payment-db
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-bookworm
+        command: ["redis-server", "--requirepass", "redis", "--appendonly", "yes"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: payment-db-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-db-replica
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-db-replica
+  template:
+    metadata:
+      labels:
+        app: payment-db-replica
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-bookworm
+        command: ["redis-server", "--requirepass", "redis", "--appendonly", "yes", "--replicaof", "payment-db", "6379", "--masterauth", "redis"]
+
+# --- Saga Broker HA ---
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: saga-broker-pvc
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: saga-broker
+spec:
+  selector:
+    app: saga-broker
+  ports:
+    - port: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: saga-broker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: saga-broker
+  template:
+    metadata:
+      labels:
+        app: saga-broker
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-bookworm
+        command: ["redis-server", "--requirepass", "redis", "--appendonly", "yes"]
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: saga-broker-pvc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: saga-broker-replica
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: saga-broker-replica
+  template:
+    metadata:
+      labels:
+        app: saga-broker-replica
+    spec:
+      containers:
+      - name: redis
+        image: redis:7.2-bookworm
+        command: ["redis-server", "--requirepass", "redis", "--appendonly", "yes", "--replicaof", "saga-broker", "6379", "--masterauth", "redis"]
+
+# --- Redis Sentinel (3 nodes) ---
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sentinel-config
+data:
+  sentinel.conf: |
+    port 26379
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+
+    sentinel monitor order-db order-db 6379 2
+    sentinel auth-pass order-db redis
+    sentinel down-after-milliseconds order-db 3000
+    sentinel failover-timeout order-db 10000
+    sentinel parallel-syncs order-db 1
+
+    sentinel monitor stock-db stock-db 6379 2
+    sentinel auth-pass stock-db redis
+    sentinel down-after-milliseconds stock-db 3000
+    sentinel failover-timeout stock-db 10000
+    sentinel parallel-syncs stock-db 1
+
+    sentinel monitor payment-db payment-db 6379 2
+    sentinel auth-pass payment-db redis
+    sentinel down-after-milliseconds payment-db 3000
+    sentinel failover-timeout payment-db 10000
+    sentinel parallel-syncs payment-db 1
+
+    sentinel monitor saga-broker saga-broker 6379 2
+    sentinel auth-pass saga-broker redis
+    sentinel down-after-milliseconds saga-broker 3000
+    sentinel failover-timeout saga-broker 10000
+    sentinel parallel-syncs saga-broker 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel
+spec:
+  selector:
+    app: sentinel
+  ports:
+    - name: sentinel
+      port: 26379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: sentinel
+  template:
+    metadata:
+      labels:
+        app: sentinel
+    spec:
+      containers:
+      - name: sentinel
+        image: redis:7.2-bookworm
+        command: ["sh", "-c", "cp /etc/redis/sentinel.conf /tmp/sentinel.conf && redis-sentinel /tmp/sentinel.conf"]
+        volumeMounts:
+        - name: config
+          mountPath: /etc/redis/sentinel.conf
+          subPath: sentinel.conf
+      volumes:
+      - name: config
+        configMap:
+          name: sentinel-config

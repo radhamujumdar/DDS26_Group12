@@ -9,11 +9,11 @@ class PaymentClient:
     def __init__(
         self,
         session: httpx.AsyncClient,
-        gateway_url: str,
+        service_url: str,
         saga_bus: SagaCommandBus | None = None,
     ):
         self.session = session
-        self.base_url = f"{gateway_url}/payment"
+        self.base_url = service_url.rstrip("/")
         self.saga_bus = saga_bus
 
     async def prepare(self, tx_id: str, user_id: str, amount: int) -> ParticipantResult:

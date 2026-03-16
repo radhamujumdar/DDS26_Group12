@@ -11,9 +11,243 @@ def reservation_key(tx_id: str, item_id: str) -> str:
     return f"txn:{tx_id}:{item_id}"
 
 
+def saga_reservation_key(tx_id: str, item_id: str) -> str:
+    return f"saga:stock:tx:{tx_id}:item:{item_id}"
+
+
+
+# Lua script for atomic prepare: eliminates WATCH/retry loops
+# KEYS[1] = item_id key, KEYS[2] = reservation key
+# ARGV[1] = amount, ARGV[2] = tx_id, ARGV[3] = item_id
+# Returns: [status_code, detail]
+PREPARE_LUA = """
+local item_key = KEYS[1]
+local rkey = KEYS[2]
+local amount = tonumber(ARGV[1])
+local tx_id = ARGV[2]
+local item_id = ARGV[3]
+
+local existing_raw = redis.call('GET', rkey)
+if existing_raw then
+    local existing = cmsgpack.unpack(existing_raw)
+    if tonumber(existing['amount']) ~= amount then
+        return {-1, 'prepare amount mismatch'}
+    end
+    if existing['state'] == 'prepared' then
+        return {1, 'prepared'}
+    end
+    if existing['state'] == 'committed' then
+        return {2, 'already committed'}
+    end
+    return {-1, 'previously aborted'}
+end
+
+local item_raw = redis.call('GET', item_key)
+if not item_raw then
+    return {-1, 'Item not found'}
+end
+local item = cmsgpack.unpack(item_raw)
+if item['stock'] < amount then
+    return {-1, 'insufficient stock'}
+end
+
+item['stock'] = item['stock'] - amount
+redis.call('SET', item_key, cmsgpack.pack(item))
+local reservation = {tx_id=tx_id, item_id=item_id, amount=amount, state='prepared'}
+redis.call('SET', rkey, cmsgpack.pack(reservation))
+return {0, 'prepared'}
+"""
+
+# Lua script for atomic commit
+COMMIT_LUA = """
+local rkey = KEYS[1]
+local amount = tonumber(ARGV[1])
+
+local raw = redis.call('GET', rkey)
+if not raw then
+    return {-1, 'Unknown transaction'}
+end
+local res = cmsgpack.unpack(raw)
+if tonumber(res['amount']) ~= amount then
+    return {-1, 'commit amount mismatch'}
+end
+if res['state'] == 'committed' then
+    return {0, 'committed'}
+end
+if res['state'] == 'aborted' then
+    return {-1, 'cannot commit, already aborted'}
+end
+if res['state'] ~= 'prepared' then
+    return {-1, 'invalid state'}
+end
+
+res['state'] = 'committed'
+redis.call('SET', rkey, cmsgpack.pack(res))
+return {0, 'committed'}
+"""
+
+# Lua script for atomic abort
+ABORT_LUA = """
+local item_key = KEYS[1]
+local rkey = KEYS[2]
+
+local res_raw = redis.call('GET', rkey)
+if not res_raw then
+    return {0, 'aborted'}
+end
+local res = cmsgpack.unpack(res_raw)
+if res['state'] == 'aborted' then
+    return {0, 'aborted'}
+end
+if res['state'] == 'committed' then
+    return {-1, 'cannot abort, already committed'}
+end
+
+local item_raw = redis.call('GET', item_key)
+if item_raw then
+    local item = cmsgpack.unpack(item_raw)
+    item['stock'] = item['stock'] + tonumber(res['amount'])
+    redis.call('SET', item_key, cmsgpack.pack(item))
+end
+
+res['state'] = 'aborted'
+redis.call('SET', rkey, cmsgpack.pack(res))
+return {0, 'aborted'}
+"""
+
+# Lua script for atomic saga reserve on a hot item key
+# KEYS[1] = item key, KEYS[2] = saga reservation hash key
+# ARGV[1] = tx_id, ARGV[2] = item_id, ARGV[3] = amount, ARGV[4] = ttl_seconds
+SAGA_RESERVE_LUA = """
+local item_key = KEYS[1]
+local saga_key = KEYS[2]
+local tx_id = ARGV[1]
+local item_id = ARGV[2]
+local amount = tonumber(ARGV[3])
+local ttl_seconds = tonumber(ARGV[4])
+
+local existing_raw = redis.call('HGETALL', saga_key)
+if next(existing_raw) ~= nil then
+    local existing = {}
+    for i = 1, #existing_raw, 2 do
+        existing[existing_raw[i]] = existing_raw[i + 1]
+    end
+
+    local existing_amount = tonumber(existing['amount'] or '0')
+    local existing_state = existing['state'] or ''
+    if existing_amount ~= amount then
+        return {-1, 'Saga reserve amount mismatch for tx=' .. tx_id .. ', item=' .. item_id}
+    end
+    if existing_state == 'reserved' then
+        return {1, 'already reserved'}
+    end
+    if existing_state == 'released' then
+        return {-1, 'Saga tx=' .. tx_id .. ', item=' .. item_id .. ' already released'}
+    end
+    return {-1, 'Invalid saga stock state: ' .. existing_state}
+end
+
+local item_raw = redis.call('GET', item_key)
+if not item_raw then
+    return {-1, 'Item: ' .. item_id .. ' not found!'}
+end
+
+local item = cmsgpack.unpack(item_raw)
+if item['stock'] < amount then
+    return {
+        -1,
+        'Item: ' .. item_id .. ' insufficient stock (have ' .. tostring(item['stock']) .. ', need ' .. tostring(amount) .. ')'
+    }
+end
+
+item['stock'] = item['stock'] - amount
+local now = redis.call('TIME')
+local now_ms = tostring((tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000))
+
+redis.call('SET', item_key, cmsgpack.pack(item))
+redis.call(
+    'HSET',
+    saga_key,
+    'tx_id', tx_id,
+    'item_id', item_id,
+    'amount', tostring(amount),
+    'state', 'reserved',
+    'created_at_ms', now_ms,
+    'updated_at_ms', now_ms
+)
+redis.call('EXPIRE', saga_key, ttl_seconds)
+return {0, 'reserved'}
+"""
+
+# Lua script for atomic saga release
+# KEYS[1] = item key, KEYS[2] = saga reservation hash key
+# ARGV[1] = tx_id, ARGV[2] = item_id, ARGV[3] = amount, ARGV[4] = ttl_seconds
+SAGA_RELEASE_LUA = """
+local item_key = KEYS[1]
+local saga_key = KEYS[2]
+local tx_id = ARGV[1]
+local item_id = ARGV[2]
+local amount = tonumber(ARGV[3])
+local ttl_seconds = tonumber(ARGV[4])
+
+local now = redis.call('TIME')
+local now_ms = tostring((tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000))
+local existing_raw = redis.call('HGETALL', saga_key)
+
+if next(existing_raw) == nil then
+    redis.call(
+        'HSET',
+        saga_key,
+        'tx_id', tx_id,
+        'item_id', item_id,
+        'amount', tostring(amount),
+        'state', 'released',
+        'created_at_ms', now_ms,
+        'updated_at_ms', now_ms
+    )
+    redis.call('EXPIRE', saga_key, ttl_seconds)
+    return {1, 'already released'}
+end
+
+local existing = {}
+for i = 1, #existing_raw, 2 do
+    existing[existing_raw[i]] = existing_raw[i + 1]
+end
+
+local existing_amount = tonumber(existing['amount'] or '0')
+local existing_state = existing['state'] or ''
+if existing_amount ~= amount then
+    return {-1, 'Saga release amount mismatch for tx=' .. tx_id .. ', item=' .. item_id}
+end
+if existing_state == 'released' then
+    return {1, 'already released'}
+end
+if existing_state ~= 'reserved' then
+    return {-1, 'Invalid saga stock state: ' .. existing_state}
+end
+
+local item_raw = redis.call('GET', item_key)
+if not item_raw then
+    return {-1, 'Item: ' .. item_id .. ' not found!'}
+end
+
+local item = cmsgpack.unpack(item_raw)
+item['stock'] = item['stock'] + amount
+redis.call('SET', item_key, cmsgpack.pack(item))
+redis.call('HSET', saga_key, 'state', 'released', 'updated_at_ms', now_ms)
+redis.call('EXPIRE', saga_key, ttl_seconds)
+return {0, 'released'}
+"""
+
+
 class StockRepository:
     def __init__(self, db: Redis):
         self.db = db
+        self._prepare_script = db.register_script(PREPARE_LUA)
+        self._commit_script = db.register_script(COMMIT_LUA)
+        self._abort_script = db.register_script(ABORT_LUA)
+        self._saga_reserve_script = db.register_script(SAGA_RESERVE_LUA)
+        self._saga_release_script = db.register_script(SAGA_RELEASE_LUA)
 
     async def create_item(self, item_id: str, price: int):
         value = msgpack.encode(StockValue(stock=0, price=int(price)))
@@ -100,56 +334,17 @@ class StockRepository:
     async def prepare_reservation(self, tx_id: str, item_id: str, amount: int) -> str:
         rkey = reservation_key(tx_id, item_id)
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
-                while True:
-                    try:
-                        await pipe.watch(item_id, rkey)
-                        existing_raw = await pipe.get(rkey)
-                        if existing_raw is not None:
-                            existing = self._decode_reservation(existing_raw)
-                            if int(existing.amount) != int(amount):
-                                await pipe.unwatch()
-                                raise HTTPException(
-                                    status_code=400,
-                                    detail=f"Txn {tx_id}: prepare amount mismatch for item {item_id}",
-                                )
-                            if existing.state == ReservationState.PREPARED:
-                                await pipe.unwatch()
-                                return ReservationState.PREPARED.value
-                            if existing.state == ReservationState.COMMITTED:
-                                await pipe.unwatch()
-                                return "already committed"
-                            await pipe.unwatch()
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Txn {tx_id}: previously aborted for item {item_id}",
-                            )
-
-                        item_raw = await pipe.get(item_id)
-                        if item_raw is None:
-                            await pipe.unwatch()
-                            raise HTTPException(status_code=400, detail=f"Item: {item_id} not found!")
-                        item = self._decode_stock(item_raw)
-                        if item.stock < amount:
-                            await pipe.unwatch()
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Item: {item_id} insufficient stock (have {item.stock}, need {amount})",
-                            )
-                        item.stock -= amount
-                        reservation = Reservation(
-                            tx_id=tx_id,
-                            item_id=item_id,
-                            amount=amount,
-                            state=ReservationState.PREPARED,
-                        )
-                        pipe.multi()
-                        pipe.set(item_id, msgpack.encode(item))
-                        pipe.set(rkey, msgpack.encode(reservation))
-                        await pipe.execute()
-                        return ReservationState.PREPARED.value
-                    except WatchError:
-                        continue
+            result = await self._prepare_script(
+                keys=[item_id, rkey],
+                args=[amount, tx_id, item_id],
+            )
+            status_code = int(result[0])
+            detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
+            if status_code == 0 or status_code == 1:
+                return ReservationState.PREPARED.value
+            if status_code == 2:
+                return "already committed"
+            raise HTTPException(status_code=400, detail=f"Txn {tx_id}: {detail} for item {item_id}")
         except HTTPException:
             raise
         except RedisError as exc:
@@ -158,51 +353,12 @@ class StockRepository:
     async def commit_reservation(self, tx_id: str, item_id: str, amount: int) -> str:
         rkey = reservation_key(tx_id, item_id)
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
-                while True:
-                    try:
-                        await pipe.watch(rkey)
-                        raw = await pipe.get(rkey)
-                        if raw is None:
-                            await pipe.unwatch()
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Unknown transaction {tx_id} for item {item_id}",
-                            )
-                        reservation = self._decode_reservation(raw)
-                        if int(amount) != int(reservation.amount):
-                            await pipe.unwatch()
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Txn {tx_id}: commit amount mismatch for item {item_id}",
-                            )
-                        if reservation.state == ReservationState.COMMITTED:
-                            await pipe.unwatch()
-                            return ReservationState.COMMITTED.value
-                        if reservation.state == ReservationState.ABORTED:
-                            await pipe.unwatch()
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Txn {tx_id}: cannot commit, already aborted for item {item_id}",
-                            )
-                        if reservation.state != ReservationState.PREPARED:
-                            await pipe.unwatch()
-                            raise HTTPException(
-                                status_code=400,
-                                detail=f"Txn {tx_id}: invalid state {reservation.state.value} for item {item_id}",
-                            )
-                        updated = Reservation(
-                            tx_id=reservation.tx_id,
-                            item_id=reservation.item_id,
-                            amount=reservation.amount,
-                            state=ReservationState.COMMITTED,
-                        )
-                        pipe.multi()
-                        pipe.set(rkey, msgpack.encode(updated))
-                        await pipe.execute()
-                        return ReservationState.COMMITTED.value
-                    except WatchError:
-                        continue
+            result = await self._commit_script(keys=[rkey], args=[amount])
+            status_code = int(result[0])
+            detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
+            if status_code == 0:
+                return ReservationState.COMMITTED.value
+            raise HTTPException(status_code=400, detail=f"Txn {tx_id}: {detail} for item {item_id}")
         except HTTPException:
             raise
         except RedisError as exc:
@@ -211,69 +367,50 @@ class StockRepository:
     async def abort_reservation(self, tx_id: str, item_id: str, amount: int) -> str:
         rkey = reservation_key(tx_id, item_id)
         try:
-            raw = await self.db.get(rkey)
+            result = await self._abort_script(keys=[item_id, rkey], args=[])
+            status_code = int(result[0])
+            detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
+            if status_code == 0:
+                return ReservationState.ABORTED.value
+            raise HTTPException(status_code=400, detail=f"Txn {tx_id}: {detail} for item {item_id}")
+        except HTTPException:
+            raise
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
-        if raw is None:
-            return ReservationState.ABORTED.value
-
-        reservation = self._decode_reservation(raw)
-        if int(amount) != int(reservation.amount):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Txn {tx_id}: abort amount mismatch for item {item_id}",
-            )
-        if reservation.state == ReservationState.ABORTED:
-            return ReservationState.ABORTED.value
-        if reservation.state == ReservationState.COMMITTED:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Txn {tx_id}: cannot abort, already committed for item {item_id}",
-            )
-
-        success = await self._do_abort(tx_id=tx_id, item_id=item_id)
-        if not success:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR)
-        return ReservationState.ABORTED.value
-
-    async def _do_abort(self, tx_id: str, item_id: str) -> bool:
-        rkey = reservation_key(tx_id, item_id)
+    async def saga_reserve_item(self, tx_id: str, item_id: str, amount: int, ttl_seconds: int) -> str:
+        skey = saga_reservation_key(tx_id, item_id)
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
-                while True:
-                    try:
-                        await pipe.watch(item_id, rkey)
-                        res_raw = await pipe.get(rkey)
-                        if res_raw is None:
-                            return True
+            result = await self._saga_reserve_script(
+                keys=[item_id, skey],
+                args=[tx_id, item_id, amount, ttl_seconds],
+            )
+            status_code = int(result[0])
+            detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
+            if status_code in (0, 1):
+                return detail
+            raise HTTPException(status_code=400, detail=detail)
+        except HTTPException:
+            raise
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
-                        current_res = self._decode_reservation(res_raw)
-                        if current_res.state == ReservationState.ABORTED:
-                            return True
-                        if current_res.state == ReservationState.COMMITTED:
-                            return False
-
-                        item_raw = await pipe.get(item_id)
-                        pipe.multi()
-                        if item_raw is not None:
-                            item = self._decode_stock(item_raw)
-                            item.stock += current_res.amount
-                            pipe.set(item_id, msgpack.encode(item))
-
-                        updated = Reservation(
-                            tx_id=current_res.tx_id,
-                            item_id=current_res.item_id,
-                            amount=current_res.amount,
-                            state=ReservationState.ABORTED,
-                        )
-                        pipe.set(rkey, msgpack.encode(updated))
-                        await pipe.execute()
-                        return True
-                    except WatchError:
-                        continue
-        except RedisError:
-            return False
+    async def saga_release_item(self, tx_id: str, item_id: str, amount: int, ttl_seconds: int) -> str:
+        skey = saga_reservation_key(tx_id, item_id)
+        try:
+            result = await self._saga_release_script(
+                keys=[item_id, skey],
+                args=[tx_id, item_id, amount, ttl_seconds],
+            )
+            status_code = int(result[0])
+            detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
+            if status_code in (0, 1):
+                return detail
+            raise HTTPException(status_code=400, detail=detail)
+        except HTTPException:
+            raise
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     @staticmethod
     def _decode_stock(raw: bytes) -> StockValue:

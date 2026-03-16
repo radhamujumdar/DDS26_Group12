@@ -345,7 +345,7 @@ class SagaCommandBus:
             )
             return
 
-        if decoded.get("status") != "pending":
+        if decoded.get("status") not in {"pending", "timed_out"}:
             await self._incr_metric("result_for_non_pending_total")
             return
 

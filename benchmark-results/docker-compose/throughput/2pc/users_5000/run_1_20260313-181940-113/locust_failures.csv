@@ -1,0 +1,4 @@
+Method,Name,Error,Occurrences
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 24133""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 83119""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 36722""}')",1

@@ -1,0 +1,74 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+spec:
+  type: ClusterIP
+  selector:
+    component: payment
+  ports:
+    - port: 5000
+      name: http
+      targetPort: 5000
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-deployment
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      component: payment
+  template:
+    metadata:
+      labels:
+        component: payment
+    spec:
+      containers:
+        - name: payment
+          image: payment:latest
+          imagePullPolicy: IfNotPresent
+          command: ["gunicorn"]
+          args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "$(PAYMENT_GUNICORN_WORKERS)", "--timeout", "120", "app:app"]
+          ports:
+            - containerPort: 5000
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 5
+          env:
+            - name: ORDER_SERVICE_URL
+              value: "http://order-service:5000"
+            - name: PAYMENT_GUNICORN_WORKERS
+              value: "1"
+            - name: REDIS_HOST
+              value: "payment-db"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_PASSWORD
+              value: "redis"
+            - name: REDIS_DB
+              value: "0"
+            - name: REDIS_SENTINEL_HOSTS
+              value: "sentinel:26379"
+            - name: REDIS_MASTER_NAME
+              value: "payment-db"
+            - name: SAGA_MQ_REDIS_HOST
+              value: "saga-broker"
+            - name: SAGA_MQ_REDIS_PORT
+              value: "6379"
+            - name: SAGA_MQ_REDIS_PASSWORD
+              value: "redis"
+            - name: SAGA_MQ_SENTINEL_HOSTS
+              value: "sentinel:26379"
+            - name: SAGA_MQ_MASTER_NAME
+              value: "saga-broker"

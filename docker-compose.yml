@@ -17,8 +17,10 @@ services:
     build: ./order
     image: order:latest
     environment:
-      - GATEWAY_URL=http://gateway:80
+      - STOCK_SERVICE_URL=${STOCK_SERVICE_URL:-http://stock-service:5000}
+      - PAYMENT_SERVICE_URL=${PAYMENT_SERVICE_URL:-http://payment-service:5000}
       - TX_MODE=${TX_MODE:-2pc}
+      - ORDER_GUNICORN_WORKERS=${ORDER_GUNICORN_WORKERS:-2}
       - ENABLE_ORDER_DISPATCHER=${ENABLE_ORDER_DISPATCHER:-true}
       - SAGA_MQ_REDIS_HOST=saga-broker
       - SAGA_MQ_REDIS_PORT=6379
@@ -38,7 +40,6 @@ services:
       - REDIS_MASTER_NAME=order-db
       - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
       - SAGA_MQ_MASTER_NAME=saga-broker
-    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -48,7 +49,9 @@ services:
       - sentinel-2
       - sentinel-3
     restart: always
-
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
+      -w $${ORDER_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
 
   order-db:
     image: redis:7.2-bookworm
@@ -79,7 +82,8 @@ services:
     build: ./stock
     image: stock:latest
     environment:
-      - GATEWAY_URL=http://gateway:80
+      - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
+      - STOCK_GUNICORN_WORKERS=${STOCK_GUNICORN_WORKERS:-1}
       - SAGA_MQ_REDIS_HOST=saga-broker
       - SAGA_MQ_REDIS_PORT=6379
       - SAGA_MQ_REDIS_PASSWORD=redis
@@ -99,7 +103,6 @@ services:
       - REDIS_MASTER_NAME=stock-db
       - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
       - SAGA_MQ_MASTER_NAME=saga-broker
-    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -109,7 +112,9 @@ services:
       - sentinel-2
       - sentinel-3
     restart: always
-
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
+      -w $${STOCK_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
 
   stock-db:
     image: redis:7.2-bookworm
@@ -127,7 +132,8 @@ services:
     build: ./payment
     image: user:latest
     environment:
-      - GATEWAY_URL=http://gateway:80
+      - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
+      - PAYMENT_GUNICORN_WORKERS=${PAYMENT_GUNICORN_WORKERS:-1}
       - SAGA_MQ_REDIS_HOST=saga-broker
       - SAGA_MQ_REDIS_PORT=6379
       - SAGA_MQ_REDIS_PASSWORD=redis
@@ -147,7 +153,6 @@ services:
       - REDIS_MASTER_NAME=payment-db
       - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
       - SAGA_MQ_MASTER_NAME=saga-broker
-    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
     depends_on:
@@ -157,7 +162,9 @@ services:
       - sentinel-2
       - sentinel-3
     restart: always
-
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
+      -w $${PAYMENT_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
 
   payment-db:
     image: redis:7.2-bookworm

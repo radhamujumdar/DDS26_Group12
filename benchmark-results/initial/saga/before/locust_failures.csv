@@ -1,0 +1,5 @@
+Method,Name,Error,Occurrences
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Requests error order""}')",213
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Transaction 96993055-822b-4aac-8828-0948dc4585fe is already in progress""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Transaction e821bcd8-70e3-4aa8-8297-71b922b2c95d is already in progress""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Transaction 98507aee-3044-4fbe-98ef-f6153b5317ae is already in progress""}')",1

@@ -1,4 +1,3 @@
-import asyncio
 import time
 import uuid
 
@@ -9,13 +8,26 @@ from redis.asyncio import Redis
 
 from models import DB_ERROR_STR, SagaState, SagaTxRecord
 
+CREATE_SAGA_TX_BY_ORDER_SCRIPT = """
+local order_key = KEYS[1]
+local tx_key = KEYS[2]
+local active_key = KEYS[3]
+local existing = redis.call('GET', order_key)
+if existing then
+    return {existing, 0}
+end
+redis.call('SET', order_key, ARGV[1])
+redis.call('SET', tx_key, ARGV[2])
+redis.call('SADD', active_key, ARGV[1])
+return {ARGV[1], 1}
+"""
+
 
 class SagaTxRepository:
     TX_PREFIX = "saga:tx:"
     TX_ACTIVE = "saga:tx:active"
     TX_ORDER_PREFIX = "saga:tx:order:"
     TX_LOCK_PREFIX = "saga:tx:lock:"
-    TX_ORDER_CREATE_LOCK_PREFIX = "saga:tx:order:create-lock:"
 
     def __init__(self, db: Redis):
         self.db = db
@@ -29,9 +41,6 @@ class SagaTxRepository:
     def _tx_lock_key(self, tx_id: str) -> str:
         return f"{self.TX_LOCK_PREFIX}{tx_id}"
 
-    def _tx_order_create_lock_key(self, order_id: str) -> str:
-        return f"{self.TX_ORDER_CREATE_LOCK_PREFIX}{order_id}"
-
     @staticmethod
     def _decode_str(value) -> str:
         if value is None:
@@ -39,6 +48,27 @@ class SagaTxRepository:
         if isinstance(value, bytes):
             return value.decode()
         return str(value)
+
+    def _build_record(
+        self,
+        tx_id: str,
+        order_id: str,
+        user_id: str,
+        total_cost: int,
+        items: list[tuple[str, int]],
+        state: SagaState,
+    ) -> SagaTxRecord:
+        now = time.time()
+        return SagaTxRecord(
+            tx_id=tx_id,
+            order_id=order_id,
+            user_id=user_id,
+            total_cost=total_cost,
+            items=items,
+            state=state.value,
+            created_at=now,
+            updated_at=now,
+        )
 
     async def create(
         self,
@@ -48,17 +78,13 @@ class SagaTxRepository:
         items: list[tuple[str, int]],
         state: SagaState = SagaState.INIT,
     ) -> SagaTxRecord:
-        tx_id = str(uuid.uuid4())
-        now = time.time()
-        record = SagaTxRecord(
-            tx_id=tx_id,
+        record = self._build_record(
+            tx_id=str(uuid.uuid4()),
             order_id=order_id,
             user_id=user_id,
             total_cost=total_cost,
             items=items,
-            state=state.value,
-            created_at=now,
-            updated_at=now,
+            state=state,
         )
         try:
             async with self.db.pipeline(transaction=True) as pipe:
@@ -77,37 +103,48 @@ class SagaTxRepository:
         total_cost: int,
         items: list[tuple[str, int]],
         state: SagaState = SagaState.INIT,
-        wait_timeout_seconds: float = 2.0,
+        wait_timeout_seconds: float = 60.0,
     ) -> tuple[SagaTxRecord, bool]:
         deadline = time.monotonic() + wait_timeout_seconds
         while True:
-            existing = await self.get_by_order(order_id)
+            proposed_tx_id = str(uuid.uuid4())
+            proposed_record = self._build_record(
+                tx_id=proposed_tx_id,
+                order_id=order_id,
+                user_id=user_id,
+                total_cost=total_cost,
+                items=items,
+                state=state,
+            )
+
+            try:
+                result = await self.db.eval(
+                    CREATE_SAGA_TX_BY_ORDER_SCRIPT,
+                    3,
+                    self._tx_order_key(order_id),
+                    self._tx_key(proposed_tx_id),
+                    self.TX_ACTIVE,
+                    proposed_tx_id,
+                    msgpack.encode(proposed_record),
+                )
+            except redis.exceptions.RedisError as exc:
+                raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+
+            existing_tx_id = self._decode_str(result[0] if isinstance(result, (list, tuple)) and result else None)
+            created = bool(result[1]) if isinstance(result, (list, tuple)) and len(result) > 1 else False
+            if created:
+                return proposed_record, True
+
+            existing = await self.get(existing_tx_id)
             if existing is not None:
                 return existing, False
 
-            locked = await self.acquire_order_create_lock(order_id)
-            if locked:
-                try:
-                    existing = await self.get_by_order(order_id)
-                    if existing is not None:
-                        return existing, False
-                    created = await self.create(
-                        order_id=order_id,
-                        user_id=user_id,
-                        total_cost=total_cost,
-                        items=items,
-                        state=state,
-                    )
-                    return created, True
-                finally:
-                    await self.release_order_create_lock(order_id)
-
+            await self.clear_order_tx(order_id)
             if time.monotonic() >= deadline:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Timed out acquiring saga transaction-create lock for order {order_id}",
+                    detail=f"Timed out resolving saga transaction for order {order_id}",
                 )
-            await asyncio.sleep(0.05)
 
     async def get(self, tx_id: str) -> SagaTxRecord | None:
         try:
@@ -241,18 +278,5 @@ class SagaTxRepository:
                         return True
                     except redis.WatchError:
                         continue
-        except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
-
-    async def acquire_order_create_lock(self, order_id: str, ttl_seconds: int = 10) -> bool:
-        try:
-            was_set = await self.db.set(self._tx_order_create_lock_key(order_id), "1", nx=True, ex=ttl_seconds)
-        except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
-        return bool(was_set)
-
-    async def release_order_create_lock(self, order_id: str):
-        try:
-            await self.db.delete(self._tx_order_create_lock_key(order_id))
         except redis.exceptions.RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc

@@ -1,0 +1,9 @@
+Method,Name,Error,Occurrences
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 32686""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 59464""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 89543""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 45482""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 58401""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 87447""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 64027""}')",1
+POST,/orders/checkout/[order_id],"CatchResponseError('{""detail"":""Timed out acquiring transaction-create lock for order 98411""}')",1

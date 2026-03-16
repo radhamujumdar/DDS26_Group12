@@ -1,0 +1,22 @@
+{
+  "mode": "2pc",
+  "backend": "docker-compose",
+  "scenario": "throughput",
+  "users": 5000,
+  "run_number": 1,
+  "timestamp": "20260314-190106-485",
+  "spawn_rate": 10,
+  "duration": "180s",
+  "locust_workers": 2,
+  "startup_timeout": 300,
+  "order_replicas": 1,
+  "payment_replicas": 1,
+  "stock_replicas": 1,
+  "order_db_replica_count": 1,
+  "payment_db_replica_count": 1,
+  "stock_db_replica_count": 1,
+  "saga_broker_replica_count": 1,
+  "sentinel_replicas": 3,
+  "kill_schedule_enabled": false,
+  "kill_schedule": []
+}
