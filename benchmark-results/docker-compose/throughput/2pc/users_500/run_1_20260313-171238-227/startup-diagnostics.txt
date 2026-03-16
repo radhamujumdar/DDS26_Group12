@@ -1,0 +1,157 @@
+===== docker compose ps =====
+NAME                            IMAGE                 COMMAND                  SERVICE           CREATED          STATUS         PORTS
+dds_group12-gateway-1           nginx:1.25-bookworm   "/docker-entrypoint.…"   gateway           11 seconds ago   Up 5 seconds   0.0.0.0:8000->80/tcp, [::]:8000->80/tcp
+dds_group12-order-db-1          redis:7.2-bookworm    "docker-entrypoint.s…"   order-db          13 seconds ago   Up 9 seconds   6379/tcp
+dds_group12-order-service-1     order:latest          "gunicorn -k uvicorn…"   order-service     13 seconds ago   Up 7 seconds   5000/tcp
+dds_group12-payment-db-1        redis:7.2-bookworm    "docker-entrypoint.s…"   payment-db        13 seconds ago   Up 9 seconds   6379/tcp
+dds_group12-payment-service-1   user:latest           "gunicorn -k uvicorn…"   payment-service   13 seconds ago   Up 7 seconds   5000/tcp
+dds_group12-saga-broker-1       redis:7.2-bookworm    "docker-entrypoint.s…"   saga-broker       13 seconds ago   Up 9 seconds   6379/tcp
+dds_group12-stock-db-1          redis:7.2-bookworm    "docker-entrypoint.s…"   stock-db          13 seconds ago   Up 9 seconds   6379/tcp
+dds_group12-stock-service-1     stock:latest          "gunicorn -k uvicorn…"   stock-service     13 seconds ago   Up 7 seconds   5000/tcp
+
+time="2026-03-13T17:13:01+01:00" level=warning msg="/mnt/c/Users/Dani/Desktop/Workspace/University/MSc/Q3/CS4550-Distributed-Data-Systems/DDS_Group12/benchmark-fgapmu14.benchmark-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+
+===== docker compose logs =====
+order-service-1  | [2026-03-13 16:12:57 +0000] [1] [INFO] Starting gunicorn 21.2.0
+order-service-1  | [2026-03-13 16:12:57 +0000] [1] [INFO] Listening at: http://0.0.0.0:5000 (1)
+order-service-1  | [2026-03-13 16:12:57 +0000] [1] [INFO] Using worker: uvicorn.workers.UvicornWorker
+order-service-1  | [2026-03-13 16:12:57 +0000] [7] [INFO] Booting worker with pid: 7
+order-service-1  | [2026-03-13 16:12:57 +0000] [8] [INFO] Booting worker with pid: 8
+order-service-1  | [2026-03-13 16:12:57 +0000] [9] [INFO] Booting worker with pid: 9
+order-service-1  | [2026-03-13 16:12:57 +0000] [10] [INFO] Booting worker with pid: 10
+order-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] Started server process [8]
+order-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] Waiting for application startup.
+order-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] Started server process [9]
+order-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] Started server process [7]
+order-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] Waiting for application startup.
+order-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] Waiting for application startup.
+order-service-1  | [2026-03-13 16:13:00 +0000] [10] [INFO] Started server process [10]
+order-service-1  | [2026-03-13 16:13:00 +0000] [10] [INFO] Waiting for application startup.
+order-service-1  | [2026-03-13 16:13:00 +0000] [10] [INFO] {"ts":"2026-03-13T16:13:00.631358+00:00","event":"startup_recovery_begin","service":"order-service"}
+order-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:00.638122+00:00","event":"startup_recovery_begin","service":"order-service"}
+order-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] {"ts":"2026-03-13T16:13:00.638199+00:00","event":"startup_recovery_begin","service":"order-service"}
+order-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:00.641912+00:00","event":"startup_recovery_begin","service":"order-service"}
+order-service-1  | [2026-03-13 16:13:00 +0000] [10] [INFO] {"ts":"2026-03-13T16:13:00.679330+00:00","event":"recovery_scan","service":"order-service","component":"two_pc","active_count":0}
+order-service-1  | [2026-03-13 16:13:00 +0000] [10] [INFO] {"ts":"2026-03-13T16:13:00.679541+00:00","event":"startup_recovery_complete","service":"order-service"}
+order-service-1  | [2026-03-13 16:13:00 +0000] [10] [INFO] Application startup complete.
+order-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:00.681494+00:00","event":"recovery_scan","service":"order-service","component":"two_pc","active_count":0}
+order-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:00.681747+00:00","event":"startup_recovery_complete","service":"order-service"}
+order-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] Application startup complete.
+order-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] {"ts":"2026-03-13T16:13:00.682291+00:00","event":"recovery_scan","service":"order-service","component":"two_pc","active_count":0}
+order-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] {"ts":"2026-03-13T16:13:00.682443+00:00","event":"startup_recovery_complete","service":"order-service"}
+order-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] Application startup complete.
+order-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:00.683783+00:00","event":"recovery_scan","service":"order-service","component":"two_pc","active_count":0}
+order-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:00.683939+00:00","event":"startup_recovery_complete","service":"order-service"}
+order-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] Application startup complete.
+payment-service-1  | [2026-03-13 16:12:57 +0000] [1] [INFO] Starting gunicorn 21.2.0
+payment-service-1  | [2026-03-13 16:12:57 +0000] [1] [INFO] Listening at: http://0.0.0.0:5000 (1)
+payment-service-1  | [2026-03-13 16:12:57 +0000] [1] [INFO] Using worker: uvicorn.workers.UvicornWorker
+payment-service-1  | [2026-03-13 16:12:57 +0000] [6] [INFO] Booting worker with pid: 6
+payment-service-1  | [2026-03-13 16:12:57 +0000] [7] [INFO] Booting worker with pid: 7
+payment-service-1  | [2026-03-13 16:12:57 +0000] [8] [INFO] Booting worker with pid: 8
+payment-service-1  | [2026-03-13 16:12:57 +0000] [9] [INFO] Booting worker with pid: 9
+payment-service-1  | [2026-03-13 16:13:00 +0000] [6] [INFO] Started server process [6]
+payment-service-1  | [2026-03-13 16:13:00 +0000] [6] [INFO] Waiting for application startup.
+payment-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] Started server process [7]
+payment-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] Waiting for application startup.
+payment-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] Started server process [8]
+payment-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] Waiting for application startup.
+payment-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] Started server process [9]
+payment-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] Waiting for application startup.
+payment-service-1  | [2026-03-13 16:13:00 +0000] [6] [INFO] {"ts":"2026-03-13T16:13:00.601158+00:00","event":"startup_begin","service":"payment-service"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [6] [INFO] {"ts":"2026-03-13T16:13:00.601813+00:00","event":"startup_complete","service":"payment-service"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:00.603203+00:00","event":"startup_begin","service":"payment-service"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:00.603533+00:00","event":"startup_complete","service":"payment-service"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] {"ts":"2026-03-13T16:13:00.606455+00:00","event":"startup_begin","service":"payment-service"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] {"ts":"2026-03-13T16:13:00.607156+00:00","event":"startup_complete","service":"payment-service"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [6] [INFO] Application startup complete.
+payment-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] Application startup complete.
+payment-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] Application startup complete.
+payment-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:00.630558+00:00","event":"startup_begin","service":"payment-service"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:00.631136+00:00","event":"startup_complete","service":"payment-service"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [7] [INFO] {"ts":"2026-03-13T16:13:00.633342+00:00","event":"saga_worker_started","service":"payment-service","component":"saga-worker","participant":"payment","stream_partitions":4,"consumer_group":"saga-payment-workers","consumer_name":"68aecc9299e3-7"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [6] [INFO] {"ts":"2026-03-13T16:13:00.633898+00:00","event":"saga_worker_started","service":"payment-service","component":"saga-worker","participant":"payment","stream_partitions":4,"consumer_group":"saga-payment-workers","consumer_name":"68aecc9299e3-6"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:00.637158+00:00","event":"saga_worker_started","service":"payment-service","component":"saga-worker","participant":"payment","stream_partitions":4,"consumer_group":"saga-payment-workers","consumer_name":"68aecc9299e3-8"}
+payment-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] Application startup complete.
+payment-service-1  | [2026-03-13 16:13:00 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:00.646846+00:00","event":"saga_worker_started","service":"payment-service","component":"saga-worker","participant":"payment","stream_partitions":4,"consumer_group":"saga-payment-workers","consumer_name":"68aecc9299e3-9"}
+payment-service-1  | [2026-03-13 16:13:01 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:01.608115+00:00","event":"recovery_leader_acquired","service":"payment-service","component":"recovery","lease_key":"payment:recovery:lease","owner_id":"68aecc9299e3-8"}
+payment-db-1       | 1:C 13 Mar 2026 16:12:54.032 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+payment-db-1       | 1:C 13 Mar 2026 16:12:54.032 * Redis version=7.2.13, bits=64, commit=00000000, modified=0, pid=1, just started
+payment-db-1       | 1:C 13 Mar 2026 16:12:54.032 * Configuration loaded
+payment-db-1       | 1:M 13 Mar 2026 16:12:54.036 * monotonic clock: POSIX clock_gettime
+payment-db-1       | 1:M 13 Mar 2026 16:12:54.040 * Running mode=standalone, port=6379.
+payment-db-1       | 1:M 13 Mar 2026 16:12:54.043 * Server initialized
+payment-db-1       | 1:M 13 Mar 2026 16:12:54.085 * Creating AOF base file appendonly.aof.1.base.rdb on server start
+payment-db-1       | 1:M 13 Mar 2026 16:12:54.150 * Creating AOF incr file appendonly.aof.1.incr.aof on server start
+payment-db-1       | 1:M 13 Mar 2026 16:12:54.150 * Ready to accept connections tcp
+saga-broker-1      | 1:C 13 Mar 2026 16:12:54.022 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+saga-broker-1      | 1:C 13 Mar 2026 16:12:54.022 * Redis version=7.2.13, bits=64, commit=00000000, modified=0, pid=1, just started
+saga-broker-1      | 1:C 13 Mar 2026 16:12:54.022 * Configuration loaded
+saga-broker-1      | 1:M 13 Mar 2026 16:12:54.024 * monotonic clock: POSIX clock_gettime
+saga-broker-1      | 1:M 13 Mar 2026 16:12:54.029 * Running mode=standalone, port=6379.
+saga-broker-1      | 1:M 13 Mar 2026 16:12:54.038 * Server initialized
+saga-broker-1      | 1:M 13 Mar 2026 16:12:54.086 * Creating AOF base file appendonly.aof.1.base.rdb on server start
+saga-broker-1      | 1:M 13 Mar 2026 16:12:54.150 * Creating AOF incr file appendonly.aof.1.incr.aof on server start
+saga-broker-1      | 1:M 13 Mar 2026 16:12:54.150 * Ready to accept connections tcp
+gateway-1          | /docker-entrypoint.sh: /docker-entrypoint.d/ is not empty, will attempt to perform configuration
+gateway-1          | /docker-entrypoint.sh: Looking for shell scripts in /docker-entrypoint.d/
+gateway-1          | /docker-entrypoint.sh: Launching /docker-entrypoint.d/10-listen-on-ipv6-by-default.sh
+gateway-1          | 10-listen-on-ipv6-by-default.sh: info: Getting the checksum of /etc/nginx/conf.d/default.conf
+gateway-1          | 10-listen-on-ipv6-by-default.sh: info: Enabled listen on IPv6 in /etc/nginx/conf.d/default.conf
+gateway-1          | /docker-entrypoint.sh: Sourcing /docker-entrypoint.d/15-local-resolvers.envsh
+gateway-1          | /docker-entrypoint.sh: Launching /docker-entrypoint.d/20-envsubst-on-templates.sh
+gateway-1          | /docker-entrypoint.sh: Launching /docker-entrypoint.d/30-tune-worker-processes.sh
+gateway-1          | /docker-entrypoint.sh: Configuration complete; ready for start up
+stock-db-1         | 1:C 13 Mar 2026 16:12:54.023 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+stock-db-1         | 1:C 13 Mar 2026 16:12:54.023 * Redis version=7.2.13, bits=64, commit=00000000, modified=0, pid=1, just started
+stock-db-1         | 1:C 13 Mar 2026 16:12:54.023 * Configuration loaded
+stock-db-1         | 1:M 13 Mar 2026 16:12:54.024 * monotonic clock: POSIX clock_gettime
+stock-db-1         | 1:M 13 Mar 2026 16:12:54.033 * Running mode=standalone, port=6379.
+stock-db-1         | 1:M 13 Mar 2026 16:12:54.034 * Server initialized
+stock-db-1         | 1:M 13 Mar 2026 16:12:54.089 * Creating AOF base file appendonly.aof.1.base.rdb on server start
+stock-db-1         | 1:M 13 Mar 2026 16:12:54.150 * Creating AOF incr file appendonly.aof.1.incr.aof on server start
+stock-db-1         | 1:M 13 Mar 2026 16:12:54.150 * Ready to accept connections tcp
+stock-service-1    | [2026-03-13 16:12:57 +0000] [1] [INFO] Starting gunicorn 21.2.0
+stock-service-1    | [2026-03-13 16:12:57 +0000] [1] [INFO] Listening at: http://0.0.0.0:5000 (1)
+stock-service-1    | [2026-03-13 16:12:57 +0000] [1] [INFO] Using worker: uvicorn.workers.UvicornWorker
+stock-service-1    | [2026-03-13 16:12:57 +0000] [7] [INFO] Booting worker with pid: 7
+stock-service-1    | [2026-03-13 16:12:57 +0000] [8] [INFO] Booting worker with pid: 8
+stock-service-1    | [2026-03-13 16:12:57 +0000] [9] [INFO] Booting worker with pid: 9
+stock-service-1    | [2026-03-13 16:12:57 +0000] [10] [INFO] Booting worker with pid: 10
+stock-service-1    | [2026-03-13 16:13:00 +0000] [10] [INFO] Started server process [10]
+stock-service-1    | [2026-03-13 16:13:00 +0000] [7] [INFO] Started server process [7]
+stock-service-1    | [2026-03-13 16:13:00 +0000] [9] [INFO] Started server process [9]
+stock-service-1    | [2026-03-13 16:13:00 +0000] [9] [INFO] Waiting for application startup.
+stock-service-1    | [2026-03-13 16:13:00 +0000] [7] [INFO] Waiting for application startup.
+stock-service-1    | [2026-03-13 16:13:00 +0000] [10] [INFO] Waiting for application startup.
+stock-service-1    | [2026-03-13 16:13:00 +0000] [8] [INFO] Started server process [8]
+stock-service-1    | [2026-03-13 16:13:00 +0000] [8] [INFO] Waiting for application startup.
+stock-service-1    | [2026-03-13 16:13:00 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:00.607113+00:00","event":"startup_begin","service":"stock-service"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:00.607684+00:00","event":"startup_complete","service":"stock-service"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:00.610831+00:00","event":"startup_begin","service":"stock-service"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:00.611611+00:00","event":"startup_complete","service":"stock-service"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [8] [INFO] Application startup complete.
+stock-service-1    | [2026-03-13 16:13:00 +0000] [10] [INFO] {"ts":"2026-03-13T16:13:00.619020+00:00","event":"startup_begin","service":"stock-service"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [10] [INFO] {"ts":"2026-03-13T16:13:00.619297+00:00","event":"startup_complete","service":"stock-service"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [9] [INFO] Application startup complete.
+stock-service-1    | [2026-03-13 16:13:00 +0000] [7] [INFO] {"ts":"2026-03-13T16:13:00.623571+00:00","event":"startup_begin","service":"stock-service"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [7] [INFO] {"ts":"2026-03-13T16:13:00.623988+00:00","event":"startup_complete","service":"stock-service"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [10] [INFO] Application startup complete.
+stock-service-1    | [2026-03-13 16:13:00 +0000] [7] [INFO] Application startup complete.
+stock-service-1    | [2026-03-13 16:13:00 +0000] [10] [INFO] {"ts":"2026-03-13T16:13:00.635379+00:00","event":"saga_worker_started","service":"stock-service","component":"saga-worker","participant":"stock","stream_partitions":4,"consumer_group":"saga-stock-workers","consumer_name":"f20c266fa82d-10"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [7] [INFO] {"ts":"2026-03-13T16:13:00.636345+00:00","event":"saga_worker_started","service":"stock-service","component":"saga-worker","participant":"stock","stream_partitions":4,"consumer_group":"saga-stock-workers","consumer_name":"f20c266fa82d-7"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [8] [INFO] {"ts":"2026-03-13T16:13:00.636363+00:00","event":"saga_worker_started","service":"stock-service","component":"saga-worker","participant":"stock","stream_partitions":4,"consumer_group":"saga-stock-workers","consumer_name":"f20c266fa82d-8"}
+stock-service-1    | [2026-03-13 16:13:00 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:00.637297+00:00","event":"saga_worker_started","service":"stock-service","component":"saga-worker","participant":"stock","stream_partitions":4,"consumer_group":"saga-stock-workers","consumer_name":"f20c266fa82d-9"}
+stock-service-1    | [2026-03-13 16:13:01 +0000] [9] [INFO] {"ts":"2026-03-13T16:13:01.614276+00:00","event":"recovery_leader_acquired","service":"stock-service","component":"recovery","lease_key":"stock:recovery:lease","owner_id":"f20c266fa82d-9"}
+order-db-1         | 1:C 13 Mar 2026 16:12:54.021 * oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+order-db-1         | 1:C 13 Mar 2026 16:12:54.021 * Redis version=7.2.13, bits=64, commit=00000000, modified=0, pid=1, just started
+order-db-1         | 1:C 13 Mar 2026 16:12:54.021 * Configuration loaded
+order-db-1         | 1:M 13 Mar 2026 16:12:54.022 * monotonic clock: POSIX clock_gettime
+order-db-1         | 1:M 13 Mar 2026 16:12:54.033 * Running mode=standalone, port=6379.
+order-db-1         | 1:M 13 Mar 2026 16:12:54.040 * Server initialized
+order-db-1         | 1:M 13 Mar 2026 16:12:54.076 * Creating AOF base file appendonly.aof.1.base.rdb on server start
+order-db-1         | 1:M 13 Mar 2026 16:12:54.134 * Creating AOF incr file appendonly.aof.1.incr.aof on server start
+order-db-1         | 1:M 13 Mar 2026 16:12:54.134 * Ready to accept connections tcp
+
+time="2026-03-13T17:13:01+01:00" level=warning msg="/mnt/c/Users/Dani/Desktop/Workspace/University/MSc/Q3/CS4550-Distributed-Data-Systems/DDS_Group12/benchmark-fgapmu14.benchmark-compose.yml: the attribute `version` is obsolete, it will be ignored, please remove it to avoid potential confusion"
+

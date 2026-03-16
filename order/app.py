@@ -1,72 +1,144 @@
 import logging
-import os
-import atexit
 import random
-import uuid
-from collections import defaultdict
+from contextlib import asynccontextmanager
 
-import redis
-import requests
+import httpx
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import PlainTextResponse
+from msgspec import msgpack
+from redis.asyncio import Redis
 
-from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from clients.payment_client import PaymentClient
+from clients.saga_bus import SagaCommandBus
+from clients.stock_client import StockClient
+from config import OrderConfig
+from coordinator.saga import SagaCoordinator
+from coordinator.two_pc import TwoPCCoordinator
+from logging_utils import log_event
+from models import OrderValue, TxMode
+from redis_utils import create_redis_client
+from repository.order_repo import OrderRepository
+from repository.saga_repo import SagaTxRepository
+from repository.tx_repo import TxRepository
 
-
-DB_ERROR_STR = "DB error"
-REQ_ERROR_STR = "Requests error"
-
-GATEWAY_URL = os.environ['GATEWAY_URL']
-
-app = Flask("order-service")
-
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
-
-
-def close_db_connection():
-    db.close()
+logger = logging.getLogger("order-service")
 
 
-atexit.register(close_db_connection)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    config = OrderConfig.from_env()
+    if config.tx_mode not in (TxMode.TWO_PC.value, TxMode.SAGA.value):
+        raise RuntimeError(f"Unsupported TX_MODE={config.tx_mode}. Expected one of: 2pc, saga")
 
+    db = create_redis_client(
+        host=config.redis_host,
+        port=config.redis_port,
+        password=config.redis_password,
+        db=config.redis_db,
+        sentinel_hosts=config.redis_sentinel_hosts,
+        master_name=config.redis_master_name,
+    )
+    saga_broker_db: Redis | None = None
+    saga_bus: SagaCommandBus | None = None
+    if config.tx_mode == TxMode.SAGA.value:
+        saga_broker_db = create_redis_client(
+            host=config.saga_mq_redis_host,
+            port=config.saga_mq_redis_port,
+            password=config.saga_mq_redis_password,
+            db=config.saga_mq_redis_db,
+            sentinel_hosts=config.saga_mq_sentinel_hosts,
+            master_name=config.saga_mq_master_name,
+        )
+        saga_bus = SagaCommandBus(
+            db=saga_broker_db,
+            logger=logger,
+            stream_partitions=config.saga_mq_stream_partitions,
+            response_timeout_ms=config.saga_mq_response_timeout_ms,
+            command_stream_maxlen=config.saga_mq_command_stream_maxlen,
+            result_stream_maxlen=config.saga_mq_result_stream_maxlen,
+            pending_ttl_seconds=config.saga_mq_pending_ttl_seconds,
+            poll_interval_seconds=config.saga_mq_poll_interval_seconds,
+            enable_dispatcher=config.enable_order_dispatcher,
+            dispatcher_block_ms=config.saga_mq_dispatch_block_ms,
+            dispatch_lease_ttl_seconds=config.saga_mq_dispatch_lease_ttl_seconds,
+            dispatch_renew_interval_seconds=config.saga_mq_dispatch_renew_interval_seconds,
+            owner_id=config.saga_mq_owner_id,
+        )
+        await saga_bus.start()
+        await saga_bus.recover_stale_pending(stale_after_ms=config.saga_mq_pending_stale_after_ms)
 
-class OrderValue(Struct):
-    paid: bool
-    items: list[tuple[str, int]]
-    user_id: str
-    total_cost: int
+    http_client = httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=2000, max_keepalive_connections=1000),
+        timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=30.0),
+    )
+    stock_client = StockClient(http_client, config.stock_service_url, saga_bus=saga_bus)
+    payment_client = PaymentClient(http_client, config.payment_service_url, saga_bus=saga_bus)
+    tx_repo = TxRepository(db)
+    saga_repo = SagaTxRepository(db)
 
-
-def get_order_from_db(order_id: str) -> OrderValue | None:
+    app.state.config = config
+    app.state.order_repo = OrderRepository(db)
+    app.state.stock_client = stock_client
+    app.state.tx_mode = config.tx_mode
+    app.state.saga_bus = saga_bus
+    app.state.saga_broker_db = saga_broker_db
+    app.state.coordinator = TwoPCCoordinator(
+        stock_client=stock_client,
+        payment_client=payment_client,
+        tx_repo=tx_repo,
+        order_repo=app.state.order_repo,
+        logger=logger,
+    )
+    app.state.saga_coordinator = SagaCoordinator(
+        stock_client=stock_client,
+        payment_client=payment_client,
+        saga_repo=saga_repo,
+        order_repo=app.state.order_repo,
+        logger=logger,
+    )
     try:
-        # get serialized data
-        entry: bytes = db.get(order_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
-    if entry is None:
-        # if order does not exist in the database; abort
-        abort(400, f"Order: {order_id} not found!")
-    return entry
+        log_event(logger, "startup_recovery_begin", service="order-service")
+        if config.tx_mode == TxMode.SAGA.value:
+            await app.state.saga_coordinator.recover_active_transactions()
+        else:
+            await app.state.coordinator.recover_active_transactions()
+        log_event(logger, "startup_recovery_complete", service="order-service")
+    except HTTPException as exc:
+        log_event(
+            logger,
+            "startup_recovery_failed",
+            level="warning",
+            service="order-service",
+            detail=str(exc.detail),
+        )
+
+    yield
+
+    await http_client.aclose()
+    if saga_bus is not None:
+        await saga_bus.stop()
+    if saga_broker_db is not None:
+        await saga_broker_db.aclose()
+    await db.aclose()
 
 
-@app.post('/create/<user_id>')
-def create_order(user_id: str):
-    key = str(uuid.uuid4())
-    value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'order_id': key})
+app = FastAPI(title="order-service", lifespan=lifespan)
 
 
-@app.post('/batch_init/<n>/<n_items>/<n_users>/<item_price>')
-def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
+
+@app.post("/create/{user_id}")
+async def create_order(user_id: str):
+    key = await app.state.order_repo.create_order(user_id)
+    return {"order_id": key}
+
+
+@app.post("/batch_init/{n}/{n_items}/{n_users}/{item_price}")
+async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     n = int(n)
     n_items = int(n_items)
     n_users = int(n_users)
@@ -76,111 +148,93 @@ def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         user_id = random.randint(0, n_users - 1)
         item1_id = random.randint(0, n_items - 1)
         item2_id = random.randint(0, n_items - 1)
-        value = OrderValue(paid=False,
-                           items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
-                           user_id=f"{user_id}",
-                           total_cost=2*item_price)
-        return value
+        return OrderValue(
+            paid=False,
+            items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
+            user_id=f"{user_id}",
+            total_cost=2 * item_price,
+        )
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for orders successful"})
+    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry()) for i in range(n)}
+    await app.state.order_repo.batch_set_orders(kv_pairs)
+    return {"msg": "Batch init for orders successful"}
 
 
-@app.get('/find/<order_id>')
-def find_order(order_id: str):
-    order_entry: OrderValue = get_order_from_db(order_id)
-    return jsonify(
-        {
-            "order_id": order_id,
-            "paid": order_entry.paid,
-            "items": order_entry.items,
-            "user_id": order_entry.user_id,
-            "total_cost": order_entry.total_cost
-        }
-    )
+@app.get("/find/{order_id}")
+async def find_order(order_id: str):
+    order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
+    return {
+        "order_id": order_id,
+        "paid": order_entry.paid,
+        "items": order_entry.items,
+        "user_id": order_entry.user_id,
+        "total_cost": order_entry.total_cost,
+    }
 
 
-def send_post_request(url: str):
-    try:
-        response = requests.post(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
+@app.post("/addItem/{order_id}/{item_id}/{quantity}")
+async def add_item(order_id: str, item_id: str, quantity: int):
+    if int(quantity) <= 0:
+        raise HTTPException(status_code=400, detail="Quantity must be greater than zero")
 
+    order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
+    if order_entry.paid:
+        raise HTTPException(status_code=400, detail=f"Order: {order_id} is already paid")
 
-def send_get_request(url: str):
-    try:
-        response = requests.get(url)
-    except requests.exceptions.RequestException:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
-
-
-@app.post('/addItem/<order_id>/<item_id>/<quantity>')
-def add_item(order_id: str, item_id: str, quantity: int):
-    order_entry: OrderValue = get_order_from_db(order_id)
-    item_reply = send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
+    item_reply = await app.state.stock_client.find_item(item_id)
     if item_reply.status_code != 200:
-        # Request failed because item does not exist
-        abort(400, f"Item: {item_id} does not exist!")
+        raise HTTPException(status_code=400, detail=f"Item: {item_id} does not exist!")
+
     item_json: dict = item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-                    status=200)
+    await app.state.order_repo.save_order(order_id, order_entry)
+    return PlainTextResponse(
+        f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
+        status_code=200,
+    )
 
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+@app.post("/checkout/{order_id}")
+async def checkout(order_id: str):
+    order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
+    if app.state.tx_mode == TxMode.SAGA.value:
+        await app.state.saga_coordinator.checkout(order_id, order_entry)
+    else:
+        await app.state.coordinator.checkout(order_id, order_entry)
+    return PlainTextResponse("Checkout successful", status_code=200)
 
 
-@app.post('/checkout/<order_id>')
-def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
-    order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
-    order_entry.paid = True
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+@app.get("/2pc/tx/{tx_id}")
+async def get_tx_state(tx_id: str):
+    tx = await app.state.coordinator.tx_repo.get(tx_id)
+    if tx is None:
+        raise HTTPException(status_code=400, detail=f"Transaction {tx_id} not found")
+    return {"tx_id": tx.tx_id, "state": tx.state}
 
 
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
+@app.get("/saga/tx/{tx_id}")
+async def get_saga_tx_state(tx_id: str):
+    tx = await app.state.saga_coordinator.saga_repo.get(tx_id)
+    if tx is None:
+        raise HTTPException(status_code=400, detail=f"Saga transaction {tx_id} not found")
+    return {"tx_id": tx.tx_id, "state": tx.state}
+
+
+@app.get("/saga/metrics")
+async def get_saga_metrics():
+    if app.state.saga_bus is None:
+        raise HTTPException(status_code=400, detail="Saga mode is disabled")
+    snapshot = await app.state.saga_bus.get_metrics_snapshot()
+    active_ids = await app.state.saga_coordinator.saga_repo.list_active()
+    snapshot["active_saga_transactions"] = len(active_ids)
+    snapshot["tx_mode"] = app.state.tx_mode
+    return snapshot
+
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    logger.handlers = gunicorn_logger.handlers
+    logger.setLevel(gunicorn_logger.level)

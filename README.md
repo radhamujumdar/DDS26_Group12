@@ -51,3 +51,68 @@ but you can find any database you want in https://artifacthub.io/ and adapt the 
 Similarly to the `minikube` deployment but run the `deploy-charts-cluster.sh` in the helm step to also install an ingress to the cluster. 
 
 ***Requirements:*** You need to have access to kubectl of a k8s cluster.
+
+### Benchmark runner
+
+The benchmark entrypoint is now a thin shim around the `benchmark` package:
+
+```bash
+pip install -r requirements.txt
+python benchmark.py --backends docker-compose --scenarios throughput --modes 2pc saga --users 500 1000 2000 --locust-workers 2
+```
+
+Supported backend/scenario combinations:
+
+* `docker-compose + throughput`
+* `docker-compose + ha`
+* `minikube + throughput`
+* `minikube + ha`
+
+Scenario meaning:
+
+* `throughput` uses the same deployed system topology without fault injection
+* `ha` uses the same deployed system topology with failure injection enabled
+
+The benchmark does not change Sentinel or replica presence based on scenario selection.
+
+Laptop-safe defaults:
+
+* `--users 500 1000 2000`
+* `--locust-workers 2`
+
+Example commands:
+
+```bash
+python benchmark.py --backends docker-compose --scenarios throughput --modes 2pc saga --users 500 --runs 1 --duration 30s
+python benchmark.py --backends docker-compose --scenarios ha --modes 2pc saga --users 500 --runs 1 --duration 30s
+python benchmark.py --backends minikube --scenarios throughput --modes 2pc saga --users 500 --runs 1 --duration 30s
+python benchmark.py --backends minikube --scenarios ha --modes 2pc saga --users 500 --runs 1 --duration 30s
+```
+
+Results are stored under:
+
+```text
+benchmark-results/<backend>/<scenario>/<mode>/users_<n>/run_<i>_<timestamp>/
+```
+
+Each run directory includes `metadata.json`, Locust CSVs and stdout, the consistency output, and diagnostics when startup or recovery fails.
+
+### Internal routing and deployment knobs
+
+The gateway is for external traffic only. Internal service-to-service calls should use the stable service URLs directly:
+
+* `PAYMENT_SERVICE_URL=http://payment-service:5000`
+* `STOCK_SERVICE_URL=http://stock-service:5000`
+* `ORDER_SERVICE_URL=http://order-service:5000`
+
+Local defaults are tuned for a laptop-sized deployment but keep the same overall HA-capable topology:
+
+* `ORDER_REPLICAS=1`
+* `PAYMENT_REPLICAS=1`
+* `STOCK_REPLICAS=1`
+* `ORDER_GUNICORN_WORKERS=2`
+* `PAYMENT_GUNICORN_WORKERS=1`
+* `STOCK_GUNICORN_WORKERS=1`
+* `SENTINEL_REPLICAS=3`
+
+These defaults demonstrate container and pod failover behavior on one machine, but they do not provide true multi-node availability. Cloud deployers are expected to tune replica counts and resources upward without changing the architecture or internal routing contract.

@@ -1,117 +1,132 @@
+import asyncio
 import logging
-import os
-import atexit
-import uuid
+from contextlib import asynccontextmanager, suppress
 
-import redis
+import httpx
+import uvicorn
+from fastapi import FastAPI
+from redis.asyncio import Redis
 
-from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
-
-
-DB_ERROR_STR = "DB error"
-
-app = Flask("stock-service")
-
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+from api import router
+from config import StockConfig
+from logging_utils import log_event
+from redis_utils import create_redis_client
+from repository.stock_repo import StockRepository
+from services import StockRecoveryService, StockService
 
 
-def close_db_connection():
-    db.close()
+logger = logging.getLogger("stock-service")
 
 
-atexit.register(close_db_connection)
-
-
-class StockValue(Struct):
-    stock: int
-    price: int
-
-
-def get_item_from_db(item_id: str) -> StockValue | None:
-    # get serialized data
-    try:
-        entry: bytes = db.get(item_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
-    if entry is None:
-        # if item does not exist in the database; abort
-        abort(400, f"Item: {item_id} not found!")
-    return entry
-
-
-@app.post('/item/create/<price>')
-def create_item(price: int):
-    key = str(uuid.uuid4())
-    app.logger.debug(f"Item: {key} created")
-    value = msgpack.encode(StockValue(stock=0, price=int(price)))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'item_id': key})
-
-
-@app.post('/batch_init/<n>/<starting_stock>/<item_price>')
-def batch_init_users(n: int, starting_stock: int, item_price: int):
-    n = int(n)
-    starting_stock = int(starting_stock)
-    item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for stock successful"})
-
-
-@app.get('/find/<item_id>')
-def find_item(item_id: str):
-    item_entry: StockValue = get_item_from_db(item_id)
-    return jsonify(
-        {
-            "stock": item_entry.stock,
-            "price": item_entry.price
-        }
+@asynccontextmanager
+async def lifespan(the_app: FastAPI):
+    config = StockConfig.from_env()
+    db = create_redis_client(
+        host=config.redis_host,
+        port=config.redis_port,
+        password=config.redis_password,
+        db=config.redis_db,
+        sentinel_hosts=config.redis_sentinel_hosts,
+        master_name=config.redis_master_name,
     )
+    gateway_client = httpx.AsyncClient(timeout=2.0)
+    stock_repo = StockRepository(db)
+    stock_service = StockService(stock_repo, logger)
+    recovery_service = StockRecoveryService(
+        repo=stock_repo,
+        stock_service=stock_service,
+        order_client=gateway_client,
+        order_service_url=config.order_service_url,
+        logger=logger,
+        enable_loop=config.enable_recovery_loop,
+        lease_key=config.recovery_lease_key,
+        lease_ttl_seconds=config.recovery_lease_ttl_seconds,
+        owner_id=config.recovery_owner_id,
+    )
+    saga_broker_db: Redis | None = None
+    saga_worker_task: asyncio.Task | None = None
+    saga_worker = None
+    if config.saga_mq_enabled and config.enable_saga_worker:
+        saga_broker_db = create_redis_client(
+            host=config.saga_mq_redis_host,
+            port=config.saga_mq_redis_port,
+            password=config.saga_mq_redis_password,
+            db=config.saga_mq_redis_db,
+            sentinel_hosts=config.saga_mq_sentinel_hosts,
+            master_name=config.saga_mq_master_name,
+        )
+        from services import StockSagaMqWorkerService
+
+        saga_worker = StockSagaMqWorkerService(
+            db=saga_broker_db,
+            stock_service=stock_service,
+            logger=logger,
+            stream_partitions=config.saga_mq_stream_partitions,
+            consumer_group=config.saga_mq_consumer_group,
+            block_ms=config.saga_mq_block_ms,
+            batch_size=config.saga_mq_batch_size,
+            command_stream_maxlen=config.saga_mq_command_stream_maxlen,
+            result_stream_maxlen=config.saga_mq_result_stream_maxlen,
+        )
+    elif config.saga_mq_enabled and not config.enable_saga_worker:
+        log_event(logger, "saga_worker_disabled", service="stock-service")
+
+    the_app.state.config = config
+    the_app.state.db = db
+    the_app.state.stock_repository = stock_repo
+    the_app.state.stock_service = stock_service
+    the_app.state.recovery_service = recovery_service
+    the_app.state.gateway_client = gateway_client
+    the_app.state.saga_broker_db = saga_broker_db
+    the_app.state.saga_worker = saga_worker
+
+    log_event(logger, "startup_begin", service="stock-service")
+    the_app.state.recovery_task = asyncio.create_task(
+        recovery_service.run_loop(
+            startup_delay_seconds=config.recovery_startup_delay_seconds,
+            interval_seconds=config.recovery_interval_seconds,
+        )
+    )
+    if saga_worker is not None:
+        saga_worker_task = asyncio.create_task(saga_worker.run_loop())
+    the_app.state.saga_worker_task = saga_worker_task
+    log_event(logger, "startup_complete", service="stock-service")
+
+    yield
+
+    log_event(logger, "shutdown_begin", service="stock-service")
+    the_app.state.recovery_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await the_app.state.recovery_task
+    if the_app.state.saga_worker_task is not None:
+        the_app.state.saga_worker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await the_app.state.saga_worker_task
+    await gateway_client.aclose()
+    if saga_broker_db is not None:
+        await saga_broker_db.aclose()
+    await db.aclose()
+    log_event(logger, "shutdown_complete", service="stock-service")
 
 
-@app.post('/add/<item_id>/<amount>')
-def add_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock += int(amount)
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+app = FastAPI(title="stock-service", lifespan=lifespan)
 
 
-@app.post('/subtract/<item_id>/<amount>')
-def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
+app.include_router(router)
+
+
+def get_db() -> Redis:
+    return app.state.db
+
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    logger.handlers = gunicorn_logger.handlers
+    logger.setLevel(gunicorn_logger.level)

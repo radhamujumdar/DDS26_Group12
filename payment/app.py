@@ -1,114 +1,132 @@
+import asyncio
 import logging
-import os
-import atexit
-import uuid
+from contextlib import asynccontextmanager, suppress
 
-import redis
+import httpx
+import uvicorn
+from fastapi import FastAPI
+from redis.asyncio import Redis
 
-from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
-
-DB_ERROR_STR = "DB error"
-
-
-app = Flask("payment-service")
-
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+from api import router
+from config import PaymentConfig
+from logging_utils import log_event
+from redis_utils import create_redis_client
+from repository.payment_repo import PaymentRepository
+from services import PaymentRecoveryService, PaymentService
 
 
-def close_db_connection():
-    db.close()
+logger = logging.getLogger("payment-service")
 
 
-atexit.register(close_db_connection)
-
-
-class UserValue(Struct):
-    credit: int
-
-
-def get_user_from_db(user_id: str) -> UserValue | None:
-    try:
-        # get serialized data
-        entry: bytes = db.get(user_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    # deserialize data if it exists else return null
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
-    if entry is None:
-        # if user does not exist in the database; abort
-        abort(400, f"User: {user_id} not found!")
-    return entry
-
-
-@app.post('/create_user')
-def create_user():
-    key = str(uuid.uuid4())
-    value = msgpack.encode(UserValue(credit=0))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'user_id': key})
-
-
-@app.post('/batch_init/<n>/<starting_money>')
-def batch_init_users(n: int, starting_money: int):
-    n = int(n)
-    starting_money = int(starting_money)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
-                                  for i in range(n)}
-    try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for users successful"})
-
-
-@app.get('/find_user/<user_id>')
-def find_user(user_id: str):
-    user_entry: UserValue = get_user_from_db(user_id)
-    return jsonify(
-        {
-            "user_id": user_id,
-            "credit": user_entry.credit
-        }
+@asynccontextmanager
+async def lifespan(the_app: FastAPI):
+    config = PaymentConfig.from_env()
+    db = create_redis_client(
+        host=config.redis_host,
+        port=config.redis_port,
+        password=config.redis_password,
+        db=config.redis_db,
+        sentinel_hosts=config.redis_sentinel_hosts,
+        master_name=config.redis_master_name,
     )
+    gateway_client = httpx.AsyncClient(timeout=2.0)
+    payment_repo = PaymentRepository(db)
+    payment_service = PaymentService(payment_repo, logger)
+    recovery_service = PaymentRecoveryService(
+        repo=payment_repo,
+        payment_service=payment_service,
+        order_client=gateway_client,
+        order_service_url=config.order_service_url,
+        logger=logger,
+        enable_loop=config.enable_recovery_loop,
+        lease_key=config.recovery_lease_key,
+        lease_ttl_seconds=config.recovery_lease_ttl_seconds,
+        owner_id=config.recovery_owner_id,
+    )
+    saga_broker_db: Redis | None = None
+    saga_worker_task: asyncio.Task | None = None
+    saga_worker = None
+    if config.saga_mq_enabled and config.enable_saga_worker:
+        saga_broker_db = create_redis_client(
+            host=config.saga_mq_redis_host,
+            port=config.saga_mq_redis_port,
+            password=config.saga_mq_redis_password,
+            db=config.saga_mq_redis_db,
+            sentinel_hosts=config.saga_mq_sentinel_hosts,
+            master_name=config.saga_mq_master_name,
+        )
+        from services import PaymentSagaMqWorkerService
+
+        saga_worker = PaymentSagaMqWorkerService(
+            db=saga_broker_db,
+            payment_service=payment_service,
+            logger=logger,
+            stream_partitions=config.saga_mq_stream_partitions,
+            consumer_group=config.saga_mq_consumer_group,
+            block_ms=config.saga_mq_block_ms,
+            batch_size=config.saga_mq_batch_size,
+            command_stream_maxlen=config.saga_mq_command_stream_maxlen,
+            result_stream_maxlen=config.saga_mq_result_stream_maxlen,
+        )
+    elif config.saga_mq_enabled and not config.enable_saga_worker:
+        log_event(logger, "saga_worker_disabled", service="payment-service")
+
+    the_app.state.config = config
+    the_app.state.db = db
+    the_app.state.payment_repository = payment_repo
+    the_app.state.payment_service = payment_service
+    the_app.state.recovery_service = recovery_service
+    the_app.state.gateway_client = gateway_client
+    the_app.state.saga_broker_db = saga_broker_db
+    the_app.state.saga_worker = saga_worker
+
+    log_event(logger, "startup_begin", service="payment-service")
+    the_app.state.recovery_task = asyncio.create_task(
+        recovery_service.run_loop(
+            startup_delay_seconds=config.recovery_startup_delay_seconds,
+            interval_seconds=config.recovery_interval_seconds,
+        )
+    )
+    if saga_worker is not None:
+        saga_worker_task = asyncio.create_task(saga_worker.run_loop())
+    the_app.state.saga_worker_task = saga_worker_task
+    log_event(logger, "startup_complete", service="payment-service")
+
+    yield
+
+    log_event(logger, "shutdown_begin", service="payment-service")
+    the_app.state.recovery_task.cancel()
+    with suppress(asyncio.CancelledError):
+        await the_app.state.recovery_task
+    if the_app.state.saga_worker_task is not None:
+        the_app.state.saga_worker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await the_app.state.saga_worker_task
+    await gateway_client.aclose()
+    if saga_broker_db is not None:
+        await saga_broker_db.aclose()
+    await db.aclose()
+    log_event(logger, "shutdown_complete", service="payment-service")
 
 
-@app.post('/add_funds/<user_id>/<amount>')
-def add_credit(user_id: str, amount: int):
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit += int(amount)
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+app = FastAPI(title="payment-service", lifespan=lifespan)
 
 
-@app.post('/pay/<user_id>/<amount>')
-def remove_credit(user_id: str, amount: int):
-    app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
-    # update credit, serialize and update database
-    user_entry.credit -= int(amount)
-    if user_entry.credit < 0:
-        abort(400, f"User: {user_id} credit cannot get reduced below zero!")
-    try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
 
 
-if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
+app.include_router(router)
+
+
+def get_db() -> Redis:
+    return app.state.db
+
+
+if __name__ == "__main__":
+    uvicorn.run("app:app", host="0.0.0.0", port=8000, reload=True)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    gunicorn_logger = logging.getLogger("gunicorn.error")
+    logger.handlers = gunicorn_logger.handlers
+    logger.setLevel(gunicorn_logger.level)

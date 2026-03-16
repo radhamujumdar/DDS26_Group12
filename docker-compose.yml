@@ -11,54 +11,236 @@ services:
       - order-service
       - stock-service
       - payment-service
+    restart: always
 
   order-service:
     build: ./order
     image: order:latest
     environment:
-      - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - STOCK_SERVICE_URL=${STOCK_SERVICE_URL:-http://stock-service:5000}
+      - PAYMENT_SERVICE_URL=${PAYMENT_SERVICE_URL:-http://payment-service:5000}
+      - TX_MODE=${TX_MODE:-2pc}
+      - ORDER_GUNICORN_WORKERS=${ORDER_GUNICORN_WORKERS:-2}
+      - ENABLE_ORDER_DISPATCHER=${ENABLE_ORDER_DISPATCHER:-true}
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
+      - SAGA_MQ_RESPONSE_TIMEOUT_MS=${SAGA_MQ_RESPONSE_TIMEOUT_MS:-3000}
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_PENDING_TTL_SECONDS=${SAGA_MQ_PENDING_TTL_SECONDS:-3600}
+      - SAGA_MQ_PENDING_STALE_AFTER_MS=${SAGA_MQ_PENDING_STALE_AFTER_MS:-3000}
+      - SAGA_MQ_POLL_INTERVAL_SECONDS=${SAGA_MQ_POLL_INTERVAL_SECONDS:-0.05}
+      - SAGA_MQ_DISPATCH_BLOCK_MS=${SAGA_MQ_DISPATCH_BLOCK_MS:-1000}
+      - SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS=${SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS:-10}
+      - SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS=${SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS:-2.0}
+      - REDIS_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      - REDIS_MASTER_NAME=order-db
+      - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      - SAGA_MQ_MASTER_NAME=saga-broker
     env_file:
       - env/order_redis.env
     depends_on:
       - order-db
+      - saga-broker
+      - sentinel-1
+      - sentinel-2
+      - sentinel-3
+    restart: always
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
+      -w $${ORDER_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
 
   order-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    restart: always
+
+  order-db-replica:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --replicaof order-db 6379 --masterauth redis
+    depends_on:
+      - order-db
+    restart: always
+
+  saga-broker:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    restart: always
+
+  saga-broker-replica:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --replicaof saga-broker 6379 --masterauth redis
+    depends_on:
+      - saga-broker
+    restart: always
+
 
   stock-service:
     build: ./stock
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
+      - STOCK_GUNICORN_WORKERS=${STOCK_GUNICORN_WORKERS:-1}
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
+      - ENABLE_SAGA_WORKER=${STOCK_ENABLE_SAGA_WORKER:-true}
+      - ENABLE_RECOVERY_LOOP=${STOCK_ENABLE_RECOVERY_LOOP:-true}
+      - RECOVERY_LEASE_KEY=${STOCK_RECOVERY_LEASE_KEY:-stock:recovery:lease}
+      - RECOVERY_LEASE_TTL_SECONDS=${STOCK_RECOVERY_LEASE_TTL_SECONDS:-10}
+      - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
+      - SAGA_MQ_CONSUMER_GROUP=${STOCK_SAGA_MQ_CONSUMER_GROUP:-saga-stock-workers}
+      - SAGA_MQ_BLOCK_MS=${SAGA_MQ_BLOCK_MS:-1000}
+      - SAGA_MQ_BATCH_SIZE=${SAGA_MQ_BATCH_SIZE:-16}
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
+      - REDIS_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      - REDIS_MASTER_NAME=stock-db
+      - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      - SAGA_MQ_MASTER_NAME=saga-broker
     env_file:
       - env/stock_redis.env
     depends_on:
       - stock-db
+      - saga-broker
+      - sentinel-1
+      - sentinel-2
+      - sentinel-3
+    restart: always
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
+      -w $${STOCK_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
 
   stock-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    restart: always
+
+  stock-db-replica:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --replicaof stock-db 6379 --masterauth redis
+    depends_on:
+      - stock-db
+    restart: always
 
   payment-service:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
+      - PAYMENT_GUNICORN_WORKERS=${PAYMENT_GUNICORN_WORKERS:-1}
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
+      - ENABLE_SAGA_WORKER=${PAYMENT_ENABLE_SAGA_WORKER:-true}
+      - ENABLE_RECOVERY_LOOP=${PAYMENT_ENABLE_RECOVERY_LOOP:-true}
+      - RECOVERY_LEASE_KEY=${PAYMENT_RECOVERY_LEASE_KEY:-payment:recovery:lease}
+      - RECOVERY_LEASE_TTL_SECONDS=${PAYMENT_RECOVERY_LEASE_TTL_SECONDS:-10}
+      - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
+      - SAGA_MQ_CONSUMER_GROUP=${PAYMENT_SAGA_MQ_CONSUMER_GROUP:-saga-payment-workers}
+      - SAGA_MQ_BLOCK_MS=${SAGA_MQ_BLOCK_MS:-1000}
+      - SAGA_MQ_BATCH_SIZE=${SAGA_MQ_BATCH_SIZE:-16}
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
+      - REDIS_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      - REDIS_MASTER_NAME=payment-db
+      - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      - SAGA_MQ_MASTER_NAME=saga-broker
     env_file:
       - env/payment_redis.env
     depends_on:
       - payment-db
+      - saga-broker
+      - sentinel-1
+      - sentinel-2
+      - sentinel-3
+    restart: always
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
+      -w $${PAYMENT_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
 
   payment-db:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    restart: always
+
+  payment-db-replica:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --replicaof payment-db 6379 --masterauth redis
+    depends_on:
+      - payment-db
+    restart: always
 
 
-  redisinsight:
-    image: redis/redisinsight:latest
-    ports:
-      - "5540:5540"
+  # --- Redis Sentinel (3 nodes, monitors all 4 Redis instances) ---
+
+  sentinel-1:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "cp /etc/redis/sentinel-base.conf /tmp/sentinel.conf && redis-sentinel /tmp/sentinel.conf"
+    volumes:
+      - ./sentinel.conf:/etc/redis/sentinel-base.conf:ro
     depends_on:
       - order-db
       - stock-db
       - payment-db
+      - saga-broker
+      - order-db-replica
+      - stock-db-replica
+      - payment-db-replica
+      - saga-broker-replica
+    restart: always
+
+  sentinel-2:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "cp /etc/redis/sentinel-base.conf /tmp/sentinel.conf && redis-sentinel /tmp/sentinel.conf"
+    volumes:
+      - ./sentinel.conf:/etc/redis/sentinel-base.conf:ro
+    depends_on:
+      - order-db
+      - stock-db
+      - payment-db
+      - saga-broker
+    restart: always
+
+  sentinel-3:
+    image: redis:7.2-bookworm
+    command: >
+      sh -c "cp /etc/redis/sentinel-base.conf /tmp/sentinel.conf && redis-sentinel /tmp/sentinel.conf"
+    volumes:
+      - ./sentinel.conf:/etc/redis/sentinel-base.conf:ro
+    depends_on:
+      - order-db
+      - stock-db
+      - payment-db
+      - saga-broker
+    restart: always
+
+
+  watchdog:
+    image: docker:cli
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: always
+    command: >
+      sh -c "
+        echo 'Watchdog started - monitoring containers every 3 seconds';
+        while true; do
+          for svc in stock-service payment-service order-service gateway order-db stock-db payment-db saga-broker order-db-replica stock-db-replica payment-db-replica saga-broker-replica sentinel-1 sentinel-2 sentinel-3; do
+            CONTAINER=$$(docker ps -a -q --filter label=com.docker.compose.service=$${svc} --filter status=exited | head -n 1);
+            if [ -n \"$$CONTAINER\" ]; then
+              echo \"Restarting $$svc...\";
+              docker start $$CONTAINER;
+            fi;
+          done;
+          sleep 3;
+        done
+      "

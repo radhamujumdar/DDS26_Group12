@@ -28,27 +28,51 @@ spec:
       containers:
         - name: order
           image: order:latest
-          resources:
-            limits:
-              memory: "1Gi"
-              cpu: "1"
-            requests:
-              memory: "1Gi"
-              cpu: "1"
+          imagePullPolicy: IfNotPresent
           command: ["gunicorn"]
-          args: ["-b", "0.0.0.0:5000", "app:app"]
+          args: ["-k", "uvicorn.workers.UvicornWorker", "-b", "0.0.0.0:5000", "-w", "$(ORDER_GUNICORN_WORKERS)", "--timeout", "120", "app:app"]
           ports:
             - containerPort: 5000
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 5
           env:
-            - name: USER_SERVICE_URL
-              value: "user-service"
             - name: STOCK_SERVICE_URL
-              value: "stock-service"
+              value: "http://stock-service:5000"
+            - name: PAYMENT_SERVICE_URL
+              value: "http://payment-service:5000"
+            - name: ORDER_GUNICORN_WORKERS
+              value: "2"
             - name: REDIS_HOST
-              value: redis-master
+              value: "order-db"
             - name: REDIS_PORT
-              value: '6379'
+              value: "6379"
             - name: REDIS_PASSWORD
               value: "redis"
             - name: REDIS_DB
               value: "0"
+            - name: REDIS_SENTINEL_HOSTS
+              value: "sentinel:26379"
+            - name: REDIS_MASTER_NAME
+              value: "order-db"
+            - name: TX_MODE
+              value: "2pc"
+            - name: SAGA_MQ_REDIS_HOST
+              value: "saga-broker"
+            - name: SAGA_MQ_REDIS_PORT
+              value: "6379"
+            - name: SAGA_MQ_REDIS_PASSWORD
+              value: "redis"
+            - name: SAGA_MQ_SENTINEL_HOSTS
+              value: "sentinel:26379"
+            - name: SAGA_MQ_MASTER_NAME
+              value: "saga-broker"
