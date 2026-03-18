@@ -22,6 +22,7 @@ class SagaCoordinator:
     IN_FLIGHT_POLL_SECONDS = 0.1
     TX_LOCK_TTL_SECONDS = 30
     TX_LOCK_RENEW_INTERVAL_SECONDS = 10.0
+    LATE_COMPENSATION_RESULT_WAIT_MS = 3000
 
     def __init__(
         self,
@@ -316,6 +317,18 @@ class SagaCoordinator:
                 duration_ms=duration_ms,
             )
 
+            late_result = await self._await_late_compensation_result(
+                tx=tx,
+                phase=phase,
+                participant=participant,
+                operation_name=operation_name,
+                item_id=item_id,
+                attempt=attempt,
+                result=result,
+            )
+            if late_result is not None:
+                result = late_result
+
             if result.ok:
                 return result
             if not result.retryable or attempt == self.RETRY_LIMIT:
@@ -338,6 +351,50 @@ class SagaCoordinator:
                 return tx
             await asyncio.sleep(self.IN_FLIGHT_POLL_SECONDS)
         return None
+
+    async def _await_late_compensation_result(
+        self,
+        tx: SagaTxRecord,
+        phase: str,
+        participant: str,
+        operation_name: str,
+        item_id: str | None,
+        attempt: int,
+        result: ParticipantResult,
+    ) -> ParticipantResult | None:
+        if phase != "compensation" or result.ok:
+            return None
+        if result.status != "timed_out" or not result.correlation_id:
+            return None
+
+        participant_client = self.stock_client if participant == "stock" else self.payment_client
+        saga_bus = getattr(participant_client, "saga_bus", None)
+        if saga_bus is None or not hasattr(saga_bus, "await_late_result"):
+            return None
+
+        settle_timeout_ms = int(max(self.LATE_COMPENSATION_RESULT_WAIT_MS, getattr(saga_bus, "response_timeout_ms", 0)))
+        settled = await saga_bus.await_late_result(result.correlation_id, settle_timeout_ms)
+        if settled.status not in ("completed", "failed"):
+            return None
+
+        self._log(
+            "participant_late_result_reconciled",
+            level="info" if settled.ok else "warning",
+            tx_id=tx.tx_id,
+            order_id=tx.order_id,
+            phase=phase,
+            participant=participant,
+            operation=operation_name,
+            item_id=item_id,
+            attempt=attempt,
+            correlation_id=result.correlation_id,
+            initial_detail=result.detail,
+            settled_status=settled.status,
+            ok=settled.ok,
+            retryable=settled.retryable,
+            detail=settled.detail,
+        )
+        return settled
 
     async def _transition_state(
         self,
