@@ -159,6 +159,8 @@ class SagaCoordinator:
                 item_id=item_id,
             )
             if not result.ok:
+                if self._is_uncertain_forward_result(result):
+                    tx = await self._record_uncertain_stock_reservation(tx, item_id, amount)
                 tx = await self.saga_repo.update(
                     tx.tx_id,
                     state=SagaState.COMPENSATING.value,
@@ -194,6 +196,8 @@ class SagaCoordinator:
                 participant="payment",
             )
             if not result.ok:
+                if self._is_uncertain_forward_result(result):
+                    tx = await self.saga_repo.update(tx.tx_id, payment_debited=True)
                 tx = await self.saga_repo.update(
                     tx.tx_id,
                     error=result.detail or "Payment debit failed",
@@ -221,7 +225,12 @@ class SagaCoordinator:
         if tx.payment_debited and not tx.payment_refunded:
             result = await self._call_with_retries(
                 operation_name="refund",
-                operation=lambda attempt: self.payment_client.saga_refund(tx.tx_id, attempt),
+                operation=lambda attempt: self.payment_client.saga_refund(
+                    tx.tx_id,
+                    tx.user_id,
+                    tx.total_cost,
+                    attempt,
+                ),
                 tx=tx,
                 phase="compensation",
                 participant="payment",
@@ -395,6 +404,24 @@ class SagaCoordinator:
             detail=settled.detail,
         )
         return settled
+
+    async def _record_uncertain_stock_reservation(
+        self,
+        tx: SagaTxRecord,
+        item_id: str,
+        amount: int,
+    ) -> SagaTxRecord:
+        reserved_items = list(tx.stock_reserved_items)
+        if (item_id, amount) in reserved_items:
+            return tx
+        reserved_items.append((item_id, amount))
+        return await self.saga_repo.update(tx.tx_id, stock_reserved_items=reserved_items)
+
+    @staticmethod
+    def _is_uncertain_forward_result(result: ParticipantResult) -> bool:
+        if result.status == "timed_out":
+            return True
+        return result.retryable
 
     async def _transition_state(
         self,

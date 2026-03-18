@@ -162,7 +162,7 @@ class FakePaymentClient:
         self.debit_sequence: list[ParticipantResult] = []
         self.refund_sequence: list[ParticipantResult] = []
         self.debit_calls: list[tuple[str, str, int, int]] = []
-        self.refund_calls: list[tuple[str, int]] = []
+        self.refund_calls: list[tuple[str, str, int, int]] = []
         self.saga_bus = None
 
     async def saga_debit(self, tx_id: str, user_id: str, amount: int, attempt: int) -> ParticipantResult:
@@ -171,8 +171,8 @@ class FakePaymentClient:
             return self.debit_sequence.pop(0)
         return ParticipantResult(ok=True)
 
-    async def saga_refund(self, tx_id: str, attempt: int) -> ParticipantResult:
-        self.refund_calls.append((tx_id, attempt))
+    async def saga_refund(self, tx_id: str, user_id: str, amount: int, attempt: int) -> ParticipantResult:
+        self.refund_calls.append((tx_id, user_id, amount, attempt))
         if self.refund_sequence:
             return self.refund_sequence.pop(0)
         return ParticipantResult(ok=True)
@@ -274,6 +274,7 @@ class TestSagaCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.order_repo.orders[order_id].paid)
         self.assertEqual(len(self.payment_client.refund_calls), 1)
         self.assertEqual(self.payment_client.refund_calls[0][0], tx.tx_id)
+        self.assertEqual(self.payment_client.refund_calls[0][1:3], (order.user_id, order.total_cost))
         self.assertEqual(len(self.stock_client.release_calls), 1)
         self.assertEqual(self.stock_client.release_calls[0][1:3], ("item-1", 1))
 

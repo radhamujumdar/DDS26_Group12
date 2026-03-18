@@ -39,14 +39,14 @@ class PaymentClient:
             attempt=attempt,
         )
 
-    async def saga_refund(self, tx_id: str, attempt: int) -> ParticipantResult:
+    async def saga_refund(self, tx_id: str, user_id: str, amount: int, attempt: int) -> ParticipantResult:
         if self.saga_bus is None:
             raise HTTPException(status_code=400, detail="Saga MQ bus is not configured")
         return await self.saga_bus.request(
             participant="payment",
             action="refund",
             tx_id=tx_id,
-            payload={},
+            payload={"user_id": user_id, "amount": int(amount)},
             attempt=attempt,
         )
 
