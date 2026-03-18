@@ -113,6 +113,6 @@ Local defaults are tuned for a laptop-sized deployment but keep the same overall
 * `ORDER_GUNICORN_WORKERS=2`
 * `PAYMENT_GUNICORN_WORKERS=1`
 * `STOCK_GUNICORN_WORKERS=1`
-* `SENTINEL_REPLICAS=3`
+* `SENTINEL_REPLICAS=1`
 
 These defaults demonstrate container and pod failover behavior on one machine, but they do not provide true multi-node availability. Cloud deployers are expected to tune replica counts and resources upward without changing the architecture or internal routing contract.
