@@ -3,7 +3,6 @@ from enum import StrEnum
 from msgspec import Struct, field
 
 
-DB_ERROR_STR = "DB error order"
 REQ_ERROR_STR = "Requests error order"
 
 

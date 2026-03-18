@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from msgspec import DecodeError, msgpack
 from redis.asyncio import Redis
 
-from models import DB_ERROR_STR, SagaState, SagaTxRecord
+from models import SagaState, SagaTxRecord
 
 CREATE_SAGA_TX_BY_ORDER_SCRIPT = """
 local order_key = KEYS[1]
@@ -32,6 +32,10 @@ class SagaTxRepository:
     def __init__(self, db: Redis):
         self.db = db
 
+    @staticmethod
+    def _db_error(detail: str) -> HTTPException:
+        return HTTPException(status_code=400, detail=detail)
+
     def _tx_key(self, tx_id: str) -> str:
         return f"{self.TX_PREFIX}{tx_id}"
 
@@ -48,6 +52,12 @@ class SagaTxRepository:
         if isinstance(value, bytes):
             return value.decode()
         return str(value)
+
+    def _decode_record_bytes(self, raw: bytes, tx_id: str) -> SagaTxRecord:
+        try:
+            return msgpack.decode(raw, type=SagaTxRecord)
+        except DecodeError as exc:
+            raise self._db_error(f"Failed to decode saga transaction {tx_id} from Redis") from exc
 
     def _build_record(
         self,
@@ -93,7 +103,9 @@ class SagaTxRepository:
                 pipe.set(self._tx_order_key(order_id), record.tx_id)
                 await pipe.execute()
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to create saga transaction {record.tx_id} for order {order_id} in Redis"
+            ) from exc
         return record
 
     async def get_or_create_by_order(
@@ -128,7 +140,9 @@ class SagaTxRepository:
                     msgpack.encode(proposed_record),
                 )
             except redis.exceptions.RedisError as exc:
-                raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+                raise self._db_error(
+                    f"Failed to create or load a saga transaction for order {order_id} in Redis"
+                ) from exc
 
             existing_tx_id = self._decode_str(result[0] if isinstance(result, (list, tuple)) and result else None)
             created = bool(result[1]) if isinstance(result, (list, tuple)) and len(result) > 1 else False
@@ -150,21 +164,20 @@ class SagaTxRepository:
         try:
             entry: bytes = await self.db.get(self._tx_key(tx_id))
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to load saga transaction {tx_id} from Redis") from exc
 
         if not entry:
             return None
 
-        try:
-            return msgpack.decode(entry, type=SagaTxRecord)
-        except DecodeError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+        return self._decode_record_bytes(entry, tx_id)
 
     async def get_by_order(self, order_id: str) -> SagaTxRecord | None:
         try:
             tx_id = await self.db.get(self._tx_order_key(order_id))
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to load the saga transaction mapping for order {order_id}"
+            ) from exc
 
         if tx_id is None:
             return None
@@ -179,7 +192,7 @@ class SagaTxRepository:
         try:
             await self.db.set(self._tx_key(record.tx_id), msgpack.encode(record))
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to save saga transaction {record.tx_id} in Redis") from exc
 
     async def update(self, tx_id: str, **changes) -> SagaTxRecord:
         existing = await self.get(tx_id)
@@ -209,33 +222,39 @@ class SagaTxRepository:
         try:
             await self.db.sadd(self.TX_ACTIVE, tx_id)
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to add saga transaction {tx_id} to the active transaction set"
+            ) from exc
 
     async def remove_active(self, tx_id: str):
         try:
             await self.db.srem(self.TX_ACTIVE, tx_id)
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to remove saga transaction {tx_id} from the active transaction set"
+            ) from exc
 
     async def list_active(self) -> list[str]:
         try:
             tx_ids = await self.db.smembers(self.TX_ACTIVE)
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error("Failed to list active saga transactions from Redis") from exc
         return [tx_id.decode() if isinstance(tx_id, bytes) else str(tx_id) for tx_id in tx_ids]
 
     async def clear_order_tx(self, order_id: str):
         try:
             await self.db.delete(self._tx_order_key(order_id))
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to clear the saga transaction mapping for order {order_id}"
+            ) from exc
 
     async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 30) -> str | None:
         token = str(uuid.uuid4())
         try:
             was_set = await self.db.set(self._tx_lock_key(tx_id), token, nx=True, ex=ttl_seconds)
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to acquire the lock for saga transaction {tx_id}") from exc
         return token if was_set else None
 
     async def renew_tx_lock(self, tx_id: str, token: str, ttl_seconds: int = 30) -> bool:
@@ -256,7 +275,7 @@ class SagaTxRepository:
                     except redis.WatchError:
                         continue
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to renew the lock for saga transaction {tx_id}") from exc
 
     async def release_tx_lock(self, tx_id: str, token: str) -> bool:
         lock_key = self._tx_lock_key(tx_id)
@@ -279,4 +298,4 @@ class SagaTxRepository:
                     except redis.WatchError:
                         continue
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to release the lock for saga transaction {tx_id}") from exc
