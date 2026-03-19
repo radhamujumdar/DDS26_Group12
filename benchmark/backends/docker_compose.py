@@ -17,6 +17,19 @@ COMPOSE_KILL_TARGETS = {
     "stock-db": "stock-db",
     "order-db": "order-db",
 }
+COMPOSE_REDIS_SERVICES = (
+    "order-db",
+    "order-db-replica",
+    "stock-db",
+    "stock-db-replica",
+    "payment-db",
+    "payment-db-replica",
+    "saga-broker",
+    "saga-broker-replica",
+)
+COMPOSE_SENTINEL_SERVICES = ("sentinel-1", "sentinel-2", "sentinel-3")
+COMPOSE_SENTINEL_MASTERS = ("order-db", "stock-db", "payment-db", "saga-broker")
+COMPOSE_REDIS_PASSWORD = "redis"
 
 
 class DockerComposeBackend:
@@ -53,7 +66,13 @@ class DockerComposeBackend:
 
     def wait_ready(self, scenario: ScenarioSpec) -> bool:
         del scenario
-        return self._wait_for_gateway_health(self.resolve_gateway_url(), self.startup_timeout)
+        deadline = time.time() + self.startup_timeout
+        if not self._wait_for_databases(self._remaining_timeout(deadline)):
+            return False
+        remaining_timeout = self._remaining_timeout(deadline)
+        if remaining_timeout <= 0:
+            return False
+        return self._wait_for_gateway_health(self.resolve_gateway_url(), remaining_timeout)
 
     def resolve_gateway_url(self) -> str:
         return "http://localhost:8000"
@@ -125,6 +144,69 @@ class DockerComposeBackend:
         if result.stderr:
             output += ("\n" if output else "") + result.stderr
         return output.strip()
+
+    def _wait_for_databases(self, timeout: float, interval: int = 3) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            pending_services = self._pending_redis_services()
+            pending_masters = self._pending_sentinel_masters()
+            if not pending_services and not pending_masters:
+                return True
+            time.sleep(interval)
+        return False
+
+    def _pending_redis_services(self) -> list[str]:
+        return [service for service in COMPOSE_REDIS_SERVICES if not self._redis_service_ready(service)]
+
+    def _redis_service_ready(self, service: str) -> bool:
+        result = self._run_compose(
+            self.compose_file,
+            [
+                "exec",
+                "-T",
+                service,
+                "redis-cli",
+                "--no-auth-warning",
+                "-a",
+                COMPOSE_REDIS_PASSWORD,
+                "ping",
+            ],
+            capture_output=True,
+        )
+        return result.returncode == 0 and "PONG" in (result.stdout or "")
+
+    def _pending_sentinel_masters(self) -> list[str]:
+        pending: list[str] = []
+        for sentinel_service in COMPOSE_SENTINEL_SERVICES:
+            for master_name in COMPOSE_SENTINEL_MASTERS:
+                if not self._sentinel_master_ready(sentinel_service, master_name):
+                    pending.append(f"{sentinel_service}:{master_name}")
+        return pending
+
+    def _sentinel_master_ready(self, sentinel_service: str, master_name: str) -> bool:
+        result = self._run_compose(
+            self.compose_file,
+            [
+                "exec",
+                "-T",
+                sentinel_service,
+                "redis-cli",
+                "--raw",
+                "-p",
+                "26379",
+                "SENTINEL",
+                "get-master-addr-by-name",
+                master_name,
+            ],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            return False
+        resolved = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        return len(resolved) >= 2
+
+    def _remaining_timeout(self, deadline: float) -> float:
+        return max(0.0, deadline - time.time())
 
     def _wait_for_gateway_health(self, gateway_url: str, timeout: int, interval: int = 3) -> bool:
         endpoints = ("/orders/health", "/payment/health", "/stock/health")

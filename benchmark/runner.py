@@ -192,6 +192,7 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
     try:
         backend.down()
         backend.up(run_spec.mode, scenario)
+        log("Waiting for databases and services to become ready")
         if not backend.wait_ready(scenario):
             diagnostics_needed = True
             return False
@@ -249,9 +250,9 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
             kill_thread.join(timeout=5)
 
         if scenario.kill_schedule:
-            log("Waiting for services to recover before testing")
+            log("Waiting for databases and services to recover")
         else:
-            log("Waiting for services to become healthy testing")
+            log("Waiting for databases and services to remain ready")
         if not backend.wait_ready(scenario):
             diagnostics_needed = True
             (output_dir / "consistency.txt").write_text(
