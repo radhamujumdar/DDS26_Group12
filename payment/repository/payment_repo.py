@@ -362,7 +362,12 @@ class PaymentRepository:
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
-    async def saga_refund(self, tx_id: str) -> tuple[bool, bool, str | None]:
+    async def saga_refund(
+        self,
+        tx_id: str,
+        user_id: str | None = None,
+        amount: int | None = None,
+    ) -> tuple[bool, bool, str | None]:
         debit_key = f"saga:payment:debit:{tx_id}"
         try:
             existing_raw = await self.db.get(debit_key)
@@ -370,9 +375,35 @@ class PaymentRepository:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
         if existing_raw is None:
-            return True, False, None
+            if user_id is None or amount is None:
+                return True, False, None
+
+            refunded = SagaDebitRecord(
+                tx_id=tx_id,
+                user_id=user_id,
+                amount=amount,
+                old_credit=0,
+                new_credit=0,
+                state=SagaDebitState.REFUNDED,
+            )
+            try:
+                created = await self.db.set(debit_key, msgpack.encode(refunded), nx=True)
+            except RedisError as exc:
+                raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            if created:
+                return True, False, None
+            try:
+                existing_raw = await self.db.get(debit_key)
+            except RedisError as exc:
+                raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            if existing_raw is None:
+                return True, False, None
 
         existing = self._decode_saga_debit(existing_raw)
+        if user_id is not None and existing.user_id != user_id:
+            return False, False, f"Refund tx {tx_id} parameter mismatch"
+        if amount is not None and existing.amount != amount:
+            return False, False, f"Refund tx {tx_id} parameter mismatch"
         if existing.state in (SagaDebitState.REFUNDED, SagaDebitState.FAILED):
             return True, False, None
 

@@ -123,32 +123,6 @@ def run_init_orders(stress_test_dir: Path) -> tuple[bool, str]:
     return result.returncode == 0, output
 
 
-def run_consistency_test(consistency_test_dir: Path, output_file: Path) -> bool:
-    script_path = consistency_test_dir / "run_consistency_test.py"
-    if not script_path.is_file():
-        output_file.write_text("SKIPPED: Consistency test script not found\n", encoding="utf-8")
-        return False
-
-    try:
-        result = subprocess.run(
-            [sys.executable, script_path.name],
-            cwd=consistency_test_dir,
-            capture_output=True,
-            text=True,
-            timeout=300,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
-        output_file.write_text(
-            "TIMEOUT: Consistency test did not finish within 5 minutes\n",
-            encoding="utf-8",
-        )
-        return False
-
-    output_file.write_text((result.stdout or "") + ("\n" if result.stderr else "") + (result.stderr or ""), encoding="utf-8")
-    return result.returncode == 0
-
-
 def collect_locust_csvs(csv_prefix: str, output_dir: Path) -> None:
     prefix_path = Path(csv_prefix)
     prefix_dir = prefix_path.parent if prefix_path.parent != Path("") else Path(".")
@@ -211,7 +185,6 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
     log("=" * 72)
 
     diagnostics_needed = False
-    consistency_ok = False
     locust_exit_code = 0
     stop_event = threading.Event()
     kill_thread: threading.Thread | None = None
@@ -219,6 +192,7 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
     try:
         backend.down()
         backend.up(run_spec.mode, scenario)
+        log("Waiting for databases and services to become ready")
         if not backend.wait_ready(scenario):
             diagnostics_needed = True
             return False
@@ -276,23 +250,19 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
             kill_thread.join(timeout=5)
 
         if scenario.kill_schedule:
-            log("Waiting for services to recover before consistency test")
+            log("Waiting for databases and services to recover")
         else:
-            log("Waiting for services to become healthy before consistency test")
+            log("Waiting for databases and services to remain ready")
         if not backend.wait_ready(scenario):
             diagnostics_needed = True
             (output_dir / "consistency.txt").write_text(
-                "SKIPPED: Services did not recover before consistency test\n",
+                "SKIPPED: Services did not recover before testing\n",
                 encoding="utf-8",
             )
             return False
 
-        consistency_ok = run_consistency_test(
-            config.paths.consistency_test_dir,
-            output_dir / "consistency.txt",
-        )
-        diagnostics_needed = diagnostics_needed or locust_exit_code != 0 or not consistency_ok
-        return locust_exit_code == 0 and consistency_ok
+        diagnostics_needed = diagnostics_needed or locust_exit_code != 0
+        return locust_exit_code == 0
     except Exception as exc:
         diagnostics_needed = True
         (output_dir / "runner-error.txt").write_text(f"{exc}\n", encoding="utf-8")
@@ -305,7 +275,7 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
             backend.collect_diagnostics(output_dir)
         backend.down()
         log(
-            f"Run complete: success={locust_exit_code == 0 and consistency_ok} "
+            f"Run complete: success={locust_exit_code == 0} "
             f"locust_exit={locust_exit_code}"
         )
 

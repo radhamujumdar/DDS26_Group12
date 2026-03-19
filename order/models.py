@@ -3,7 +3,6 @@ from enum import StrEnum
 from msgspec import Struct, field
 
 
-DB_ERROR_STR = "DB error order"
 REQ_ERROR_STR = "Requests error order"
 
 
@@ -79,3 +78,5 @@ class ParticipantResult(Struct):
     ok: bool
     retryable: bool = False
     detail: str | None = None
+    correlation_id: str | None = None
+    status: str | None = None

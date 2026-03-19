@@ -144,7 +144,7 @@ class PaymentService:
         if action == "debit":
             return await self._handle_saga_debit(tx_id=tx_id, payload=payload)
         if action == "refund":
-            return await self._handle_saga_refund(tx_id=tx_id)
+            return await self._handle_saga_refund(tx_id=tx_id, payload=payload)
         return False, False, f"Unsupported payment saga action: {action}"
 
     async def _handle_saga_debit(self, tx_id: str, payload: dict) -> tuple[bool, bool, str | None]:
@@ -154,8 +154,13 @@ class PaymentService:
             return False, False, "Invalid debit payload"
         return await self.repo.saga_debit(tx_id=tx_id, user_id=user_id, amount=amount)
 
-    async def _handle_saga_refund(self, tx_id: str) -> tuple[bool, bool, str | None]:
-        return await self.repo.saga_refund(tx_id=tx_id)
+    async def _handle_saga_refund(self, tx_id: str, payload: dict) -> tuple[bool, bool, str | None]:
+        user_id = str(payload.get("user_id", "")).strip() or None
+        amount_raw = payload.get("amount")
+        amount = int(amount_raw) if amount_raw is not None else None
+        if amount is not None and amount <= 0:
+            return False, False, "Invalid refund payload"
+        return await self.repo.saga_refund(tx_id=tx_id, user_id=user_id, amount=amount)
 
     async def get_prepare_record(self, txn_id: str) -> PrepareRecord | None:
         return await self.repo.get_prepare_record(txn_id)

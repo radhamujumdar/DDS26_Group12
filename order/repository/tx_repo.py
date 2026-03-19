@@ -6,7 +6,7 @@ from fastapi import HTTPException
 from msgspec import DecodeError, msgpack
 from redis.asyncio import Redis
 
-from models import DB_ERROR_STR, TxRecord, TxState
+from models import TxRecord, TxState
 
 CREATE_TX_BY_ORDER_SCRIPT = """
 local order_key = KEYS[1]
@@ -135,6 +135,10 @@ class TxRepository:
         self._finalize_commit_script = db.register_script(TX_FINALIZE_COMMIT_SCRIPT)
         self._finalize_abort_script = db.register_script(TX_FINALIZE_ABORT_SCRIPT)
 
+    @staticmethod
+    def _db_error(detail: str) -> HTTPException:
+        return HTTPException(status_code=400, detail=detail)
+
     def _tx_key(self, tx_id: str) -> str:
         return f"{self.TX_PREFIX}{tx_id}"
 
@@ -181,15 +185,15 @@ class TxRepository:
     def _flag(value: bool) -> str:
         return "1" if value else "0"
 
-    def _decode_record_bytes(self, raw: bytes) -> TxRecord:
+    def _decode_record_bytes(self, raw: bytes, tx_id: str, *, source: str) -> TxRecord:
         try:
             return msgpack.decode(raw, type=TxRecord)
         except DecodeError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to decode transaction {tx_id} from {source}") from exc
 
     def _decode_transition_result(self, result, tx_id: str) -> TxRecord:
         if not isinstance(result, (list, tuple)) or len(result) < 2:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR)
+            raise self._db_error(f"Failed to parse Redis transition result for transaction {tx_id}")
 
         status_code = int(result[0])
         payload = result[1]
@@ -197,8 +201,8 @@ class TxRepository:
             detail = self._decode_str(payload) or f"Transaction {tx_id} not found"
             raise HTTPException(status_code=400, detail=detail)
         if not isinstance(payload, (bytes, bytearray)):
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR)
-        return self._decode_record_bytes(bytes(payload))
+            raise self._db_error(f"Failed to decode Redis transition payload for transaction {tx_id}")
+        return self._decode_record_bytes(bytes(payload), tx_id, source="the Redis transition result")
 
     async def create(
         self,
@@ -223,7 +227,9 @@ class TxRepository:
                 pipe.set(self._tx_order_key(order_id), record.tx_id)
                 await pipe.execute()
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to create transaction {record.tx_id} for order {order_id} in Redis"
+            ) from exc
         return record
 
     async def get_or_create_by_order(
@@ -258,7 +264,9 @@ class TxRepository:
                     msgpack.encode(proposed_record),
                 )
             except redis.exceptions.RedisError as exc:
-                raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+                raise self._db_error(
+                    f"Failed to create or load a transaction for order {order_id} in Redis"
+                ) from exc
 
             existing_tx_id = self._decode_str(result[0] if isinstance(result, (list, tuple)) and result else None)
             created = bool(result[1]) if isinstance(result, (list, tuple)) and len(result) > 1 else False
@@ -280,21 +288,18 @@ class TxRepository:
         try:
             entry: bytes = await self.db.get(self._tx_key(tx_id))
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to load transaction {tx_id} from Redis") from exc
 
         if not entry:
             return None
 
-        try:
-            return msgpack.decode(entry, type=TxRecord)
-        except DecodeError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+        return self._decode_record_bytes(entry, tx_id, source="Redis")
 
     async def get_by_order(self, order_id: str) -> TxRecord | None:
         try:
             tx_id = await self.db.get(self._tx_order_key(order_id))
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to load the transaction mapping for order {order_id}") from exc
 
         if tx_id is None:
             return None
@@ -309,7 +314,7 @@ class TxRepository:
         try:
             await self.db.set(self._tx_key(record.tx_id), msgpack.encode(record))
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to save transaction {record.tx_id} in Redis") from exc
 
     async def update(self, tx_id: str, **changes) -> TxRecord:
         existing = await self.get(tx_id)
@@ -368,7 +373,9 @@ class TxRepository:
                 ],
             )
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to persist the prepare outcome for transaction {tx_id} in Redis"
+            ) from exc
         return self._decode_transition_result(result, tx_id)
 
     async def persist_commit_progress(
@@ -400,7 +407,9 @@ class TxRepository:
                 ],
             )
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to persist commit progress for transaction {tx_id} in Redis"
+            ) from exc
         return self._decode_transition_result(result, tx_id)
 
     async def persist_abort_failure(self, tx_id: str, error: str) -> TxRecord:
@@ -425,7 +434,9 @@ class TxRepository:
                 ],
             )
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to persist abort failure details for transaction {tx_id} in Redis"
+            ) from exc
         return self._decode_transition_result(result, tx_id)
 
     async def finalize_commit(
@@ -448,7 +459,7 @@ class TxRepository:
                 ],
             )
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to finalize commit for transaction {tx_id} in Redis") from exc
         return self._decode_transition_result(result, tx_id)
 
     async def finalize_abort(self, tx_id: str, error: str | None = None) -> TxRecord:
@@ -465,43 +476,45 @@ class TxRepository:
                 ],
             )
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to finalize abort for transaction {tx_id} in Redis") from exc
         return self._decode_transition_result(result, tx_id)
 
     async def add_active(self, tx_id: str):
         try:
             await self.db.sadd(self.TX_ACTIVE, tx_id)
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to add transaction {tx_id} to the active transaction set") from exc
 
     async def remove_active(self, tx_id: str):
         try:
             await self.db.srem(self.TX_ACTIVE, tx_id)
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(
+                f"Failed to remove transaction {tx_id} from the active transaction set"
+            ) from exc
 
     async def list_active(self) -> list[str]:
         try:
             tx_ids = await self.db.smembers(self.TX_ACTIVE)
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error("Failed to list active transactions from Redis") from exc
         return [tx_id.decode() if isinstance(tx_id, bytes) else str(tx_id) for tx_id in tx_ids]
 
     async def clear_order_tx(self, order_id: str):
         try:
             await self.db.delete(self._tx_order_key(order_id))
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to clear the transaction mapping for order {order_id}") from exc
 
     async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 120) -> bool:
         try:
             was_set = await self.db.set(self._tx_lock_key(tx_id), "1", nx=True, ex=ttl_seconds)
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to acquire the lock for transaction {tx_id}") from exc
         return bool(was_set)
 
     async def release_tx_lock(self, tx_id: str):
         try:
             await self.db.delete(self._tx_lock_key(tx_id))
         except redis.exceptions.RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            raise self._db_error(f"Failed to release the lock for transaction {tx_id}") from exc
