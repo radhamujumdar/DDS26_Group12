@@ -9,6 +9,9 @@ from pathlib import Path
 
 from benchmark.config import BenchmarkPaths, DeploymentSizing, ScenarioSpec
 
+K8S_SENTINEL_MASTERS = ("order-db", "stock-db", "payment-db", "saga-broker")
+K8S_REDIS_PASSWORD = "redis"
+
 
 class MinikubeBackend:
     def __init__(self, paths: BenchmarkPaths, startup_timeout: int, sizing: DeploymentSizing):
@@ -64,12 +67,27 @@ class MinikubeBackend:
 
     def wait_ready(self, scenario: ScenarioSpec) -> bool:
         del scenario
-        if not self._wait_for_deployments(self.sizing.k8s_targets(), self.startup_timeout):
+        deadline = time.time() + self.startup_timeout
+        if not self._wait_for_deployments(self.sizing.k8s_targets(), self._remaining_timeout(deadline)):
             return False
-        gateway_url = self.resolve_gateway_url()
-        return self._wait_for_gateway_health(gateway_url, self.startup_timeout)
+        remaining_timeout = self._remaining_timeout(deadline)
+        if remaining_timeout <= 0:
+            return False
+        if not self._wait_for_databases(remaining_timeout):
+            return False
+        remaining_timeout = self._remaining_timeout(deadline)
+        if remaining_timeout <= 0:
+            return False
+        gateway_url = self._resolve_gateway_url(remaining_timeout)
+        remaining_timeout = self._remaining_timeout(deadline)
+        if remaining_timeout <= 0:
+            return False
+        return self._wait_for_gateway_health(gateway_url, remaining_timeout)
 
     def resolve_gateway_url(self) -> str:
+        return self._resolve_gateway_url(self.startup_timeout)
+
+    def _resolve_gateway_url(self, timeout: float | None = None) -> str:
         configured_url = os.environ.get("BENCHMARK_GATEWAY_URL")
         if configured_url:
             self.current_gateway_url = configured_url.strip().rstrip("/")
@@ -78,7 +96,7 @@ class MinikubeBackend:
         if self.current_gateway_url:
             return self.current_gateway_url
 
-        deadline = time.time() + self.startup_timeout
+        deadline = time.time() + (timeout if timeout is not None else self.startup_timeout)
         while time.time() < deadline:
             for jsonpath in (
                 "{.status.loadBalancer.ingress[0].ip}",
@@ -232,6 +250,80 @@ class MinikubeBackend:
                 message = (scale_result.stderr or scale_result.stdout or "").strip()
                 raise RuntimeError(f"Failed to scale deployment/{deployment}: {message}")
 
+    def _wait_for_databases(self, timeout: float, interval: int = 3) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            pending_deployments = self._pending_redis_deployments()
+            pending_masters = self._pending_sentinel_masters()
+            if not pending_deployments and not pending_masters:
+                return True
+            time.sleep(interval)
+        return False
+
+    def _pending_redis_deployments(self) -> list[str]:
+        return [deployment for deployment in self._redis_deployments() if not self._redis_deployment_ready(deployment)]
+
+    def _redis_deployments(self) -> list[str]:
+        deployments = ["order-db", "stock-db", "payment-db", "saga-broker"]
+        optional_deployments = (
+            ("order-db-replica", self.sizing.order_db_replica_count),
+            ("stock-db-replica", self.sizing.stock_db_replica_count),
+            ("payment-db-replica", self.sizing.payment_db_replica_count),
+            ("saga-broker-replica", self.sizing.saga_broker_replica_count),
+        )
+        for deployment, replicas in optional_deployments:
+            if replicas > 0:
+                deployments.append(deployment)
+        return deployments
+
+    def _redis_deployment_ready(self, deployment: str) -> bool:
+        result = subprocess.run(
+            [
+                "kubectl",
+                "exec",
+                f"deployment/{deployment}",
+                "--",
+                "redis-cli",
+                "--no-auth-warning",
+                "-a",
+                K8S_REDIS_PASSWORD,
+                "ping",
+            ],
+            cwd=self.paths.project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        return result.returncode == 0 and "PONG" in (result.stdout or "")
+
+    def _pending_sentinel_masters(self) -> list[str]:
+        return [master_name for master_name in K8S_SENTINEL_MASTERS if not self._sentinel_master_ready(master_name)]
+
+    def _sentinel_master_ready(self, master_name: str) -> bool:
+        result = subprocess.run(
+            [
+                "kubectl",
+                "exec",
+                "deployment/sentinel",
+                "--",
+                "redis-cli",
+                "--raw",
+                "-p",
+                "26379",
+                "SENTINEL",
+                "get-master-addr-by-name",
+                master_name,
+            ],
+            cwd=self.paths.project_dir,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return False
+        resolved = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        return len(resolved) >= 2
+
     def _wait_for_deployments(self, targets: dict[str, int] | object, timeout: int, interval: int = 5) -> bool:
         deadline = time.time() + timeout
         target_map = dict(targets)
@@ -268,6 +360,9 @@ class MinikubeBackend:
                 return True
             time.sleep(interval)
         return False
+
+    def _remaining_timeout(self, deadline: float) -> float:
+        return max(0.0, deadline - time.time())
 
     def _wait_for_gateway_health(self, gateway_url: str, timeout: int, interval: int = 3) -> bool:
         endpoints = ("/orders/health", "/payment/health", "/stock/health")

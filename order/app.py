@@ -1,14 +1,12 @@
 import logging
-import random
 from contextlib import asynccontextmanager
 
 import httpx
 import uvicorn
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import PlainTextResponse
-from msgspec import msgpack
 from redis.asyncio import Redis
 
+from api import router
 from clients.payment_client import PaymentClient
 from clients.saga_bus import SagaCommandBus
 from clients.stock_client import StockClient
@@ -16,7 +14,7 @@ from config import OrderConfig
 from coordinator.saga import SagaCoordinator
 from coordinator.two_pc import TwoPCCoordinator
 from logging_utils import log_event
-from models import OrderValue, TxMode
+from models import TxMode
 from redis_utils import create_redis_client
 from repository.order_repo import OrderRepository
 from repository.saga_repo import SagaTxRepository
@@ -131,105 +129,7 @@ async def health_check():
     return {"status": "ok"}
 
 
-@app.post("/create/{user_id}")
-async def create_order(user_id: str):
-    key = await app.state.order_repo.create_order(user_id)
-    return {"order_id": key}
-
-
-@app.post("/batch_init/{n}/{n_items}/{n_users}/{item_price}")
-async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
-    n = int(n)
-    n_items = int(n_items)
-    n_users = int(n_users)
-    item_price = int(item_price)
-
-    def generate_entry() -> OrderValue:
-        user_id = random.randint(0, n_users - 1)
-        item1_id = random.randint(0, n_items - 1)
-        item2_id = random.randint(0, n_items - 1)
-        return OrderValue(
-            paid=False,
-            items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
-            user_id=f"{user_id}",
-            total_cost=2 * item_price,
-        )
-
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry()) for i in range(n)}
-    await app.state.order_repo.batch_set_orders(kv_pairs)
-    return {"msg": "Batch init for orders successful"}
-
-
-@app.get("/find/{order_id}")
-async def find_order(order_id: str):
-    order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
-    return {
-        "order_id": order_id,
-        "paid": order_entry.paid,
-        "items": order_entry.items,
-        "user_id": order_entry.user_id,
-        "total_cost": order_entry.total_cost,
-    }
-
-
-@app.post("/addItem/{order_id}/{item_id}/{quantity}")
-async def add_item(order_id: str, item_id: str, quantity: int):
-    if int(quantity) <= 0:
-        raise HTTPException(status_code=400, detail="Quantity must be greater than zero")
-
-    order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
-    if order_entry.paid:
-        raise HTTPException(status_code=400, detail=f"Order: {order_id} is already paid")
-
-    item_reply = await app.state.stock_client.find_item(item_id)
-    if item_reply.status_code != 200:
-        raise HTTPException(status_code=400, detail=f"Item: {item_id} does not exist!")
-
-    item_json: dict = item_reply.json()
-    order_entry.items.append((item_id, int(quantity)))
-    order_entry.total_cost += int(quantity) * item_json["price"]
-    await app.state.order_repo.save_order(order_id, order_entry)
-    return PlainTextResponse(
-        f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
-        status_code=200,
-    )
-
-
-@app.post("/checkout/{order_id}")
-async def checkout(order_id: str):
-    order_entry: OrderValue = await app.state.order_repo.get_order(order_id)
-    if app.state.tx_mode == TxMode.SAGA.value:
-        await app.state.saga_coordinator.checkout(order_id, order_entry)
-    else:
-        await app.state.coordinator.checkout(order_id, order_entry)
-    return PlainTextResponse("Checkout successful", status_code=200)
-
-
-@app.get("/2pc/tx/{tx_id}")
-async def get_tx_state(tx_id: str):
-    tx = await app.state.coordinator.tx_repo.get(tx_id)
-    if tx is None:
-        raise HTTPException(status_code=400, detail=f"Transaction {tx_id} not found")
-    return {"tx_id": tx.tx_id, "state": tx.state}
-
-
-@app.get("/saga/tx/{tx_id}")
-async def get_saga_tx_state(tx_id: str):
-    tx = await app.state.saga_coordinator.saga_repo.get(tx_id)
-    if tx is None:
-        raise HTTPException(status_code=400, detail=f"Saga transaction {tx_id} not found")
-    return {"tx_id": tx.tx_id, "state": tx.state}
-
-
-@app.get("/saga/metrics")
-async def get_saga_metrics():
-    if app.state.saga_bus is None:
-        raise HTTPException(status_code=400, detail="Saga mode is disabled")
-    snapshot = await app.state.saga_bus.get_metrics_snapshot()
-    active_ids = await app.state.saga_coordinator.saga_repo.list_active()
-    snapshot["active_saga_transactions"] = len(active_ids)
-    snapshot["tx_mode"] = app.state.tx_mode
-    return snapshot
+app.include_router(router)
 
 
 if __name__ == "__main__":

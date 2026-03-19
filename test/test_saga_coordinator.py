@@ -136,6 +136,7 @@ class FakeStockClient:
         self.release_sequences: dict[str, list[ParticipantResult]] = {}
         self.reserve_calls: list[tuple[str, str, int, int]] = []
         self.release_calls: list[tuple[str, str, int, int]] = []
+        self.saga_bus = None
 
     def set_reserve_sequence(self, item_id: str, sequence: list[ParticipantResult]):
         self.reserve_sequences[item_id] = list(sequence)
@@ -161,7 +162,8 @@ class FakePaymentClient:
         self.debit_sequence: list[ParticipantResult] = []
         self.refund_sequence: list[ParticipantResult] = []
         self.debit_calls: list[tuple[str, str, int, int]] = []
-        self.refund_calls: list[tuple[str, int]] = []
+        self.refund_calls: list[tuple[str, str, int, int]] = []
+        self.saga_bus = None
 
     async def saga_debit(self, tx_id: str, user_id: str, amount: int, attempt: int) -> ParticipantResult:
         self.debit_calls.append((tx_id, user_id, amount, attempt))
@@ -169,11 +171,34 @@ class FakePaymentClient:
             return self.debit_sequence.pop(0)
         return ParticipantResult(ok=True)
 
-    async def saga_refund(self, tx_id: str, attempt: int) -> ParticipantResult:
-        self.refund_calls.append((tx_id, attempt))
+    async def saga_refund(self, tx_id: str, user_id: str, amount: int, attempt: int) -> ParticipantResult:
+        self.refund_calls.append((tx_id, user_id, amount, attempt))
         if self.refund_sequence:
             return self.refund_sequence.pop(0)
         return ParticipantResult(ok=True)
+
+
+class FakeSagaBus:
+    def __init__(self):
+        self.response_timeout_ms = 3000
+        self.late_results: dict[str, ParticipantResult] = {}
+        self.await_calls: list[tuple[str, int]] = []
+
+    def set_late_result(self, correlation_id: str, result: ParticipantResult):
+        self.late_results[correlation_id] = result
+
+    async def await_late_result(self, correlation_id: str, timeout_ms: int) -> ParticipantResult:
+        self.await_calls.append((correlation_id, timeout_ms))
+        return self.late_results.get(
+            correlation_id,
+            ParticipantResult(
+                ok=False,
+                retryable=True,
+                detail="Saga MQ response timeout",
+                correlation_id=correlation_id,
+                status="timed_out",
+            ),
+        )
 
 
 class TestSagaCoordinator(unittest.IsolatedAsyncioTestCase):
@@ -186,6 +211,10 @@ class TestSagaCoordinator(unittest.IsolatedAsyncioTestCase):
         self.saga_repo = FakeSagaTxRepository()
         self.stock_client = FakeStockClient()
         self.payment_client = FakePaymentClient()
+        self.stock_bus = FakeSagaBus()
+        self.payment_bus = FakeSagaBus()
+        self.stock_client.saga_bus = self.stock_bus
+        self.payment_client.saga_bus = self.payment_bus
         self.coordinator = SagaCoordinator(
             stock_client=self.stock_client,
             payment_client=self.payment_client,
@@ -245,8 +274,101 @@ class TestSagaCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.order_repo.orders[order_id].paid)
         self.assertEqual(len(self.payment_client.refund_calls), 1)
         self.assertEqual(self.payment_client.refund_calls[0][0], tx.tx_id)
+        self.assertEqual(self.payment_client.refund_calls[0][1:3], (order.user_id, order.total_cost))
         self.assertEqual(len(self.stock_client.release_calls), 1)
         self.assertEqual(self.stock_client.release_calls[0][1:3], ("item-1", 1))
+
+    async def test_late_successful_stock_release_finalizes_compensation(self):
+        order_id = "order-late-release"
+        order = OrderValue(
+            paid=False,
+            items=[("item-1", 1)],
+            user_id="user-3",
+            total_cost=10,
+        )
+        self.order_repo.orders[order_id] = order
+        release_timeout = ParticipantResult(
+            ok=False,
+            retryable=True,
+            detail="Saga MQ response timeout",
+            correlation_id="corr-release-1",
+            status="timed_out",
+        )
+        self.payment_client.debit_sequence = [
+            ParticipantResult(ok=False, retryable=False, detail="Insufficient credit"),
+        ]
+        self.stock_client.release_sequences["item-1"] = [release_timeout]
+        self.stock_bus.set_late_result(
+            "corr-release-1",
+            ParticipantResult(
+                ok=True,
+                retryable=False,
+                detail="released",
+                correlation_id="corr-release-1",
+                status="completed",
+            ),
+        )
+
+        with self.assertRaises(HTTPException):
+            await self.coordinator.checkout(order_id, order)
+
+        tx = next(iter(self.saga_repo.records.values()))
+        self.assertEqual(tx.state, SagaState.COMPENSATED.value)
+        self.assertEqual(tx.stock_released_items, [("item-1", 1)])
+        self.assertNotIn(tx.tx_id, self.saga_repo.active)
+        self.assertNotIn(order_id, self.saga_repo.order_to_tx)
+        self.assertEqual(self.stock_bus.await_calls, [("corr-release-1", 3000)])
+
+    async def test_late_successful_payment_refund_allows_compensation_to_finish(self):
+        order_id = "order-late-refund"
+        order = OrderValue(
+            paid=False,
+            items=[("item-1", 1)],
+            user_id="user-4",
+            total_cost=10,
+        )
+        self.order_repo.orders[order_id] = order
+        tx, _ = await self.saga_repo.get_or_create_by_order(
+            order_id=order_id,
+            user_id=order.user_id,
+            total_cost=order.total_cost,
+            items=list(order.items),
+            state=SagaState.COMPENSATING,
+        )
+        await self.saga_repo.update(
+            tx.tx_id,
+            state=SagaState.COMPENSATING.value,
+            payment_debited=True,
+            stock_reserved_items=[("item-1", 1)],
+            error="Saga MQ response timeout",
+        )
+        refund_timeout = ParticipantResult(
+            ok=False,
+            retryable=True,
+            detail="Saga MQ response timeout",
+            correlation_id="corr-refund-1",
+            status="timed_out",
+        )
+        self.payment_client.refund_sequence = [refund_timeout]
+        self.payment_bus.set_late_result(
+            "corr-refund-1",
+            ParticipantResult(
+                ok=True,
+                retryable=False,
+                detail="refunded",
+                correlation_id="corr-refund-1",
+                status="completed",
+            ),
+        )
+
+        tx = await self.coordinator._process_transaction(tx.tx_id)
+
+        self.assertEqual(tx.state, SagaState.COMPENSATED.value)
+        self.assertTrue(tx.payment_refunded)
+        self.assertEqual(tx.stock_released_items, [("item-1", 1)])
+        self.assertNotIn(tx.tx_id, self.saga_repo.active)
+        self.assertNotIn(order_id, self.saga_repo.order_to_tx)
+        self.assertEqual(self.payment_bus.await_calls, [("corr-refund-1", 3000)])
 
 
 if __name__ == "__main__":

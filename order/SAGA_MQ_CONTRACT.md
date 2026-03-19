@@ -38,7 +38,7 @@ Partition selection is deterministic in `order`: `partition = sha256(tx_id) % P`
 Payload shapes:
 
 - payment `debit`: `{"user_id":"<id>","amount":<int>}`
-- payment `refund`: `{}`
+- payment `refund`: `{"user_id":"<id>","amount":<int>}` (used to write a refund tombstone if debit has not been persisted yet)
 - stock `reserve`: `{"item_id":"<id>","amount":<int>}`
 - stock `release`: `{"item_id":"<id>","amount":<int>}`
 

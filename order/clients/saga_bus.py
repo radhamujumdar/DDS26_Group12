@@ -232,7 +232,50 @@ class SagaCommandBus:
         )
 
         result = await self._await_result(correlation_id, self.response_timeout_ms)
-        return ParticipantResult(ok=result.ok, retryable=result.retryable, detail=result.detail)
+        return ParticipantResult(
+            ok=result.ok,
+            retryable=result.retryable,
+            detail=result.detail,
+            correlation_id=correlation_id,
+            status=result.status,
+        )
+
+    async def await_late_result(self, correlation_id: str, timeout_ms: int) -> ParticipantResult:
+        pending_key = self._pending_key(correlation_id)
+        deadline = asyncio.get_running_loop().time() + (int(timeout_ms) / 1000.0)
+
+        while asyncio.get_running_loop().time() < deadline:
+            raw = await self.db.hgetall(pending_key)
+            decoded = self._decode_dict(raw)
+            status = decoded.get("status", "")
+            if status in ("completed", "failed"):
+                ok = decoded.get("ok", "0").lower() in ("1", "true", "yes")
+                retryable = decoded.get("retryable", "0").lower() in ("1", "true", "yes")
+                detail = decoded.get("detail") or None
+                return ParticipantResult(
+                    ok=ok,
+                    retryable=retryable,
+                    detail=detail,
+                    correlation_id=correlation_id,
+                    status=status,
+                )
+            await asyncio.sleep(self.poll_interval_seconds)
+
+        raw = await self.db.hgetall(pending_key)
+        decoded = self._decode_dict(raw)
+        status = decoded.get("status", "") or "missing"
+        ok = decoded.get("ok", "0").lower() in ("1", "true", "yes")
+        retryable = decoded.get("retryable", "0").lower() in ("1", "true", "yes")
+        detail = decoded.get("detail") or None
+        if status == "missing" and detail is None:
+            detail = "Saga MQ pending result missing"
+        return ParticipantResult(
+            ok=ok,
+            retryable=retryable,
+            detail=detail,
+            correlation_id=correlation_id,
+            status=status,
+        )
 
     async def _await_result(self, correlation_id: str, timeout_ms: int) -> PendingCommandResult:
         pending_key = self._pending_key(correlation_id)

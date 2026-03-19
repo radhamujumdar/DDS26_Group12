@@ -47,6 +47,10 @@ class FakeRedis:
         self.sets: dict[str, set[str]] = {}
         self.get_calls: list[str] = []
 
+    def pipeline(self, transaction: bool = True):
+        del transaction
+        return FakePipeline(self)
+
     def register_script(self, script: str):
         async def _runner(*, keys: list[str], args: list[object]):
             if script == self.repo_module.PAYMENT_PREPARE_LUA:
@@ -197,6 +201,40 @@ class FakeRedis:
         return [0, self.values[tx_key]]
 
 
+class FakePipeline:
+    def __init__(self, db: FakeRedis) -> None:
+        self.db = db
+        self.operations: list[tuple[str, str, bytes]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    async def watch(self, *keys: str) -> None:
+        del keys
+
+    async def unwatch(self) -> None:
+        return None
+
+    async def get(self, key: str):
+        return await self.db.get(key)
+
+    def multi(self) -> None:
+        return None
+
+    def set(self, key: str, value: bytes) -> None:
+        self.operations.append(("set", key, value))
+
+    async def execute(self):
+        for operation, key, value in self.operations:
+            if operation == "set":
+                self.db.values[key] = value
+        self.operations.clear()
+        return []
+
+
 class PaymentRepositoryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.sandbox = ModuleSandbox()
@@ -272,6 +310,43 @@ class PaymentRepositoryTests(unittest.IsolatedAsyncioTestCase):
             type=self.models_module.PrepareRecord,
         )
         self.assertEqual(stored.state, self.models_module.TxnState.ABORTED)
+
+    async def test_saga_refund_writes_tombstone_when_debit_record_is_missing(self) -> None:
+        db = FakeRedis(self.repo_module, self.models_module)
+        repo = self.repo_module.PaymentRepository(db)
+
+        ok, retryable, detail = await repo.saga_refund("saga-1", user_id="user-10", amount=25)
+
+        self.assertEqual((ok, retryable, detail), (True, False, None))
+        stored = msgpack.decode(
+            db.values["saga:payment:debit:saga-1"],
+            type=self.models_module.SagaDebitRecord,
+        )
+        self.assertEqual(stored.tx_id, "saga-1")
+        self.assertEqual(stored.user_id, "user-10")
+        self.assertEqual(stored.amount, 25)
+        self.assertEqual(stored.state, self.models_module.SagaDebitState.REFUNDED)
+
+    async def test_saga_debit_is_noop_after_refund_tombstone(self) -> None:
+        db = FakeRedis(self.repo_module, self.models_module)
+        repo = self.repo_module.PaymentRepository(db)
+        db.values["user-10"] = msgpack.encode(self.models_module.UserValue(credit=100))
+        db.values["saga:payment:debit:saga-2"] = msgpack.encode(
+            self.models_module.SagaDebitRecord(
+                tx_id="saga-2",
+                user_id="user-10",
+                amount=25,
+                old_credit=0,
+                new_credit=0,
+                state=self.models_module.SagaDebitState.REFUNDED,
+            )
+        )
+
+        ok, retryable, detail = await repo.saga_debit("saga-2", "user-10", 25)
+
+        self.assertEqual((ok, retryable, detail), (True, False, None))
+        user = msgpack.decode(db.values["user-10"], type=self.models_module.UserValue)
+        self.assertEqual(user.credit, 100)
 
 
 if __name__ == "__main__":
