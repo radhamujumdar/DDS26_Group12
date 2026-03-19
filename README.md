@@ -116,3 +116,45 @@ Local defaults are tuned for a laptop-sized deployment but keep the same overall
 * `SENTINEL_REPLICAS=1`
 
 These defaults demonstrate container and pod failover behavior on one machine, but they do not provide true multi-node availability. Cloud deployers are expected to tune replica counts and resources upward without changing the architecture or internal routing contract.
+
+### Compose profiles
+
+For local Docker Compose runs we provide three profile env files plus three launcher scripts:
+
+* `.env.small` + `compose-up-small.sh`
+* `.env.medium` + `compose-up-medium.sh`
+* `.env.large` + `compose-up-large.sh`
+
+The env files inject the service settings that are already parameterized in `docker-compose.yml`.
+The launcher scripts also pass the required `--scale` flags for the application services, because plain
+`docker compose up` does not consume the benchmark-only `ORDER_REPLICAS` / `PAYMENT_REPLICAS` /
+`STOCK_REPLICAS` values by itself.
+
+Examples:
+
+```bash
+sh compose-up-small.sh
+sh compose-up-medium.sh
+sh compose-up-large.sh
+```
+
+Each launcher defaults to `TX_MODE=2pc` for throughput. To run the same profile in saga mode:
+
+```bash
+TX_MODE=saga sh compose-up-small.sh
+TX_MODE=saga sh compose-up-medium.sh
+TX_MODE=saga sh compose-up-large.sh
+```
+
+Equivalent raw Docker Compose commands:
+
+```bash
+docker compose --env-file .env.small up -d --build --remove-orphans \
+  --scale order-service=1 --scale payment-service=1 --scale stock-service=1
+
+docker compose --env-file .env.medium up -d --build --remove-orphans \
+  --scale order-service=4 --scale payment-service=3 --scale stock-service=3
+
+docker compose --env-file .env.large up -d --build --remove-orphans \
+  --scale order-service=8 --scale payment-service=6 --scale stock-service=6
+```
