@@ -1,0 +1,47 @@
+{
+  "mode": "2pc",
+  "backend": "docker-compose",
+  "scenario": "ha",
+  "users": 10000,
+  "run_number": 1,
+  "timestamp": "20260319-112242-600",
+  "spawn_rate": 100,
+  "duration": "360s",
+  "locust_workers": 4,
+  "startup_timeout": 300,
+  "order_replicas": 2,
+  "payment_replicas": 2,
+  "stock_replicas": 2,
+  "order_db_replica_count": 2,
+  "payment_db_replica_count": 2,
+  "stock_db_replica_count": 2,
+  "saga_broker_replica_count": 2,
+  "sentinel_replicas": 2,
+  "kill_schedule_enabled": true,
+  "kill_schedule": [
+    {
+      "delay_seconds": 30,
+      "target": "payment-deployment"
+    },
+    {
+      "delay_seconds": 50,
+      "target": "stock-deployment"
+    },
+    {
+      "delay_seconds": 70,
+      "target": "order-deployment"
+    },
+    {
+      "delay_seconds": 90,
+      "target": "payment-db"
+    },
+    {
+      "delay_seconds": 110,
+      "target": "stock-db"
+    },
+    {
+      "delay_seconds": 130,
+      "target": "order-db"
+    }
+  ]
+}
