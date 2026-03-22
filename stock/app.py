@@ -55,21 +55,40 @@ async def lifespan(the_app: FastAPI):
             sentinel_hosts=config.saga_mq_sentinel_hosts,
             master_name=config.saga_mq_master_name,
         )
-        from services import StockSagaMqWorkerService
+        # 2pc message queue change: choose the worker by TX_MODE so 2PC and Saga
+        # share the same broker/settings but consume different stream namespaces.
+        if config.tx_mode == "2pc":
+            from services import StockTwoPCMqWorkerService
 
-        saga_worker = StockSagaMqWorkerService(
-            db=saga_broker_db,
-            stock_service=stock_service,
-            logger=logger,
-            stream_partitions=config.saga_mq_stream_partitions,
-            consumer_group=config.saga_mq_consumer_group,
-            block_ms=config.saga_mq_block_ms,
-            batch_size=config.saga_mq_batch_size,
-            command_stream_maxlen=config.saga_mq_command_stream_maxlen,
-            result_stream_maxlen=config.saga_mq_result_stream_maxlen,
-        )
+            saga_worker = StockTwoPCMqWorkerService(
+                db=saga_broker_db,
+                stock_service=stock_service,
+                logger=logger,
+                stream_partitions=config.saga_mq_stream_partitions,
+                consumer_group=config.saga_mq_consumer_group,
+                block_ms=config.saga_mq_block_ms,
+                batch_size=config.saga_mq_batch_size,
+                command_stream_maxlen=config.saga_mq_command_stream_maxlen,
+                result_stream_maxlen=config.saga_mq_result_stream_maxlen,
+            )
+        else:
+            from services import StockSagaMqWorkerService
+
+            saga_worker = StockSagaMqWorkerService(
+                db=saga_broker_db,
+                stock_service=stock_service,
+                logger=logger,
+                stream_partitions=config.saga_mq_stream_partitions,
+                consumer_group=config.saga_mq_consumer_group,
+                block_ms=config.saga_mq_block_ms,
+                batch_size=config.saga_mq_batch_size,
+                command_stream_maxlen=config.saga_mq_command_stream_maxlen,
+                result_stream_maxlen=config.saga_mq_result_stream_maxlen,
+            )
     elif config.saga_mq_enabled and not config.enable_saga_worker:
-        log_event(logger, "saga_worker_disabled", service="stock-service")
+        # 2pc message queue change: use a generic MQ-disabled log since the same
+        # toggle now controls either the Saga or 2PC worker based on TX_MODE.
+        log_event(logger, "mq_worker_disabled", service="stock-service", tx_mode=config.tx_mode)
 
     the_app.state.config = config
     the_app.state.db = db

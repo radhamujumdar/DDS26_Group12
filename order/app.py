@@ -10,6 +10,7 @@ from api import router
 from clients.payment_client import PaymentClient
 from clients.saga_bus import SagaCommandBus
 from clients.stock_client import StockClient
+from clients.two_pc_bus import TwoPCCommandBus
 from config import OrderConfig
 from coordinator.saga import SagaCoordinator
 from coordinator.two_pc import TwoPCCoordinator
@@ -39,7 +40,10 @@ async def lifespan(app: FastAPI):
     )
     saga_broker_db: Redis | None = None
     saga_bus: SagaCommandBus | None = None
-    if config.tx_mode == TxMode.SAGA.value:
+    two_pc_bus: TwoPCCommandBus | None = None
+    # 2pc message queue change: 2PC now shares the existing MQ broker/settings so
+    # both transaction modes use Redis Streams transport without new infra.
+    if config.tx_mode in (TxMode.TWO_PC.value, TxMode.SAGA.value):
         saga_broker_db = create_redis_client(
             host=config.saga_mq_redis_host,
             port=config.saga_mq_redis_port,
@@ -48,30 +52,56 @@ async def lifespan(app: FastAPI):
             sentinel_hosts=config.saga_mq_sentinel_hosts,
             master_name=config.saga_mq_master_name,
         )
-        saga_bus = SagaCommandBus(
-            db=saga_broker_db,
-            logger=logger,
-            stream_partitions=config.saga_mq_stream_partitions,
-            response_timeout_ms=config.saga_mq_response_timeout_ms,
-            command_stream_maxlen=config.saga_mq_command_stream_maxlen,
-            result_stream_maxlen=config.saga_mq_result_stream_maxlen,
-            pending_ttl_seconds=config.saga_mq_pending_ttl_seconds,
-            poll_interval_seconds=config.saga_mq_poll_interval_seconds,
-            enable_dispatcher=config.enable_order_dispatcher,
-            dispatcher_block_ms=config.saga_mq_dispatch_block_ms,
-            dispatch_lease_ttl_seconds=config.saga_mq_dispatch_lease_ttl_seconds,
-            dispatch_renew_interval_seconds=config.saga_mq_dispatch_renew_interval_seconds,
-            owner_id=config.saga_mq_owner_id,
-        )
-        await saga_bus.start()
-        await saga_bus.recover_stale_pending(stale_after_ms=config.saga_mq_pending_stale_after_ms)
+        if config.tx_mode == TxMode.TWO_PC.value:
+            two_pc_bus = TwoPCCommandBus(
+                db=saga_broker_db,
+                logger=logger,
+                stream_partitions=config.saga_mq_stream_partitions,
+                response_timeout_ms=config.saga_mq_response_timeout_ms,
+                command_stream_maxlen=config.saga_mq_command_stream_maxlen,
+                result_stream_maxlen=config.saga_mq_result_stream_maxlen,
+                pending_ttl_seconds=config.saga_mq_pending_ttl_seconds,
+                poll_interval_seconds=config.saga_mq_poll_interval_seconds,
+                enable_dispatcher=config.enable_order_dispatcher,
+                dispatcher_block_ms=config.saga_mq_dispatch_block_ms,
+                dispatch_lease_ttl_seconds=config.saga_mq_dispatch_lease_ttl_seconds,
+                dispatch_renew_interval_seconds=config.saga_mq_dispatch_renew_interval_seconds,
+                owner_id=config.saga_mq_owner_id,
+            )
+            await two_pc_bus.start()
+            await two_pc_bus.recover_stale_pending(stale_after_ms=config.saga_mq_pending_stale_after_ms)
+        else:
+            saga_bus = SagaCommandBus(
+                db=saga_broker_db,
+                logger=logger,
+                stream_partitions=config.saga_mq_stream_partitions,
+                response_timeout_ms=config.saga_mq_response_timeout_ms,
+                command_stream_maxlen=config.saga_mq_command_stream_maxlen,
+                result_stream_maxlen=config.saga_mq_result_stream_maxlen,
+                pending_ttl_seconds=config.saga_mq_pending_ttl_seconds,
+                poll_interval_seconds=config.saga_mq_poll_interval_seconds,
+                enable_dispatcher=config.enable_order_dispatcher,
+                dispatcher_block_ms=config.saga_mq_dispatch_block_ms,
+                dispatch_lease_ttl_seconds=config.saga_mq_dispatch_lease_ttl_seconds,
+                dispatch_renew_interval_seconds=config.saga_mq_dispatch_renew_interval_seconds,
+                owner_id=config.saga_mq_owner_id,
+            )
+            await saga_bus.start()
+            await saga_bus.recover_stale_pending(stale_after_ms=config.saga_mq_pending_stale_after_ms)
 
     http_client = httpx.AsyncClient(
         limits=httpx.Limits(max_connections=2000, max_keepalive_connections=1000),
         timeout=httpx.Timeout(connect=5.0, read=30.0, write=5.0, pool=30.0),
     )
-    stock_client = StockClient(http_client, config.stock_service_url, saga_bus=saga_bus)
-    payment_client = PaymentClient(http_client, config.payment_service_url, saga_bus=saga_bus)
+    # 2pc message queue change: inject the 2PC bus into the normal clients so the
+    # coordinator can keep using the same client APIs regardless of transport.
+    stock_client = StockClient(http_client, config.stock_service_url, saga_bus=saga_bus, two_pc_bus=two_pc_bus)
+    payment_client = PaymentClient(
+        http_client,
+        config.payment_service_url,
+        saga_bus=saga_bus,
+        two_pc_bus=two_pc_bus,
+    )
     tx_repo = TxRepository(db)
     saga_repo = SagaTxRepository(db)
 
@@ -80,6 +110,7 @@ async def lifespan(app: FastAPI):
     app.state.stock_client = stock_client
     app.state.tx_mode = config.tx_mode
     app.state.saga_bus = saga_bus
+    app.state.two_pc_bus = two_pc_bus
     app.state.saga_broker_db = saga_broker_db
     app.state.coordinator = TwoPCCoordinator(
         stock_client=stock_client,
@@ -116,6 +147,8 @@ async def lifespan(app: FastAPI):
     await http_client.aclose()
     if saga_bus is not None:
         await saga_bus.stop()
+    if two_pc_bus is not None:
+        await two_pc_bus.stop()
     if saga_broker_db is not None:
         await saga_broker_db.aclose()
     await db.aclose()

@@ -123,7 +123,9 @@ class TwoPCCoordinator:
             async def _prepare_stock(iid=item_id, a=amount):
                 r = await self._call_with_retries(
                     operation_name="prepare",
-                    operation=lambda iid=iid, a=a: self.stock_client.prepare_item(tx.tx_id, iid, a),
+                    # 2pc message queue change: pass retry attempt into the client
+                    # so MQ delivery metadata stays aligned with Saga request flow.
+                    operation=lambda attempt, iid=iid, a=a: self.stock_client.prepare_item(tx.tx_id, iid, a, attempt),
                     tx=tx, phase="prepare", participant="stock", item_id=iid,
                 )
                 return ("stock", iid, a, r)
@@ -133,7 +135,12 @@ class TwoPCCoordinator:
             async def _prepare_pay():
                 r = await self._call_with_retries(
                     operation_name="prepare",
-                    operation=lambda: self.payment_client.prepare(tx.tx_id, tx.user_id, tx.total_cost),
+                    operation=lambda attempt: self.payment_client.prepare(
+                        tx.tx_id,
+                        tx.user_id,
+                        tx.total_cost,
+                        attempt,
+                    ),
                     tx=tx, phase="prepare", participant="payment",
                 )
                 return ("payment", None, None, r)
@@ -193,7 +200,12 @@ class TwoPCCoordinator:
         async def _commit_stock(item_id: str, amount: int) -> tuple[str, int, ParticipantResult]:
             r = await self._call_with_retries(
                 operation_name="commit",
-                operation=lambda iid=item_id, a=amount: self.stock_client.commit_item(tx.tx_id, iid, a),
+                operation=lambda attempt, iid=item_id, a=amount: self.stock_client.commit_item(
+                    tx.tx_id,
+                    iid,
+                    a,
+                    attempt,
+                ),
                 tx=tx, phase="commit", participant="stock", item_id=item_id,
             )
             return item_id, amount, r
@@ -204,7 +216,7 @@ class TwoPCCoordinator:
             async def _commit_payment() -> ParticipantResult:
                 return await self._call_with_retries(
                     operation_name="commit",
-                    operation=lambda: self.payment_client.commit(tx.tx_id),
+                    operation=lambda attempt: self.payment_client.commit(tx.tx_id, attempt),
                     tx=tx, phase="commit", participant="payment",
                 )
             tasks.append(_commit_payment())
@@ -253,7 +265,7 @@ class TwoPCCoordinator:
             async def _abort_stock(iid=item_id, a=amount):
                 r = await self._call_with_retries(
                     operation_name="abort",
-                    operation=lambda iid=iid, a=a: self.stock_client.abort_item(tx.tx_id, iid, a),
+                    operation=lambda attempt, iid=iid, a=a: self.stock_client.abort_item(tx.tx_id, iid, a, attempt),
                     tx=tx, phase="abort", participant="stock", item_id=iid,
                 )
                 return ("stock", iid, r)
@@ -263,7 +275,7 @@ class TwoPCCoordinator:
             async def _abort_payment():
                 r = await self._call_with_retries(
                     operation_name="abort",
-                    operation=lambda: self.payment_client.abort(tx.tx_id),
+                    operation=lambda attempt: self.payment_client.abort(tx.tx_id, attempt),
                     tx=tx, phase="abort", participant="payment",
                 )
                 return ("payment", None, r)
@@ -291,7 +303,9 @@ class TwoPCCoordinator:
     async def _call_with_retries(
         self,
         operation_name: str,
-        operation: Callable[[], Awaitable[ParticipantResult]],
+        # 2pc message queue change: retries now pass the attempt count into the
+        # client so queued requests can carry the same metadata as Saga commands.
+        operation: Callable[[int], Awaitable[ParticipantResult]],
         tx: TxRecord,
         phase: str,
         participant: str,
@@ -299,7 +313,7 @@ class TwoPCCoordinator:
     ) -> ParticipantResult:
         for attempt in range(1, self.RETRY_LIMIT + 1):
             try:
-                result = await operation()
+                result = await operation(attempt)
             except HTTPException as exc:
                 detail = str(exc.detail)
                 retryable = detail == REQ_ERROR_STR

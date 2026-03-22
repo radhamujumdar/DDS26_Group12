@@ -83,6 +83,9 @@ services:
     image: stock:latest
     environment:
       - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
+      # 2pc message queue change: propagate TX_MODE so stock can select the 2PC
+      # worker when the deployment is running in 2PC mode.
+      - TX_MODE=${TX_MODE:-2pc}
       - STOCK_GUNICORN_WORKERS=${STOCK_GUNICORN_WORKERS:-1}
       - SAGA_MQ_REDIS_HOST=saga-broker
       - SAGA_MQ_REDIS_PORT=6379
@@ -133,6 +136,9 @@ services:
     image: user:latest
     environment:
       - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
+      # 2pc message queue change: propagate TX_MODE so payment can select the
+      # 2PC worker when the deployment is running in 2PC mode.
+      - TX_MODE=${TX_MODE:-2pc}
       - PAYMENT_GUNICORN_WORKERS=${PAYMENT_GUNICORN_WORKERS:-1}
       - SAGA_MQ_REDIS_HOST=saga-broker
       - SAGA_MQ_REDIS_PORT=6379

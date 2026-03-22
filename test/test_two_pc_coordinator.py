@@ -285,17 +285,22 @@ class FakeStockClient:
     def set_abort_sequence(self, item_id: str, sequence: list[ParticipantResult]):
         self.abort_sequences[item_id] = list(sequence)
 
-    async def prepare_item(self, tx_id: str, item_id: str, amount: int) -> ParticipantResult:
+    # 2pc message queue change: coordinator retries now pass the attempt number
+    # into client methods so fake clients accept the same call shape.
+    async def prepare_item(self, tx_id: str, item_id: str, amount: int, attempt: int = 1) -> ParticipantResult:
+        del attempt
         self.prepare_calls.append((tx_id, item_id, amount))
         if self.prepare_delay_seconds:
             await asyncio.sleep(self.prepare_delay_seconds)
         return self._pop_or_ok(self.prepare_sequences, item_id)
 
-    async def commit_item(self, tx_id: str, item_id: str, amount: int) -> ParticipantResult:
+    async def commit_item(self, tx_id: str, item_id: str, amount: int, attempt: int = 1) -> ParticipantResult:
+        del attempt
         self.commit_calls.append((tx_id, item_id, amount))
         return self._pop_or_ok(self.commit_sequences, item_id)
 
-    async def abort_item(self, tx_id: str, item_id: str, amount: int) -> ParticipantResult:
+    async def abort_item(self, tx_id: str, item_id: str, amount: int, attempt: int = 1) -> ParticipantResult:
+        del attempt
         self.abort_calls.append((tx_id, item_id, amount))
         return self._pop_or_ok(self.abort_sequences, item_id)
 
@@ -316,19 +321,24 @@ class FakePaymentClient:
         self.commit_calls: list[str] = []
         self.abort_calls: list[str] = []
 
-    async def prepare(self, tx_id: str, user_id: str, amount: int) -> ParticipantResult:
+    # 2pc message queue change: keep the test double aligned with the MQ-aware
+    # payment client signature that now receives retry attempt metadata.
+    async def prepare(self, tx_id: str, user_id: str, amount: int, attempt: int = 1) -> ParticipantResult:
+        del attempt
         self.prepare_calls.append((tx_id, user_id, amount))
         if self.prepare_sequence:
             return self.prepare_sequence.pop(0)
         return ParticipantResult(ok=True)
 
-    async def commit(self, tx_id: str) -> ParticipantResult:
+    async def commit(self, tx_id: str, attempt: int = 1) -> ParticipantResult:
+        del attempt
         self.commit_calls.append(tx_id)
         if self.commit_sequence:
             return self.commit_sequence.pop(0)
         return ParticipantResult(ok=True)
 
-    async def abort(self, tx_id: str) -> ParticipantResult:
+    async def abort(self, tx_id: str, attempt: int = 1) -> ParticipantResult:
+        del attempt
         self.abort_calls.append(tx_id)
         if self.abort_sequence:
             return self.abort_sequence.pop(0)

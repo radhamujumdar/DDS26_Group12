@@ -30,6 +30,9 @@ class PaymentConfig:
     redis_port: int
     redis_password: str
     redis_db: int
+    # 2pc message queue change: participant startup needs TX_MODE so it can
+    # pick the correct MQ worker while keeping the current broker settings.
+    tx_mode: str
     order_service_url: str
     recovery_interval_seconds: float
     recovery_startup_delay_seconds: float
@@ -61,6 +64,7 @@ class PaymentConfig:
             redis_port=int(os.environ["REDIS_PORT"]),
             redis_password=os.environ["REDIS_PASSWORD"],
             redis_db=int(os.environ["REDIS_DB"]),
+            tx_mode=os.environ.get("TX_MODE", "2pc").lower(),
             order_service_url=os.environ.get("ORDER_SERVICE_URL", DEFAULT_ORDER_SERVICE_URL).rstrip("/"),
             recovery_interval_seconds=float(
                 os.environ.get("RECOVERY_INTERVAL_SECONDS", DEFAULT_RECOVERY_INTERVAL_SECONDS)
