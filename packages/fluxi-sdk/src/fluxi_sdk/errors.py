@@ -21,6 +21,14 @@ class RegistrationError(FluxiError):
     """Raised for registration-related failures."""
 
 
+class DuplicateWorkflowRegistrationError(RegistrationError):
+    """Raised when a workflow is registered more than once."""
+
+
+class DuplicateActivityRegistrationError(RegistrationError):
+    """Raised when an activity is registered more than once."""
+
+
 class UnknownWorkflowError(RegistrationError):
     """Raised when a referenced workflow is not registered."""
 
