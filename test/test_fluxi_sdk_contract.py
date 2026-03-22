@@ -1,8 +1,14 @@
 import inspect
 import unittest
 
-from fluxi_sdk import ActivityOptions, RetryPolicy, StartPolicy, WorkflowClient
-from fluxi_sdk import activity, client, errors, types, workflow
+from fluxi_sdk import (
+    ActivityOptions,
+    FakeFluxiRuntime,
+    RetryPolicy,
+    StartPolicy,
+    WorkflowClient,
+)
+from fluxi_sdk import activity, client, errors, testing, types, workflow
 
 
 class TestFluxiSdkContract(unittest.TestCase):
@@ -11,6 +17,7 @@ class TestFluxiSdkContract(unittest.TestCase):
         self.assertIsNotNone(activity)
         self.assertIsNotNone(client)
         self.assertIsNotNone(errors)
+        self.assertIsNotNone(testing)
         self.assertIsNotNone(types)
         self.assertIsNotNone(workflow)
 
@@ -53,6 +60,12 @@ class TestFluxiSdkContract(unittest.TestCase):
         self.assertEqual(options.task_queue, "payment")
         self.assertEqual(options.retry_policy, retry_policy)
         self.assertEqual(options.timeout_seconds, 30)
+
+    def test_fake_runtime_is_public(self):
+        runtime = FakeFluxiRuntime()
+
+        self.assertIsInstance(runtime, FakeFluxiRuntime)
+        self.assertIs(runtime.create_client(), runtime.create_client())
 
     def test_workflow_decorator_supports_default_task_queue(self):
         @workflow.defn(default_task_queue="orders")
