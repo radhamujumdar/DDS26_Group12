@@ -16,7 +16,10 @@ Basic project structure with Python's Flask and Redis.
     
 * `order`
     Folder containing the order application logic and dockerfile. 
-    
+
+* `packages`
+    Folder containing shared local packages, including the `fluxi-sdk` phase-1 SDK.
+
 * `payment`
     Folder containing the payment application logic and dockerfile. 
 
@@ -25,6 +28,9 @@ Basic project structure with Python's Flask and Redis.
 
 * `test`
     Folder containing some basic correctness tests for the entire system. (Feel free to enhance them)
+
+* `docs`
+    Additional project documentation, including the Fluxi phase-1 bootstrap guide in `docs/phase-1-fluxi-bootstrap.md`.
 
 ### Deployment types:
 
