@@ -47,12 +47,10 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
         runtime.register_workflow(CheckoutWorkflow)
         return runtime
 
-    async def test_executes_workflow_and_records_activity_metadata(self):
-        runtime = self._create_runtime()
-        client = runtime.create_client()
-
-        @activity.defn
-        def load_order(order_id: str) -> dict:
+    @staticmethod
+    def _register_checkout_activities(runtime: FakeFluxiRuntime) -> None:
+        @activity.defn(name="load_order")
+        def load_order_activity(order_id: str) -> dict:
             return {
                 "order_id": order_id,
                 "item_id": "item-1",
@@ -62,17 +60,22 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
             }
 
         @activity.defn(name="reserve_stock")
-        async def reserve_stock(item_id: str, quantity: int) -> dict:
+        async def reserve_stock_activity(item_id: str, quantity: int) -> dict:
             await asyncio.sleep(0)
             return {"item_id": item_id, "reserved": quantity}
 
-        @activity.defn
-        def charge_payment(user_id: str, total: int) -> dict:
+        @activity.defn(name="charge_payment")
+        def charge_payment_activity(user_id: str, total: int) -> dict:
             return {"user_id": user_id, "charged": total}
 
-        runtime.register_activity(load_order)
-        runtime.register_activity(reserve_stock)
-        runtime.register_activity(charge_payment)
+        runtime.register_activity(load_order_activity)
+        runtime.register_activity(reserve_stock_activity)
+        runtime.register_activity(charge_payment_activity)
+
+    async def test_executes_workflow_and_records_activity_metadata(self):
+        runtime = self._create_runtime()
+        client = runtime.create_client()
+        self._register_checkout_activities(runtime)
 
         result = await client.execute_workflow(
             CheckoutWorkflow,
@@ -114,6 +117,21 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payment_execution.activity_name, "charge_payment")
         self.assertEqual(payment_execution.options.task_queue, "payment")
 
+    async def test_executes_registered_workflow_by_name_string(self):
+        runtime = self._create_runtime()
+        self._register_checkout_activities(runtime)
+        client = runtime.create_client()
+
+        result = await client.execute_workflow(
+            "CheckoutWorkflow",
+            workflow_key="checkout:by-name",
+            args=("order-2",),
+        )
+
+        self.assertEqual(result["order_id"], "order-2")
+        self.assertEqual(len(runtime.workflow_runs), 1)
+        self.assertEqual(runtime.workflow_runs[0].workflow_name, "CheckoutWorkflow")
+
     async def test_attach_or_start_reuses_existing_run_for_same_workflow_key(self):
         runtime = FakeFluxiRuntime()
         runtime.register_workflow(SlowWorkflow)
@@ -151,6 +169,35 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
 
         first_result = await first_task
         second_result = await second_task
+
+        self.assertEqual(first_result, "done:alpha")
+        self.assertEqual(second_result, "done:alpha")
+        self.assertEqual(len(runtime.workflow_runs), 1)
+        self.assertEqual(runtime.workflow_runs[0].attach_count, 1)
+        self.assertEqual(runtime.workflow_runs[0].args, ("alpha",))
+
+    async def test_attach_or_start_reuses_completed_run_for_same_workflow_key(self):
+        runtime = FakeFluxiRuntime()
+        runtime.register_workflow(SlowWorkflow)
+
+        @activity.defn
+        async def wait_for_signal(value: str) -> str:
+            await asyncio.sleep(0)
+            return value
+
+        runtime.register_activity(wait_for_signal)
+        client = runtime.create_client()
+
+        first_result = await client.execute_workflow(
+            SlowWorkflow,
+            workflow_key="slow:completed",
+            args=("alpha",),
+        )
+        second_result = await client.execute_workflow(
+            SlowWorkflow,
+            workflow_key="slow:completed",
+            args=("beta",),
+        )
 
         self.assertEqual(first_result, "done:alpha")
         self.assertEqual(second_result, "done:alpha")
