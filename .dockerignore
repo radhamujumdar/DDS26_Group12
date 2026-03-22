@@ -8,6 +8,9 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+build/
+dist/
+*.egg-info/
 env/
 helm-config/
 k8s/

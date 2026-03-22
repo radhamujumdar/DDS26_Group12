@@ -1,5 +1,10 @@
 pyproject.toml
 src/fluxi_sdk/__init__.py
+src/fluxi_sdk/activity.py
+src/fluxi_sdk/client.py
+src/fluxi_sdk/errors.py
+src/fluxi_sdk/types.py
+src/fluxi_sdk/workflow.py
 src/fluxi_sdk.egg-info/PKG-INFO
 src/fluxi_sdk.egg-info/SOURCES.txt
 src/fluxi_sdk.egg-info/dependency_links.txt
