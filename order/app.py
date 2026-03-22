@@ -3,11 +3,11 @@ import os
 import atexit
 import random
 import uuid
-from collections import defaultdict
 
 import redis
 import requests
 
+from checkout_coordinator import build_checkout_coordinator
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
@@ -16,6 +16,7 @@ DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
+CHECKOUT_COORDINATOR_MODE = os.environ.get('ORDER_CHECKOUT_COORDINATOR', 'legacy').strip().lower()
 
 app = Flask("order-service")
 
@@ -53,14 +54,20 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
     return entry
 
 
+def save_order_to_db(order_id: str, order_entry: OrderValue) -> None:
+    try:
+        db.set(order_id, msgpack.encode(order_entry))
+    except redis.exceptions.RedisError:
+        abort(400, DB_ERROR_STR)
+
+
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
     key = str(uuid.uuid4())
-    value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
-    try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    save_order_to_db(
+        key,
+        OrderValue(paid=False, items=[], user_id=user_id, total_cost=0),
+    )
     return jsonify({'order_id': key})
 
 
@@ -133,49 +140,24 @@ def add_item(order_id: str, item_id: str, quantity: int):
     item_json: dict = item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+    save_order_to_db(order_id, order_entry)
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
                     status=200)
 
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+checkout_coordinator = build_checkout_coordinator(
+    mode=CHECKOUT_COORDINATOR_MODE,
+    gateway_url=GATEWAY_URL,
+    get_order=get_order_from_db,
+    save_order=save_order_to_db,
+    send_post_request=send_post_request,
+    logger=app.logger,
+)
 
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
-    order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
-    order_entry.paid = True
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+    return checkout_coordinator.checkout(order_id)
 
 
 if __name__ == '__main__':
