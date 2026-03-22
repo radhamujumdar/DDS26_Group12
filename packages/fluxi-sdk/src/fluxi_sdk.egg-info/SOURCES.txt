@@ -10,3 +10,5 @@ src/fluxi_sdk.egg-info/PKG-INFO
 src/fluxi_sdk.egg-info/SOURCES.txt
 src/fluxi_sdk.egg-info/dependency_links.txt
 src/fluxi_sdk.egg-info/top_level.txt
+src/fluxi_sdk/examples/__init__.py
+src/fluxi_sdk/examples/checkout.py
