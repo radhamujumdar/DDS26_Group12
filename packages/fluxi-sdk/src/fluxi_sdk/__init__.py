@@ -1,6 +1,6 @@
 """Public package exports for the Fluxi SDK."""
 
-from . import activity, client, errors, testing, types, workflow
+from . import activity, client, errors, testing, types, worker, workflow
 from .activity import ActivityRegistration, ActivityRegistry
 from .client import WorkflowClient
 from .testing import (
@@ -9,6 +9,7 @@ from .testing import (
     WorkflowExecutionRecord,
 )
 from .types import ActivityOptions, RetryPolicy, StartPolicy
+from .worker import Worker
 from .workflow import WorkflowRegistration, WorkflowRegistry
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "FakeFluxiRuntime",
     "RetryPolicy",
     "StartPolicy",
+    "Worker",
     "WorkflowClient",
     "WorkflowExecutionRecord",
     "WorkflowRegistration",
@@ -29,6 +31,7 @@ __all__ = [
     "errors",
     "testing",
     "types",
+    "worker",
     "workflow",
 ]
 

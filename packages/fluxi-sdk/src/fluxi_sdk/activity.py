@@ -73,6 +73,16 @@ def _get_activity_definition(fn: Callable[..., Any]) -> _ActivityDefinition:
     return definition
 
 
+def _get_activity_name(activity: str | Callable[..., Any]) -> str:
+    if isinstance(activity, str):
+        return activity
+    if callable(activity) and not inspect.isclass(activity):
+        return _get_activity_definition(activity).name
+    raise InvalidActivityDefinitionError(
+        "Activities must be referenced by registered name or a callable decorated with @activity.defn."
+    )
+
+
 class ActivityRegistry:
     """Explicit registry for activity definitions."""
 

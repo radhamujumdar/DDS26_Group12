@@ -10,7 +10,13 @@ from typing import Any
 from . import activity, workflow
 from .activity import ActivityRegistration
 from .client import WorkflowClient
-from .errors import WorkflowAlreadyStartedError
+from .errors import (
+    DuplicateActivityRegistrationError,
+    DuplicateWorkflowRegistrationError,
+    NoActivityWorkerAvailableError,
+    NoWorkflowWorkerAvailableError,
+    WorkflowAlreadyStartedError,
+)
 from .types import ActivityOptions, StartPolicy, WorkflowReference
 from .workflow import WorkflowRegistration
 
@@ -34,15 +40,19 @@ class WorkflowExecutionRecord:
 
     run_id: str
     workflow_name: str
-    workflow_key: str
+    workflow_id: str
+    task_queue: str
     args: tuple[Any, ...]
     start_policy: StartPolicy
-    default_task_queue: str | None
     status: str = "running"
     result: Any = None
     error: BaseException | None = None
     attach_count: int = 0
     activity_executions: list[ActivityExecutionRecord] = field(default_factory=list)
+
+    @property
+    def workflow_key(self) -> str:
+        return self.workflow_id
 
 
 @dataclass(slots=True)
@@ -50,25 +60,12 @@ class _WorkflowRunHandle:
     record: WorkflowExecutionRecord
     task: asyncio.Task[Any]
 
-
-class _FakeWorkflowClient(WorkflowClient):
-    def __init__(self, runtime: FakeFluxiRuntime) -> None:
-        self._runtime = runtime
-
-    async def execute_workflow(
-        self,
-        workflow: WorkflowReference,
-        *,
-        workflow_key: str,
-        args: tuple[Any, ...] = (),
-        start_policy: StartPolicy = StartPolicy.ATTACH_OR_START,
-    ) -> Any:
-        return await self._runtime._execute_workflow(
-            workflow,
-            workflow_key=workflow_key,
-            args=tuple(args),
-            start_policy=start_policy,
-        )
+@dataclass(slots=True)
+class _WorkerBinding:
+    task_queue: str
+    workflows: tuple[WorkflowRegistration, ...]
+    activities: tuple[ActivityRegistration, ...]
+    running: bool = False
 
 
 class FakeFluxiRuntime:
@@ -77,11 +74,12 @@ class FakeFluxiRuntime:
     def __init__(self) -> None:
         self.workflow_registry = workflow.WorkflowRegistry()
         self.activity_registry = activity.ActivityRegistry()
-        self._client = _FakeWorkflowClient(self)
+        self._client = WorkflowClient(self)
+        self._worker_bindings: list[_WorkerBinding] = []
         self._workflow_runs: list[WorkflowExecutionRecord] = []
-        self._workflow_runs_by_id: dict[str, WorkflowExecutionRecord] = {}
-        self._workflow_runs_by_key: dict[str, list[WorkflowExecutionRecord]] = {}
-        self._latest_handle_by_key: dict[str, _WorkflowRunHandle] = {}
+        self._workflow_runs_by_run_id: dict[str, WorkflowExecutionRecord] = {}
+        self._workflow_runs_by_workflow_id: dict[str, list[WorkflowExecutionRecord]] = {}
+        self._latest_handle_by_workflow_id: dict[str, _WorkflowRunHandle] = {}
         self._next_run_number = 1
         self._state_lock = asyncio.Lock()
 
@@ -105,43 +103,57 @@ class FakeFluxiRuntime:
         return tuple(self._workflow_runs)
 
     def get_workflow_run(self, run_id: str) -> WorkflowExecutionRecord:
-        return self._workflow_runs_by_id[run_id]
+        return self._workflow_runs_by_run_id[run_id]
+
+    def get_workflow_runs_for_id(
+        self,
+        workflow_id: str,
+    ) -> tuple[WorkflowExecutionRecord, ...]:
+        return tuple(self._workflow_runs_by_workflow_id.get(workflow_id, ()))
 
     def get_workflow_runs_for_key(
         self,
         workflow_key: str,
     ) -> tuple[WorkflowExecutionRecord, ...]:
-        return tuple(self._workflow_runs_by_key.get(workflow_key, ()))
+        return self.get_workflow_runs_for_id(workflow_key)
 
     async def _execute_workflow(
         self,
         workflow_ref: WorkflowReference,
         *,
-        workflow_key: str,
+        workflow_id: str,
+        task_queue: str,
         args: tuple[Any, ...],
         start_policy: StartPolicy,
     ) -> Any:
+        registration = self._get_workflow_registration_for_task_queue(
+            workflow_ref,
+            task_queue=task_queue,
+        )
+
         async with self._state_lock:
-            existing_handle = self._latest_handle_by_key.get(workflow_key)
+            existing_handle = self._latest_handle_by_workflow_id.get(workflow_id)
             if existing_handle is not None:
                 if start_policy is StartPolicy.REJECT_DUPLICATE:
                     raise WorkflowAlreadyStartedError(
-                        f"Workflow key {workflow_key!r} is already in use."
+                        f"Workflow id {workflow_id!r} is already in use."
                     )
                 if start_policy is StartPolicy.ATTACH_OR_START:
                     existing_handle.record.attach_count += 1
                     handle = existing_handle
                 else:
                     handle = self._start_workflow_run(
-                        workflow_ref,
-                        workflow_key=workflow_key,
+                        registration,
+                        workflow_id=workflow_id,
+                        task_queue=task_queue,
                         args=args,
                         start_policy=start_policy,
                     )
             else:
                 handle = self._start_workflow_run(
-                    workflow_ref,
-                    workflow_key=workflow_key,
+                    registration,
+                    workflow_id=workflow_id,
+                    task_queue=task_queue,
                     args=args,
                     start_policy=start_policy,
                 )
@@ -150,36 +162,36 @@ class FakeFluxiRuntime:
 
     def _start_workflow_run(
         self,
-        workflow_ref: WorkflowReference,
+        registration: WorkflowRegistration,
         *,
-        workflow_key: str,
+        workflow_id: str,
+        task_queue: str,
         args: tuple[Any, ...],
         start_policy: StartPolicy,
     ) -> _WorkflowRunHandle:
-        registration = self.workflow_registry.get(workflow_ref)
         run_id = f"run-{self._next_run_number}"
         self._next_run_number += 1
 
         record = WorkflowExecutionRecord(
             run_id=run_id,
             workflow_name=registration.name,
-            workflow_key=workflow_key,
+            workflow_id=workflow_id,
+            task_queue=task_queue,
             args=args,
             start_policy=start_policy,
-            default_task_queue=registration.default_task_queue,
         )
         self._workflow_runs.append(record)
-        self._workflow_runs_by_id[record.run_id] = record
-        self._workflow_runs_by_key.setdefault(workflow_key, []).append(record)
+        self._workflow_runs_by_run_id[record.run_id] = record
+        self._workflow_runs_by_workflow_id.setdefault(workflow_id, []).append(record)
 
         handle = _WorkflowRunHandle(
             record=record,
             task=asyncio.create_task(
                 self._run_workflow(registration, record),
-                name=f"fluxi:{registration.name}:{workflow_key}:{run_id}",
+                name=f"fluxi:{registration.name}:{workflow_id}:{run_id}",
             ),
         )
-        self._latest_handle_by_key[workflow_key] = handle
+        self._latest_handle_by_workflow_id[workflow_id] = handle
         return handle
 
     async def _run_workflow(
@@ -193,6 +205,7 @@ class FakeFluxiRuntime:
         try:
             with workflow._activate_execution_context(
                 registration,
+                record.task_queue,
                 lambda name, args, options: self._execute_activity(
                     record,
                     name,
@@ -226,7 +239,10 @@ class FakeFluxiRuntime:
         workflow_record.activity_executions.append(execution)
 
         try:
-            registration = self.activity_registry.get(activity_name)
+            registration = self._get_activity_registration_for_task_queue(
+                activity_name,
+                task_queue=options.task_queue,
+            )
             result = registration.fn(*args)
             if inspect.isawaitable(result):
                 result = await result
@@ -238,6 +254,94 @@ class FakeFluxiRuntime:
         execution.status = "completed"
         execution.result = result
         return result
+
+    def _create_worker_binding(
+        self,
+        *,
+        task_queue: str,
+        workflows: tuple[type[Any], ...] | list[type[Any]],
+        activities: tuple[Any, ...] | list[Any],
+    ) -> _WorkerBinding:
+        workflow_registrations = tuple(
+            self._ensure_workflow_registered(workflow_ref)
+            for workflow_ref in workflows
+        )
+        activity_registrations = tuple(
+            self._ensure_activity_registered(activity_ref)
+            for activity_ref in activities
+        )
+
+        binding = _WorkerBinding(
+            task_queue=task_queue,
+            workflows=workflow_registrations,
+            activities=activity_registrations,
+        )
+        self._worker_bindings.append(binding)
+        return binding
+
+    def _activate_worker_binding(self, binding: _WorkerBinding) -> None:
+        binding.running = True
+
+    def _deactivate_worker_binding(self, binding: _WorkerBinding) -> None:
+        binding.running = False
+
+    def _ensure_workflow_registered(
+        self,
+        workflow_ref: type[Any],
+    ) -> WorkflowRegistration:
+        try:
+            return self.workflow_registry.register(workflow_ref)
+        except DuplicateWorkflowRegistrationError:
+            return self.workflow_registry.get(workflow_ref)
+
+    def _ensure_activity_registered(
+        self,
+        activity_ref: Any,
+    ) -> ActivityRegistration:
+        try:
+            return self.activity_registry.register(activity_ref)
+        except DuplicateActivityRegistrationError:
+            return self.activity_registry.get(activity_ref)
+
+    def _get_workflow_registration_for_task_queue(
+        self,
+        workflow_ref: WorkflowReference,
+        *,
+        task_queue: str,
+    ) -> WorkflowRegistration:
+        registration = self.workflow_registry.get(workflow_ref)
+        for binding in self._worker_bindings:
+            if (
+                binding.running
+                and binding.task_queue == task_queue
+                and registration in binding.workflows
+            ):
+                return registration
+        raise NoWorkflowWorkerAvailableError(
+            f"No running worker for task_queue {task_queue!r} can execute workflow {registration.name!r}."
+        )
+
+    def _get_activity_registration_for_task_queue(
+        self,
+        activity_ref: str,
+        *,
+        task_queue: str | None,
+    ) -> ActivityRegistration:
+        registration = self.activity_registry.get(activity_ref)
+        if task_queue is None:
+            raise NoActivityWorkerAvailableError(
+                f"Activity {registration.name!r} was scheduled without a task queue."
+            )
+        for binding in self._worker_bindings:
+            if (
+                binding.running
+                and binding.task_queue == task_queue
+                and registration in binding.activities
+            ):
+                return registration
+        raise NoActivityWorkerAvailableError(
+            f"No running worker for task_queue {task_queue!r} can execute activity {registration.name!r}."
+        )
 
 
 __all__ = [

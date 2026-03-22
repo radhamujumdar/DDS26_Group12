@@ -6,19 +6,22 @@ from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import timedelta
 import inspect
 from typing import Any, TypeVar, overload
 
+from .activity import _get_activity_name
 from .errors import (
     DuplicateWorkflowRegistrationError,
     InvalidWorkflowDefinitionError,
     UnknownWorkflowError,
     WorkflowContextUnavailableError,
 )
-from .types import ActivityOptions, RetryPolicy, WorkflowReference
+from .types import ActivityOptions, ActivityReference, RetryPolicy, WorkflowReference
 
 _WORKFLOW_DEFINITION_ATTR = "__fluxi_workflow_definition__"
 _WORKFLOW_RUN_ATTR = "__fluxi_workflow_run__"
+_WORKFLOW_CLASS_ATTR = "__fluxi_workflow_class__"
 
 WorkflowClassT = TypeVar("WorkflowClassT")
 
@@ -27,7 +30,6 @@ WorkflowClassT = TypeVar("WorkflowClassT")
 class _WorkflowDefinition:
     name: str
     run_method_name: str
-    default_task_queue: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,12 +39,12 @@ class WorkflowRegistration:
     name: str
     workflow: type[Any]
     run_method_name: str
-    default_task_queue: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
 class _WorkflowExecutionContext:
     registration: WorkflowRegistration
+    task_queue: str
     activity_executor: Callable[
         [str, Sequence[Any], ActivityOptions],
         Awaitable[Any],
@@ -75,7 +77,6 @@ def defn(target: type[WorkflowClassT]) -> type[WorkflowClassT]: ...
 def defn(
     *,
     name: str | None = None,
-    default_task_queue: str | None = None,
 ) -> Callable[[type[WorkflowClassT]], type[WorkflowClassT]]: ...
 
 
@@ -83,7 +84,6 @@ def defn(
     target: type[WorkflowClassT] | None = None,
     *,
     name: str | None = None,
-    default_task_queue: str | None = None,
 ) -> (
     type[WorkflowClassT]
     | Callable[[type[WorkflowClassT]], type[WorkflowClassT]]
@@ -111,17 +111,13 @@ def defn(
                 "Workflow classes must define exactly one @workflow.run method."
             )
 
-        if default_task_queue is not None and not default_task_queue.strip():
-            raise InvalidWorkflowDefinitionError(
-                "default_task_queue must be a non-empty string when provided."
-            )
-
         definition = _WorkflowDefinition(
             name=name or cls.__name__,
             run_method_name=run_method_names[0],
-            default_task_queue=default_task_queue,
         )
         setattr(cls, _WORKFLOW_DEFINITION_ATTR, definition)
+        run_method = cls.__dict__[run_method_names[0]]
+        setattr(run_method, _WORKFLOW_CLASS_ATTR, cls)
         return cls
 
     if target is None:
@@ -161,7 +157,6 @@ class WorkflowRegistry:
             name=definition.name,
             workflow=workflow_cls,
             run_method_name=definition.run_method_name,
-            default_task_queue=definition.default_task_queue,
         )
         self._by_name[registration.name] = registration
         self._by_class[registration.workflow] = registration
@@ -173,6 +168,9 @@ class WorkflowRegistry:
             registration = self._by_name.get(workflow)
         elif inspect.isclass(workflow):
             registration = self._by_class.get(workflow)
+        elif callable(workflow):
+            workflow_cls = getattr(workflow, _WORKFLOW_CLASS_ATTR, None)
+            registration = self._by_class.get(workflow_cls)
         else:
             registration = None
 
@@ -194,6 +192,7 @@ class WorkflowRegistry:
 @contextmanager
 def _activate_execution_context(
     registration: WorkflowRegistration,
+    task_queue: str,
     activity_executor: Callable[
         [str, Sequence[Any], ActivityOptions],
         Awaitable[Any],
@@ -201,6 +200,7 @@ def _activate_execution_context(
 ) -> Iterator[None]:
     context = _WorkflowExecutionContext(
         registration=registration,
+        task_queue=task_queue,
         activity_executor=activity_executor,
     )
     token = _CURRENT_WORKFLOW_CONTEXT.set(context)
@@ -210,12 +210,39 @@ def _activate_execution_context(
         _CURRENT_WORKFLOW_CONTEXT.reset(token)
 
 
+def _coerce_schedule_to_close_timeout(
+    schedule_to_close_timeout: timedelta | None,
+    timeout_seconds: float | None,
+) -> timedelta | None:
+    if schedule_to_close_timeout is not None and timeout_seconds is not None:
+        raise ValueError(
+            "Use either schedule_to_close_timeout or timeout_seconds, not both."
+        )
+    if timeout_seconds is not None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be greater than 0 when provided.")
+        return timedelta(seconds=timeout_seconds)
+    return schedule_to_close_timeout
+
+
+def _normalize_activity_args(
+    activity_args: tuple[Any, ...],
+    args: Sequence[Any] | None,
+) -> tuple[Any, ...]:
+    if args is not None and activity_args:
+        raise ValueError("Use positional activity args or args=, not both.")
+    if args is not None:
+        return tuple(args)
+    return activity_args
+
+
 async def execute_activity(
-    name: str,
-    *,
-    args: Sequence[Any] = (),
+    activity: ActivityReference,
+    *activity_args: Any,
     task_queue: str | None = None,
     retry_policy: RetryPolicy | None = None,
+    schedule_to_close_timeout: timedelta | None = None,
+    args: Sequence[Any] | None = None,
     timeout_seconds: float | None = None,
 ) -> Any:
     """Schedule an activity from inside workflow code."""
@@ -226,12 +253,33 @@ async def execute_activity(
             "workflow.execute_activity() requires an active workflow execution context."
         )
 
+    activity_name = _get_activity_name(activity)
+    normalized_args = _normalize_activity_args(activity_args, args)
     options = ActivityOptions(
-        task_queue=task_queue or context.registration.default_task_queue,
+        task_queue=task_queue or context.task_queue,
         retry_policy=retry_policy,
-        timeout_seconds=timeout_seconds,
+        schedule_to_close_timeout=_coerce_schedule_to_close_timeout(
+            schedule_to_close_timeout,
+            timeout_seconds,
+        ),
     )
-    return await context.activity_executor(name, tuple(args), options)
+    return await context.activity_executor(activity_name, normalized_args, options)
 
 
-__all__ = ["WorkflowRegistration", "WorkflowRegistry", "defn", "execute_activity", "run"]
+class unsafe:
+    """Compatibility helpers for Temporal-style workflow modules."""
+
+    @staticmethod
+    @contextmanager
+    def imports_passed_through() -> Iterator[None]:
+        yield
+
+
+__all__ = [
+    "WorkflowRegistration",
+    "WorkflowRegistry",
+    "defn",
+    "execute_activity",
+    "run",
+    "unsafe",
+]

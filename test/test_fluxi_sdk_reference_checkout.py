@@ -1,5 +1,7 @@
 import unittest
 
+import fluxi_sdk_test_support  # noqa: F401
+
 from fluxi_sdk.examples.checkout import (
     CheckoutItem,
     CheckoutOrder,
@@ -7,7 +9,7 @@ from fluxi_sdk.examples.checkout import (
     ReferenceCheckoutState,
     ReferenceCheckoutWorkflow,
     StockReservation,
-    create_reference_checkout_runtime,
+    create_reference_checkout_environment,
 )
 
 
@@ -26,14 +28,15 @@ class TestReferenceCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
             stock_levels={"item-1": 5},
             user_credit={"user-1": 25},
         )
-        runtime = create_reference_checkout_runtime(state)
-        client = runtime.create_client()
+        runtime, client, workers = create_reference_checkout_environment(state)
 
-        result = await client.execute_workflow(
-            ReferenceCheckoutWorkflow,
-            workflow_key="checkout:order-1",
-            args=("order-1",),
-        )
+        async with workers[0], workers[1], workers[2]:
+            result = await client.execute_workflow(
+                ReferenceCheckoutWorkflow.run,
+                "order-1",
+                id="checkout:order-1",
+                task_queue="orders",
+            )
 
         self.assertEqual(result.order_id, "order-1")
         self.assertEqual(result.status, "paid")
@@ -73,14 +76,15 @@ class TestReferenceCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
             stock_levels={"item-2": 4},
             user_credit={"user-2": 5},
         )
-        runtime = create_reference_checkout_runtime(state)
-        client = runtime.create_client()
+        runtime, client, workers = create_reference_checkout_environment(state)
 
-        result = await client.execute_workflow(
-            "ReferenceCheckoutWorkflow",
-            workflow_key="checkout:order-2",
-            args=("order-2",),
-        )
+        async with workers[0], workers[1], workers[2]:
+            result = await client.execute_workflow(
+                ReferenceCheckoutWorkflow.run,
+                "order-2",
+                id="checkout:order-2",
+                task_queue="orders",
+            )
 
         self.assertEqual(result.order_id, "order-2")
         self.assertEqual(result.status, "compensated")

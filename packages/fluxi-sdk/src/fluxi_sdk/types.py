@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
-from typing import Any
+from typing import Any, Callable
 
 
 class StartPolicy(str, Enum):
@@ -50,13 +51,27 @@ class ActivityOptions:
 
     task_queue: str | None = None
     retry_policy: RetryPolicy | None = None
-    timeout_seconds: float | None = None
+    schedule_to_close_timeout: timedelta | None = None
 
     def __post_init__(self) -> None:
         if self.task_queue is not None and not self.task_queue.strip():
             raise ValueError("task_queue must be a non-empty string when provided.")
-        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be greater than 0 when provided.")
+        if self.schedule_to_close_timeout is not None:
+            if not isinstance(self.schedule_to_close_timeout, timedelta):
+                raise TypeError(
+                    "schedule_to_close_timeout must be a datetime.timedelta when provided."
+                )
+            if self.schedule_to_close_timeout <= timedelta(0):
+                raise ValueError(
+                    "schedule_to_close_timeout must be greater than zero when provided."
+                )
+
+    @property
+    def timeout_seconds(self) -> float | None:
+        if self.schedule_to_close_timeout is None:
+            return None
+        return self.schedule_to_close_timeout.total_seconds()
 
 
-WorkflowReference = str | type[Any]
+WorkflowReference = str | type[Any] | Callable[..., Any]
+ActivityReference = str | Callable[..., Any]

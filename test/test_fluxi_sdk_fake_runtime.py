@@ -1,27 +1,55 @@
 import asyncio
+from datetime import timedelta
 import unittest
 
-from fluxi_sdk import activity, errors, workflow
+import fluxi_sdk_test_support  # noqa: F401
+
+from fluxi_sdk import Worker, activity, errors, workflow
+from fluxi_sdk.client import WorkflowClient
 from fluxi_sdk.testing import FakeFluxiRuntime
 from fluxi_sdk.types import RetryPolicy, StartPolicy
 
 
-@workflow.defn(default_task_queue="orders")
+@activity.defn(name="load_order")
+def load_order_activity(order_id: str) -> dict:
+    return {
+        "order_id": order_id,
+        "item_id": "item-1",
+        "quantity": 2,
+        "user_id": "user-1",
+        "total": 20,
+    }
+
+
+@activity.defn(name="reserve_stock")
+async def reserve_stock_activity(item_id: str, quantity: int) -> dict:
+    await asyncio.sleep(0)
+    return {"item_id": item_id, "reserved": quantity}
+
+
+@activity.defn(name="charge_payment")
+def charge_payment_activity(user_id: str, total: int) -> dict:
+    return {"user_id": user_id, "charged": total}
+
+
+@workflow.defn
 class CheckoutWorkflow:
 
     @workflow.run
     async def run(self, order_id: str) -> dict:
-        order = await workflow.execute_activity("load_order", args=(order_id,))
+        order = await workflow.execute_activity(load_order_activity, order_id)
         reservation = await workflow.execute_activity(
-            "reserve_stock",
-            args=(order["item_id"], order["quantity"]),
+            reserve_stock_activity,
+            order["item_id"],
+            order["quantity"],
             task_queue="stock",
             retry_policy=RetryPolicy(max_attempts=3),
-            timeout_seconds=30,
+            schedule_to_close_timeout=timedelta(seconds=30),
         )
         payment = await workflow.execute_activity(
-            "charge_payment",
-            args=(order["user_id"], order["total"]),
+            charge_payment_activity,
+            order["user_id"],
+            order["total"],
             task_queue="payment",
         )
         return {
@@ -31,57 +59,49 @@ class CheckoutWorkflow:
         }
 
 
-@workflow.defn(default_task_queue="orders")
+@workflow.defn
 class SlowWorkflow:
 
     @workflow.run
     async def run(self, value: str) -> str:
-        await workflow.execute_activity("wait_for_signal", args=(value,))
+        await workflow.execute_activity("wait_for_signal", value)
         return f"done:{value}"
 
 
 class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
 
-    def _create_runtime(self) -> FakeFluxiRuntime:
-        runtime = FakeFluxiRuntime()
-        runtime.register_workflow(CheckoutWorkflow)
-        return runtime
-
     @staticmethod
-    def _register_checkout_activities(runtime: FakeFluxiRuntime) -> None:
-        @activity.defn(name="load_order")
-        def load_order_activity(order_id: str) -> dict:
-            return {
-                "order_id": order_id,
-                "item_id": "item-1",
-                "quantity": 2,
-                "user_id": "user-1",
-                "total": 20,
-            }
-
-        @activity.defn(name="reserve_stock")
-        async def reserve_stock_activity(item_id: str, quantity: int) -> dict:
-            await asyncio.sleep(0)
-            return {"item_id": item_id, "reserved": quantity}
-
-        @activity.defn(name="charge_payment")
-        def charge_payment_activity(user_id: str, total: int) -> dict:
-            return {"user_id": user_id, "charged": total}
-
-        runtime.register_activity(load_order_activity)
-        runtime.register_activity(reserve_stock_activity)
-        runtime.register_activity(charge_payment_activity)
+    def _create_runtime() -> tuple[FakeFluxiRuntime, WorkflowClient]:
+        runtime = FakeFluxiRuntime()
+        client = WorkflowClient.connect(runtime=runtime)
+        return runtime, client
 
     async def test_executes_workflow_and_records_activity_metadata(self):
-        runtime = self._create_runtime()
-        client = runtime.create_client()
-        self._register_checkout_activities(runtime)
-
-        result = await client.execute_workflow(
-            CheckoutWorkflow,
-            workflow_key="checkout:order-1",
-            args=("order-1",),
+        runtime, client = self._create_runtime()
+        orders_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[CheckoutWorkflow],
+            activities=[load_order_activity],
         )
+        stock_worker = Worker(
+            client,
+            task_queue="stock",
+            activities=[reserve_stock_activity],
+        )
+        payment_worker = Worker(
+            client,
+            task_queue="payment",
+            activities=[charge_payment_activity],
+        )
+
+        async with orders_worker, stock_worker, payment_worker:
+            result = await client.execute_workflow(
+                CheckoutWorkflow.run,
+                "order-1",
+                id="checkout:order-1",
+                task_queue="orders",
+            )
 
         self.assertEqual(
             result,
@@ -93,7 +113,8 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
         )
 
         run = runtime.workflow_runs[0]
-        self.assertEqual(run.workflow_key, "checkout:order-1")
+        self.assertEqual(run.workflow_id, "checkout:order-1")
+        self.assertEqual(run.task_queue, "orders")
         self.assertEqual(run.status, "completed")
         self.assertEqual(run.result, result)
         self.assertEqual(len(run.activity_executions), 3)
@@ -107,7 +128,10 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reserve_execution.activity_name, "reserve_stock")
         self.assertEqual(reserve_execution.options.task_queue, "stock")
         self.assertEqual(reserve_execution.options.retry_policy.max_attempts, 3)
-        self.assertEqual(reserve_execution.options.timeout_seconds, 30)
+        self.assertEqual(
+            reserve_execution.options.schedule_to_close_timeout,
+            timedelta(seconds=30),
+        )
         self.assertEqual(
             reserve_execution.result,
             {"item_id": "item-1", "reserved": 2},
@@ -118,23 +142,40 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(payment_execution.options.task_queue, "payment")
 
     async def test_executes_registered_workflow_by_name_string(self):
-        runtime = self._create_runtime()
-        self._register_checkout_activities(runtime)
-        client = runtime.create_client()
-
-        result = await client.execute_workflow(
-            "CheckoutWorkflow",
-            workflow_key="checkout:by-name",
-            args=("order-2",),
+        runtime, client = self._create_runtime()
+        orders_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[CheckoutWorkflow],
+            activities=[load_order_activity],
         )
+        stock_worker = Worker(
+            client,
+            task_queue="stock",
+            activities=[reserve_stock_activity],
+        )
+        payment_worker = Worker(
+            client,
+            task_queue="payment",
+            activities=[charge_payment_activity],
+        )
+
+        async with orders_worker, stock_worker, payment_worker:
+            result = await client.execute_workflow(
+                "CheckoutWorkflow",
+                "order-2",
+                id="checkout:by-name",
+                task_queue="orders",
+            )
 
         self.assertEqual(result["order_id"], "order-2")
         self.assertEqual(len(runtime.workflow_runs), 1)
         self.assertEqual(runtime.workflow_runs[0].workflow_name, "CheckoutWorkflow")
+        self.assertEqual(runtime.workflow_runs[0].workflow_id, "checkout:by-name")
 
     async def test_attach_or_start_reuses_existing_run_for_same_workflow_key(self):
         runtime = FakeFluxiRuntime()
-        runtime.register_workflow(SlowWorkflow)
+        client = WorkflowClient.connect(runtime=runtime)
         signal = asyncio.Event()
         started = asyncio.Event()
 
@@ -144,31 +185,38 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
             await signal.wait()
             return value
 
-        runtime.register_activity(wait_for_signal)
-        client = runtime.create_client()
-
-        first_task = asyncio.create_task(
-            client.execute_workflow(
-                SlowWorkflow,
-                workflow_key="slow:1",
-                args=("alpha",),
-            )
-        )
-        await started.wait()
-
-        second_task = asyncio.create_task(
-            client.execute_workflow(
-                SlowWorkflow,
-                workflow_key="slow:1",
-                args=("ignored",),
-            )
+        orders_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[SlowWorkflow],
+            activities=[wait_for_signal],
         )
 
-        await asyncio.sleep(0)
-        signal.set()
+        async with orders_worker:
+            first_task = asyncio.create_task(
+                client.execute_workflow(
+                    SlowWorkflow.run,
+                    "alpha",
+                    id="slow:1",
+                    task_queue="orders",
+                )
+            )
+            await started.wait()
 
-        first_result = await first_task
-        second_result = await second_task
+            second_task = asyncio.create_task(
+                client.execute_workflow(
+                    SlowWorkflow.run,
+                    "ignored",
+                    id="slow:1",
+                    task_queue="orders",
+                )
+            )
+
+            await asyncio.sleep(0)
+            signal.set()
+
+            first_result = await first_task
+            second_result = await second_task
 
         self.assertEqual(first_result, "done:alpha")
         self.assertEqual(second_result, "done:alpha")
@@ -178,26 +226,33 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
 
     async def test_attach_or_start_reuses_completed_run_for_same_workflow_key(self):
         runtime = FakeFluxiRuntime()
-        runtime.register_workflow(SlowWorkflow)
+        client = WorkflowClient.connect(runtime=runtime)
 
         @activity.defn
         async def wait_for_signal(value: str) -> str:
             await asyncio.sleep(0)
             return value
 
-        runtime.register_activity(wait_for_signal)
-        client = runtime.create_client()
+        orders_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[SlowWorkflow],
+            activities=[wait_for_signal],
+        )
 
-        first_result = await client.execute_workflow(
-            SlowWorkflow,
-            workflow_key="slow:completed",
-            args=("alpha",),
-        )
-        second_result = await client.execute_workflow(
-            SlowWorkflow,
-            workflow_key="slow:completed",
-            args=("beta",),
-        )
+        async with orders_worker:
+            first_result = await client.execute_workflow(
+                SlowWorkflow.run,
+                "alpha",
+                id="slow:completed",
+                task_queue="orders",
+            )
+            second_result = await client.execute_workflow(
+                SlowWorkflow.run,
+                "beta",
+                id="slow:completed",
+                task_queue="orders",
+            )
 
         self.assertEqual(first_result, "done:alpha")
         self.assertEqual(second_result, "done:alpha")
@@ -207,7 +262,7 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
 
     async def test_reject_duplicate_raises_for_existing_workflow_key(self):
         runtime = FakeFluxiRuntime()
-        runtime.register_workflow(SlowWorkflow)
+        client = WorkflowClient.connect(runtime=runtime)
         signal = asyncio.Event()
         started = asyncio.Event()
 
@@ -217,98 +272,139 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
             await signal.wait()
             return value
 
-        runtime.register_activity(wait_for_signal)
-        client = runtime.create_client()
-
-        first_task = asyncio.create_task(
-            client.execute_workflow(
-                SlowWorkflow,
-                workflow_key="slow:reject",
-                args=("alpha",),
-            )
+        orders_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[SlowWorkflow],
+            activities=[wait_for_signal],
         )
-        await started.wait()
 
-        with self.assertRaises(errors.WorkflowAlreadyStartedError):
-            await client.execute_workflow(
-                SlowWorkflow,
-                workflow_key="slow:reject",
-                args=("beta",),
-                start_policy=StartPolicy.REJECT_DUPLICATE,
+        async with orders_worker:
+            first_task = asyncio.create_task(
+                client.execute_workflow(
+                    SlowWorkflow.run,
+                    "alpha",
+                    id="slow:reject",
+                    task_queue="orders",
+                )
             )
+            await started.wait()
 
-        signal.set()
-        self.assertEqual(await first_task, "done:alpha")
+            with self.assertRaises(errors.WorkflowAlreadyStartedError):
+                await client.execute_workflow(
+                    SlowWorkflow.run,
+                    "beta",
+                    id="slow:reject",
+                    task_queue="orders",
+                    start_policy=StartPolicy.REJECT_DUPLICATE,
+                )
+
+            signal.set()
+            self.assertEqual(await first_task, "done:alpha")
         self.assertEqual(len(runtime.workflow_runs), 1)
 
     async def test_allow_duplicate_starts_a_new_run(self):
         runtime = FakeFluxiRuntime()
-        runtime.register_workflow(SlowWorkflow)
+        client = WorkflowClient.connect(runtime=runtime)
 
         @activity.defn
         async def wait_for_signal(value: str) -> str:
             await asyncio.sleep(0)
             return value
 
-        runtime.register_activity(wait_for_signal)
-        client = runtime.create_client()
+        orders_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[SlowWorkflow],
+            activities=[wait_for_signal],
+        )
 
-        first_result = await client.execute_workflow(
-            SlowWorkflow,
-            workflow_key="slow:dup",
-            args=("alpha",),
-        )
-        second_result = await client.execute_workflow(
-            SlowWorkflow,
-            workflow_key="slow:dup",
-            args=("beta",),
-            start_policy=StartPolicy.ALLOW_DUPLICATE,
-        )
+        async with orders_worker:
+            first_result = await client.execute_workflow(
+                SlowWorkflow.run,
+                "alpha",
+                id="slow:dup",
+                task_queue="orders",
+            )
+            second_result = await client.execute_workflow(
+                SlowWorkflow.run,
+                "beta",
+                id="slow:dup",
+                task_queue="orders",
+                start_policy=StartPolicy.ALLOW_DUPLICATE,
+            )
 
         self.assertEqual(first_result, "done:alpha")
         self.assertEqual(second_result, "done:beta")
         self.assertEqual(len(runtime.workflow_runs), 2)
         self.assertEqual(
-            [run.args for run in runtime.get_workflow_runs_for_key("slow:dup")],
+            [run.args for run in runtime.get_workflow_runs_for_id("slow:dup")],
             [("alpha",), ("beta",)],
         )
 
-    async def test_unknown_workflow_raises(self):
-        runtime = FakeFluxiRuntime()
-        client = runtime.create_client()
+    async def test_requires_running_worker_for_workflow_task_queue(self):
+        runtime, client = self._create_runtime()
+        Worker(
+            client,
+            task_queue="orders",
+            workflows=[CheckoutWorkflow],
+            activities=[load_order_activity],
+        )
 
-        with self.assertRaises(errors.UnknownWorkflowError):
+        with self.assertRaises(errors.NoWorkflowWorkerAvailableError):
             await client.execute_workflow(
-                "missing-workflow",
-                workflow_key="missing:1",
+                CheckoutWorkflow.run,
+                "missing",
+                id="missing:1",
+                task_queue="orders",
             )
 
-    async def test_unknown_activity_fails_workflow_and_is_recorded(self):
+    async def test_requires_running_worker_for_activity_task_queue(self):
         runtime = FakeFluxiRuntime()
+        client = WorkflowClient.connect(runtime=runtime)
 
-        @workflow.defn(default_task_queue="orders")
+        @activity.defn(name="charge_payment")
+        def charge_payment(user_id: str, amount: int) -> dict:
+            return {"user_id": user_id, "charged": amount}
+
+        @workflow.defn
         class MissingActivityWorkflow:
 
             @workflow.run
             async def run(self) -> None:
-                await workflow.execute_activity("missing-activity")
+                await workflow.execute_activity(
+                    charge_payment,
+                    "user-1",
+                    10,
+                    task_queue="payment",
+                )
 
-        runtime.register_workflow(MissingActivityWorkflow)
-        client = runtime.create_client()
+        orders_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[MissingActivityWorkflow],
+        )
+        Worker(
+            client,
+            task_queue="payment",
+            activities=[charge_payment],
+        )
 
-        with self.assertRaises(errors.UnknownActivityError):
-            await client.execute_workflow(
-                MissingActivityWorkflow,
-                workflow_key="missing-activity:1",
-            )
+        async with orders_worker:
+            with self.assertRaises(errors.NoActivityWorkerAvailableError):
+                await client.execute_workflow(
+                    MissingActivityWorkflow.run,
+                    id="missing-activity:1",
+                    task_queue="orders",
+                )
 
         run = runtime.workflow_runs[0]
         self.assertEqual(run.status, "failed")
-        self.assertIsInstance(run.error, errors.UnknownActivityError)
+        self.assertIsInstance(run.error, errors.NoActivityWorkerAvailableError)
         self.assertEqual(run.activity_executions[0].status, "failed")
         self.assertIsInstance(
             run.activity_executions[0].error,
-            errors.UnknownActivityError,
+            errors.NoActivityWorkerAvailableError,
         )
 
 

@@ -1,4 +1,7 @@
+from datetime import timedelta
 import unittest
+
+import fluxi_sdk_test_support  # noqa: F401
 
 from fluxi_sdk import activity, errors, workflow
 from fluxi_sdk.types import RetryPolicy
@@ -8,7 +11,7 @@ class TestFluxiSdkRegistration(unittest.TestCase):
 
     @staticmethod
     def _workflow_definition():
-        @workflow.defn(default_task_queue="orders")
+        @workflow.defn
         class CheckoutWorkflow:
 
             @workflow.run
@@ -34,9 +37,9 @@ class TestFluxiSdkRegistration(unittest.TestCase):
         self.assertIs(registration.workflow, workflow_cls)
         self.assertEqual(registration.name, "CheckoutWorkflow")
         self.assertEqual(registration.run_method_name, "run")
-        self.assertEqual(registration.default_task_queue, "orders")
         self.assertIs(registry.get(workflow_cls), registration)
         self.assertIs(registry.get("CheckoutWorkflow"), registration)
+        self.assertIs(registry.get(workflow_cls.run), registration)
 
     def test_workflow_registry_rejects_undeclared_workflows(self):
         registry = workflow.WorkflowRegistry()
@@ -99,7 +102,7 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
     def _workflow_registration():
         registry = workflow.WorkflowRegistry()
 
-        @workflow.defn(default_task_queue="orders")
+        @workflow.defn
         class CheckoutWorkflow:
 
             @workflow.run
@@ -112,7 +115,7 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(errors.WorkflowContextUnavailableError):
             await workflow.execute_activity("reserve_stock")
 
-    async def test_execute_activity_uses_workflow_default_task_queue(self):
+    async def test_execute_activity_uses_workflow_task_queue_by_default(self):
         registration = self._workflow_registration()
         captured: dict[str, object] = {}
 
@@ -122,12 +125,20 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
             captured["options"] = options
             return {"scheduled": name, "task_queue": options.task_queue}
 
-        with workflow._activate_execution_context(registration, execute_activity):
+        @activity.defn(name="reserve_stock")
+        def reserve_stock(order_id: str) -> str:
+            return order_id
+
+        with workflow._activate_execution_context(
+            registration,
+            "orders",
+            execute_activity,
+        ):
             result = await workflow.execute_activity(
-                "reserve_stock",
-                args=("order-1",),
+                reserve_stock,
+                "order-1",
                 retry_policy=RetryPolicy(max_attempts=3),
-                timeout_seconds=30,
+                schedule_to_close_timeout=timedelta(seconds=30),
             )
 
         self.assertEqual(
@@ -138,7 +149,10 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["args"], ("order-1",))
         self.assertEqual(captured["options"].task_queue, "orders")
         self.assertEqual(captured["options"].retry_policy.max_attempts, 3)
-        self.assertEqual(captured["options"].timeout_seconds, 30)
+        self.assertEqual(
+            captured["options"].schedule_to_close_timeout,
+            timedelta(seconds=30),
+        )
 
     async def test_execute_activity_prefers_explicit_task_queue(self):
         registration = self._workflow_registration()
@@ -150,10 +164,14 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
             captured["options"] = options
             return options.task_queue
 
-        with workflow._activate_execution_context(registration, execute_activity):
+        with workflow._activate_execution_context(
+            registration,
+            "orders",
+            execute_activity,
+        ):
             result = await workflow.execute_activity(
                 "charge_payment",
-                args=("order-1",),
+                "order-1",
                 task_queue="payment",
             )
 

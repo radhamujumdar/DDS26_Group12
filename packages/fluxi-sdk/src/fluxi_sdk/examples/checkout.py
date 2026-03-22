@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 
 from .. import activity, workflow
+from ..client import WorkflowClient
 from ..testing import FakeFluxiRuntime
+from ..worker import Worker
 
 
 class ReferenceCheckoutError(Exception):
@@ -71,35 +74,40 @@ class ReferenceCheckoutState:
     next_payment_number: int = 1
 
 
-@workflow.defn(name="ReferenceCheckoutWorkflow", default_task_queue="orders")
+@workflow.defn(name="ReferenceCheckoutWorkflow")
 class ReferenceCheckoutWorkflow:
     """Sample checkout workflow using Fluxi's public SDK surface."""
 
     @workflow.run
     async def run(self, order_id: str) -> CheckoutWorkflowResult:
-        order = await workflow.execute_activity("load_order", args=(order_id,))
+        order = await workflow.execute_activity("load_order", order_id)
         reservations: list[StockReservation] = []
 
         for item in order.items:
             reservation = await workflow.execute_activity(
                 "reserve_stock",
-                args=(item.item_id, item.quantity),
+                item.item_id,
+                item.quantity,
                 task_queue="stock",
+                schedule_to_close_timeout=timedelta(seconds=30),
             )
             reservations.append(reservation)
 
         try:
             payment = await workflow.execute_activity(
                 "charge_payment",
-                args=(order.user_id, order.total_cost),
+                order.user_id,
+                order.total_cost,
                 task_queue="payment",
+                schedule_to_close_timeout=timedelta(seconds=30),
             )
         except PaymentDeclinedError as exc:
             released: list[StockReservation] = []
             for reservation in reversed(reservations):
                 released_item = await workflow.execute_activity(
                     "release_stock",
-                    args=(reservation.item_id, reservation.quantity),
+                    reservation.item_id,
+                    reservation.quantity,
                     task_queue="stock",
                 )
                 released.append(released_item)
@@ -110,7 +118,7 @@ class ReferenceCheckoutWorkflow:
                 failure_reason=str(exc),
             )
 
-        await workflow.execute_activity("mark_order_paid", args=(order.order_id,))
+        await workflow.execute_activity("mark_order_paid", order.order_id)
         return CheckoutWorkflowResult(
             order_id=order.order_id,
             status="paid",
@@ -118,11 +126,11 @@ class ReferenceCheckoutWorkflow:
         )
 
 
-def register_reference_checkout_activities(
-    runtime: FakeFluxiRuntime,
+def create_reference_checkout_workers(
+    client: WorkflowClient,
     state: ReferenceCheckoutState,
-) -> None:
-    """Register fake in-memory activities that back the reference workflow."""
+) -> tuple[Worker, Worker, Worker]:
+    """Create workers that back the reference checkout example."""
 
     @activity.defn(name="load_order")
     def load_order(order_id: str) -> CheckoutOrder:
@@ -174,31 +182,34 @@ def register_reference_checkout_activities(
         state.released_items.append(released)
         return released
 
-    runtime.register_activity(load_order)
-    runtime.register_activity(reserve_stock)
-    runtime.register_activity(charge_payment)
-    runtime.register_activity(mark_order_paid)
-    runtime.register_activity(release_stock)
+    orders_worker = Worker(
+        client,
+        task_queue="orders",
+        workflows=[ReferenceCheckoutWorkflow],
+        activities=[load_order, mark_order_paid],
+    )
+    stock_worker = Worker(
+        client,
+        task_queue="stock",
+        activities=[reserve_stock, release_stock],
+    )
+    payment_worker = Worker(
+        client,
+        task_queue="payment",
+        activities=[charge_payment],
+    )
+    return orders_worker, stock_worker, payment_worker
 
 
-def register_reference_checkout(
-    runtime: FakeFluxiRuntime,
+def create_reference_checkout_environment(
     state: ReferenceCheckoutState,
-) -> FakeFluxiRuntime:
-    """Register the reference workflow and fake activities into a runtime."""
-
-    runtime.register_workflow(ReferenceCheckoutWorkflow)
-    register_reference_checkout_activities(runtime, state)
-    return runtime
-
-
-def create_reference_checkout_runtime(
-    state: ReferenceCheckoutState,
-) -> FakeFluxiRuntime:
-    """Create a fake runtime preloaded with the reference checkout workflow."""
+) -> tuple[FakeFluxiRuntime, WorkflowClient, tuple[Worker, Worker, Worker]]:
+    """Create a fake runtime plus client and workers for the reference example."""
 
     runtime = FakeFluxiRuntime()
-    return register_reference_checkout(runtime, state)
+    client = WorkflowClient.connect(runtime=runtime)
+    workers = create_reference_checkout_workers(client, state)
+    return runtime, client, workers
 
 
 __all__ = [
@@ -213,7 +224,6 @@ __all__ = [
     "ReferenceCheckoutWorkflow",
     "StockReservation",
     "StockUnavailableError",
-    "create_reference_checkout_runtime",
-    "register_reference_checkout",
-    "register_reference_checkout_activities",
+    "create_reference_checkout_environment",
+    "create_reference_checkout_workers",
 ]

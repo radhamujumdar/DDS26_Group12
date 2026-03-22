@@ -9,9 +9,8 @@ from .checkout import (
     ReferenceCheckoutState,
     ReferenceCheckoutWorkflow,
     StockReservation,
-    create_reference_checkout_runtime,
-    register_reference_checkout,
-    register_reference_checkout_activities,
+    create_reference_checkout_environment,
+    create_reference_checkout_workers,
 )
 
 __all__ = [
@@ -23,7 +22,6 @@ __all__ = [
     "ReferenceCheckoutState",
     "ReferenceCheckoutWorkflow",
     "StockReservation",
-    "create_reference_checkout_runtime",
-    "register_reference_checkout",
-    "register_reference_checkout_activities",
+    "create_reference_checkout_environment",
+    "create_reference_checkout_workers",
 ]

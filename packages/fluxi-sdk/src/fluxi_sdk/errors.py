@@ -47,3 +47,15 @@ class WorkflowContextUnavailableError(WorkflowContextError):
 
 class WorkflowAlreadyStartedError(FluxiError):
     """Raised when a workflow key collides with a start policy."""
+
+
+class WorkerError(FluxiError):
+    """Raised for worker lifecycle and task-queue availability failures."""
+
+
+class NoWorkflowWorkerAvailableError(WorkerError):
+    """Raised when no running worker can execute a workflow on a task queue."""
+
+
+class NoActivityWorkerAvailableError(WorkerError):
+    """Raised when no running worker can execute an activity on a task queue."""

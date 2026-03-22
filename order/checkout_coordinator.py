@@ -7,6 +7,7 @@ from typing import Any, Callable, Protocol
 from flask import Response, abort
 
 from fluxi_sdk import activity
+from fluxi_sdk.client import WorkflowClient
 from fluxi_sdk.examples.checkout import (
     CheckoutItem,
     CheckoutOrder,
@@ -18,6 +19,7 @@ from fluxi_sdk.examples.checkout import (
     StockUnavailableError,
 )
 from fluxi_sdk.testing import FakeFluxiRuntime
+from fluxi_sdk.worker import Worker
 
 
 class CheckoutCoordinator(Protocol):
@@ -109,21 +111,22 @@ class FluxiCheckoutCoordinator:
 
     async def _execute_checkout(self, order_id: str) -> CheckoutWorkflowResult:
         runtime = FakeFluxiRuntime()
-        runtime.register_workflow(ReferenceCheckoutWorkflow)
-        self._register_reference_checkout_activities(runtime, order_id)
+        client = WorkflowClient.connect(runtime=runtime)
+        workers = self._create_reference_checkout_workers(client, order_id)
 
-        client = runtime.create_client()
-        return await client.execute_workflow(
-            ReferenceCheckoutWorkflow,
-            workflow_key=f"order-checkout:{order_id}",
-            args=(order_id,),
-        )
+        async with workers[0], workers[1], workers[2]:
+            return await client.execute_workflow(
+                ReferenceCheckoutWorkflow.run,
+                order_id,
+                id=f"order-checkout:{order_id}",
+                task_queue="orders",
+            )
 
-    def _register_reference_checkout_activities(
+    def _create_reference_checkout_workers(
         self,
-        runtime: FakeFluxiRuntime,
+        client: WorkflowClient,
         order_id: str,
-    ) -> None:
+    ) -> tuple[Worker, Worker, Worker]:
         @activity.defn(name="load_order")
         def load_order(loaded_order_id: str) -> CheckoutOrder:
             order_entry = self._get_order(loaded_order_id)
@@ -163,11 +166,23 @@ class FluxiCheckoutCoordinator:
             self._send_post_request(f"{self._gateway_url}/stock/add/{item_id}/{quantity}")
             return StockReservation(item_id=item_id, quantity=quantity)
 
-        runtime.register_activity(load_order)
-        runtime.register_activity(reserve_stock)
-        runtime.register_activity(charge_payment)
-        runtime.register_activity(mark_order_paid)
-        runtime.register_activity(release_stock)
+        orders_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[ReferenceCheckoutWorkflow],
+            activities=[load_order, mark_order_paid],
+        )
+        stock_worker = Worker(
+            client,
+            task_queue="stock",
+            activities=[reserve_stock, release_stock],
+        )
+        payment_worker = Worker(
+            client,
+            task_queue="payment",
+            activities=[charge_payment],
+        )
+        return orders_worker, stock_worker, payment_worker
 
 
 def build_checkout_coordinator(
