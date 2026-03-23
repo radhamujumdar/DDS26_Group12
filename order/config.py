@@ -34,6 +34,7 @@ class OrderConfig:
     redis_db: int
     redis_sentinel_hosts: str | None
     redis_master_name: str | None
+    redis_cluster_nodes: str | None
     tx_mode: str
     stock_service_url: str
     payment_service_url: str
@@ -54,6 +55,7 @@ class OrderConfig:
     saga_mq_dispatch_block_ms: int
     saga_mq_dispatch_lease_ttl_seconds: int
     saga_mq_dispatch_renew_interval_seconds: float
+    saga_mq_cluster_nodes: str | None
     saga_mq_owner_id: str | None
 
     @classmethod
@@ -65,6 +67,7 @@ class OrderConfig:
             redis_db=int(os.environ["REDIS_DB"]),
             redis_sentinel_hosts=os.environ.get("REDIS_SENTINEL_HOSTS"),
             redis_master_name=os.environ.get("REDIS_MASTER_NAME"),
+            redis_cluster_nodes=os.environ.get("REDIS_CLUSTER_NODES"),
             tx_mode=os.environ.get("TX_MODE", TxMode.TWO_PC.value).lower(),
             stock_service_url=os.environ.get("STOCK_SERVICE_URL", DEFAULT_STOCK_SERVICE_URL).rstrip("/"),
             payment_service_url=os.environ.get("PAYMENT_SERVICE_URL", DEFAULT_PAYMENT_SERVICE_URL).rstrip("/"),
@@ -108,5 +111,6 @@ class OrderConfig:
                     DEFAULT_SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS,
                 )
             ),
+            saga_mq_cluster_nodes=os.environ.get("SAGA_MQ_CLUSTER_NODES"),
             saga_mq_owner_id=os.environ.get("SAGA_MQ_OWNER_ID"),
         )

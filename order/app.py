@@ -36,6 +36,7 @@ async def lifespan(app: FastAPI):
         db=config.redis_db,
         sentinel_hosts=config.redis_sentinel_hosts,
         master_name=config.redis_master_name,
+        cluster_nodes=config.redis_cluster_nodes,
     )
     saga_broker_db: Redis | None = None
     saga_bus: SagaCommandBus | None = None
@@ -47,6 +48,7 @@ async def lifespan(app: FastAPI):
             db=config.saga_mq_redis_db,
             sentinel_hosts=config.saga_mq_sentinel_hosts,
             master_name=config.saga_mq_master_name,
+            cluster_nodes=config.saga_mq_cluster_nodes,
         )
         saga_bus = SagaCommandBus(
             db=saga_broker_db,

@@ -160,6 +160,7 @@ class TwoPCCoordinator:
             if abort_detail:
                 tx = await self.tx_repo.persist_prepare_outcome(
                     tx_id=tx.tx_id,
+                    order_id=tx.order_id,
                     stock_prepared_items=list(prepared_set),
                     payment_prepared=payment_was_prepared,
                     attempts_increment=len(tasks),
@@ -169,6 +170,7 @@ class TwoPCCoordinator:
 
             tx = await self.tx_repo.persist_prepare_outcome(
                 tx_id=tx.tx_id,
+                order_id=tx.order_id,
                 stock_prepared_items=list(prepared_set),
                 payment_prepared=payment_was_prepared,
                 attempts_increment=len(tasks),
@@ -176,6 +178,7 @@ class TwoPCCoordinator:
         else:
             tx = await self.tx_repo.persist_prepare_outcome(
                 tx_id=tx.tx_id,
+                order_id=tx.order_id,
                 stock_prepared_items=list(tx.stock_prepared_items),
                 payment_prepared=tx.payment_prepared,
                 attempts_increment=0,
@@ -231,6 +234,7 @@ class TwoPCCoordinator:
         if error_detail:
             return await self.tx_repo.persist_commit_progress(
                 tx_id=tx.tx_id,
+                order_id=tx.order_id,
                 stock_committed_items=list(committed_set),
                 payment_committed=payment_committed,
                 attempts_increment=len(tasks),
@@ -239,6 +243,7 @@ class TwoPCCoordinator:
 
         tx = await self.tx_repo.finalize_commit(
             tx_id=tx.tx_id,
+            order_id=tx.order_id,
             stock_committed_items=list(committed_set),
             payment_committed=True,
             attempts_increment=len(tasks),
@@ -275,10 +280,11 @@ class TwoPCCoordinator:
                 if not result.ok:
                     return await self.tx_repo.persist_abort_failure(
                         tx_id=tx.tx_id,
+                        order_id=tx.order_id,
                         error=result.detail or f"{kind} rollback failed",
                     )
 
-        tx = await self.tx_repo.finalize_abort(tx.tx_id, error=tx.error)
+        tx = await self.tx_repo.finalize_abort(tx.tx_id, order_id=tx.order_id, error=tx.error)
         self._log(
             "tx_terminal",
             tx_id=tx.tx_id,

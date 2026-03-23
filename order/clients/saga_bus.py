@@ -102,40 +102,34 @@ class SagaCommandBus:
     async def recover_stale_pending(self, stale_after_ms: int):
         now_ms = int(time.time() * 1000)
         stale_after_ms = int(stale_after_ms)
-        cursor = 0
         stale_count = 0
 
-        while True:
-            cursor, keys = await self.db.scan(cursor=cursor, match=f"{self.PENDING_PREFIX}*", count=200)
-            for pending_key in keys:
-                key_str = self._decode(pending_key)
-                data = await self.db.hgetall(key_str)
-                decoded = self._decode_dict(data)
-                status = decoded.get("status", "")
-                if status != "pending":
-                    continue
+        async for pending_key in self.db.scan_iter(match=f"{self.PENDING_PREFIX}*", count=200):
+            key_str = self._decode(pending_key)
+            data = await self.db.hgetall(key_str)
+            decoded = self._decode_dict(data)
+            status = decoded.get("status", "")
+            if status != "pending":
+                continue
 
-                created_at_ms = int(decoded.get("created_at_ms", "0") or "0")
-                if created_at_ms <= 0:
-                    continue
-                if now_ms - created_at_ms < stale_after_ms:
-                    continue
+            created_at_ms = int(decoded.get("created_at_ms", "0") or "0")
+            if created_at_ms <= 0:
+                continue
+            if now_ms - created_at_ms < stale_after_ms:
+                continue
 
-                await self.db.hset(
-                    key_str,
-                    mapping={
-                        "status": "timed_out",
-                        "ok": "0",
-                        "retryable": "1",
-                        "detail": "Timed out while coordinator was unavailable",
-                        "completed_at_ms": str(now_ms),
-                    },
-                )
-                stale_count += 1
-                await self._incr_metric("stale_pending_recovered_total")
-
-            if cursor == 0:
-                break
+            await self.db.hset(
+                key_str,
+                mapping={
+                    "status": "timed_out",
+                    "ok": "0",
+                    "retryable": "1",
+                    "detail": "Timed out while coordinator was unavailable",
+                    "completed_at_ms": str(now_ms),
+                },
+            )
+            stale_count += 1
+            await self._incr_metric("stale_pending_recovered_total")
 
         if stale_count > 0:
             self._log("saga_mq_recovered_stale_pending", stale_count=stale_count, stale_after_ms=stale_after_ms)
@@ -566,7 +560,6 @@ class SagaCommandBus:
         }
 
     async def _count_pending_statuses(self) -> dict[str, int]:
-        cursor = 0
         counts: dict[str, int] = {
             "pending": 0,
             "completed": 0,
@@ -575,19 +568,15 @@ class SagaCommandBus:
             "unknown": 0,
             "total": 0,
         }
-        while True:
-            cursor, keys = await self.db.scan(cursor=cursor, match=f"{self.PENDING_PREFIX}*", count=200)
-            for pending_key in keys:
-                key_str = self._decode(pending_key)
-                raw = await self.db.hget(key_str, "status")
-                status = self._decode(raw) or "unknown"
-                counts["total"] += 1
-                if status in counts:
-                    counts[status] += 1
-                else:
-                    counts["unknown"] += 1
-            if cursor == 0:
-                break
+        async for pending_key in self.db.scan_iter(match=f"{self.PENDING_PREFIX}*", count=200):
+            key_str = self._decode(pending_key)
+            raw = await self.db.hget(key_str, "status")
+            status = self._decode(raw) or "unknown"
+            counts["total"] += 1
+            if status in counts:
+                counts[status] += 1
+            else:
+                counts["unknown"] += 1
         return counts
 
     def _log(self, event: str, level: str = "info", **fields):

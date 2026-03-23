@@ -8,17 +8,23 @@ from redis.asyncio import Redis
 
 from models import TxRecord, TxState
 
+# Keys on same slot (anchored on order_id):
+#   {order_id}:tx:{tx_id}   – tx record
+#   {order_id}:txord        – order_id → tx_id mapping
+#   {order_id}:txlk:{tx_id} – distributed lock
+#   ord:{order_id}          – order record (same slot as above, via hash tag)
+# Secondary index (random slot, used only for lookup by tx_id alone):
+#   tx:oid:{tx_id}          – tx_id → order_id
+
 CREATE_TX_BY_ORDER_SCRIPT = """
-local order_key = KEYS[1]
+local order_txord_key = KEYS[1]
 local tx_key = KEYS[2]
-local active_key = KEYS[3]
-local existing = redis.call('GET', order_key)
+local existing = redis.call('GET', order_txord_key)
 if existing then
     return {existing, 0}
 end
-redis.call('SET', order_key, ARGV[1])
+redis.call('SET', order_txord_key, ARGV[1])
 redis.call('SET', tx_key, ARGV[2])
-redis.call('SADD', active_key, ARGV[1])
 return {ARGV[1], 1}
 """
 
@@ -58,9 +64,10 @@ redis.call('SET', tx_key, packed)
 return {1, packed}
 """
 
+# KEYS[1] = {order_id}:tx:{tx_id}
+# Reads order record at 'ord:{order_id}' (same slot as tx_key via hash tag)
 TX_FINALIZE_COMMIT_SCRIPT = """
 local tx_key = KEYS[1]
-local active_key = KEYS[2]
 
 local raw = redis.call('GET', tx_key)
 if not raw then
@@ -68,7 +75,7 @@ if not raw then
 end
 
 local tx = cmsgpack.unpack(raw)
-local order_key = tx['order_id']
+local order_key = 'ord:{' .. tx['order_id'] .. '}'
 local order_raw = redis.call('GET', order_key)
 if not order_raw then
     return {-1, 'Order not found'}
@@ -87,13 +94,13 @@ tx['error'] = nil
 local packed = cmsgpack.pack(tx)
 redis.call('SET', tx_key, packed)
 redis.call('SET', order_key, cmsgpack.pack(order_entry))
-redis.call('SREM', active_key, tx['tx_id'])
 return {1, packed}
 """
 
+# KEYS[1] = {order_id}:tx:{tx_id}
+# Constructs {order_id}:txord inline (same slot)
 TX_FINALIZE_ABORT_SCRIPT = """
 local tx_key = KEYS[1]
-local active_key = KEYS[2]
 
 local raw = redis.call('GET', tx_key)
 if not raw then
@@ -101,7 +108,7 @@ if not raw then
 end
 
 local tx = cmsgpack.unpack(raw)
-local order_key = ARGV[5] .. tx['order_id']
+local order_txord_key = '{' .. tx['order_id'] .. '}:txord'
 tx['state'] = ARGV[1]
 tx['updated_at'] = tonumber(ARGV[2])
 if ARGV[3] == '1' then
@@ -112,11 +119,10 @@ end
 
 local packed = cmsgpack.pack(tx)
 redis.call('SET', tx_key, packed)
-redis.call('SREM', active_key, tx['tx_id'])
 
-local mapped_tx_id = redis.call('GET', order_key)
+local mapped_tx_id = redis.call('GET', order_txord_key)
 if mapped_tx_id and mapped_tx_id == tx['tx_id'] then
-    redis.call('DEL', order_key)
+    redis.call('DEL', order_txord_key)
 end
 
 return {1, packed}
@@ -124,10 +130,7 @@ return {1, packed}
 
 
 class TxRepository:
-    TX_PREFIX = "tx:"
     TX_ACTIVE = "tx:active"
-    TX_ORDER_PREFIX = "tx:order:"
-    TX_LOCK_PREFIX = "tx:lock:"
 
     def __init__(self, db: Redis):
         self.db = db
@@ -139,14 +142,21 @@ class TxRepository:
     def _db_error(detail: str) -> HTTPException:
         return HTTPException(status_code=400, detail=detail)
 
-    def _tx_key(self, tx_id: str) -> str:
-        return f"{self.TX_PREFIX}{tx_id}"
+    @staticmethod
+    def _tx_key(order_id: str, tx_id: str) -> str:
+        return f"{{{order_id}}}:tx:{tx_id}"
 
-    def _tx_order_key(self, order_id: str) -> str:
-        return f"{self.TX_ORDER_PREFIX}{order_id}"
+    @staticmethod
+    def _tx_order_key(order_id: str) -> str:
+        return f"{{{order_id}}}:txord"
 
-    def _tx_lock_key(self, tx_id: str) -> str:
-        return f"{self.TX_LOCK_PREFIX}{tx_id}"
+    @staticmethod
+    def _tx_lock_key(order_id: str, tx_id: str) -> str:
+        return f"{{{order_id}}}:txlk:{tx_id}"
+
+    @staticmethod
+    def _tx_oid_index_key(tx_id: str) -> str:
+        return f"tx:oid:{tx_id}"
 
     @staticmethod
     def _decode_str(value) -> str:
@@ -204,6 +214,15 @@ class TxRepository:
             raise self._db_error(f"Failed to decode Redis transition payload for transaction {tx_id}")
         return self._decode_record_bytes(bytes(payload), tx_id, source="the Redis transition result")
 
+    async def _get_order_id_for_tx(self, tx_id: str) -> str | None:
+        try:
+            raw = await self.db.get(self._tx_oid_index_key(tx_id))
+        except redis.exceptions.RedisError as exc:
+            raise self._db_error(f"Failed to look up order_id for transaction {tx_id}") from exc
+        if raw is None:
+            return None
+        return raw.decode() if isinstance(raw, bytes) else str(raw)
+
     async def create(
         self,
         order_id: str,
@@ -221,11 +240,12 @@ class TxRepository:
             state=state,
         )
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
-                pipe.set(self._tx_key(record.tx_id), msgpack.encode(record))
-                pipe.sadd(self.TX_ACTIVE, record.tx_id)
-                pipe.set(self._tx_order_key(order_id), record.tx_id)
-                await pipe.execute()
+            pipe = self.db.pipeline(transaction=False)
+            pipe.set(self._tx_key(order_id, record.tx_id), msgpack.encode(record))
+            pipe.set(self._tx_order_key(order_id), record.tx_id)
+            pipe.set(self._tx_oid_index_key(record.tx_id), order_id)
+            await pipe.execute()
+            await self.db.sadd(self.TX_ACTIVE, record.tx_id)
         except redis.exceptions.RedisError as exc:
             raise self._db_error(
                 f"Failed to create transaction {record.tx_id} for order {order_id} in Redis"
@@ -256,10 +276,9 @@ class TxRepository:
             try:
                 result = await self.db.eval(
                     CREATE_TX_BY_ORDER_SCRIPT,
-                    3,
+                    2,
                     self._tx_order_key(order_id),
-                    self._tx_key(proposed_tx_id),
-                    self.TX_ACTIVE,
+                    self._tx_key(order_id, proposed_tx_id),
                     proposed_tx_id,
                     msgpack.encode(proposed_record),
                 )
@@ -271,6 +290,13 @@ class TxRepository:
             existing_tx_id = self._decode_str(result[0] if isinstance(result, (list, tuple)) and result else None)
             created = bool(result[1]) if isinstance(result, (list, tuple)) and len(result) > 1 else False
             if created:
+                try:
+                    pipe = self.db.pipeline(transaction=False)
+                    pipe.set(self._tx_oid_index_key(proposed_tx_id), order_id)
+                    pipe.sadd(self.TX_ACTIVE, proposed_tx_id)
+                    await pipe.execute()
+                except redis.exceptions.RedisError:
+                    pass  # non-critical; recovery can proceed without these
                 return proposed_record, True
 
             existing = await self.get(existing_tx_id)
@@ -285,14 +311,15 @@ class TxRepository:
                 )
 
     async def get(self, tx_id: str) -> TxRecord | None:
+        order_id = await self._get_order_id_for_tx(tx_id)
+        if order_id is None:
+            return None
         try:
-            entry: bytes = await self.db.get(self._tx_key(tx_id))
+            entry: bytes = await self.db.get(self._tx_key(order_id, tx_id))
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to load transaction {tx_id} from Redis") from exc
-
         if not entry:
             return None
-
         return self._decode_record_bytes(entry, tx_id, source="Redis")
 
     async def get_by_order(self, order_id: str) -> TxRecord | None:
@@ -312,7 +339,7 @@ class TxRepository:
 
     async def save(self, record: TxRecord):
         try:
-            await self.db.set(self._tx_key(record.tx_id), msgpack.encode(record))
+            await self.db.set(self._tx_key(record.order_id, record.tx_id), msgpack.encode(record))
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to save transaction {record.tx_id} in Redis") from exc
 
@@ -346,6 +373,7 @@ class TxRepository:
     async def persist_prepare_outcome(
         self,
         tx_id: str,
+        order_id: str,
         stock_prepared_items: list[tuple[str, int]],
         payment_prepared: bool,
         attempts_increment: int,
@@ -355,7 +383,7 @@ class TxRepository:
         updated_at = time.time()
         try:
             result = await self._transition_script(
-                keys=[self._tx_key(tx_id)],
+                keys=[self._tx_key(order_id, tx_id)],
                 args=[
                     state.value,
                     updated_at,
@@ -381,6 +409,7 @@ class TxRepository:
     async def persist_commit_progress(
         self,
         tx_id: str,
+        order_id: str,
         stock_committed_items: list[tuple[str, int]],
         payment_committed: bool,
         attempts_increment: int,
@@ -389,7 +418,7 @@ class TxRepository:
         updated_at = time.time()
         try:
             result = await self._transition_script(
-                keys=[self._tx_key(tx_id)],
+                keys=[self._tx_key(order_id, tx_id)],
                 args=[
                     TxState.COMMITTING.value,
                     updated_at,
@@ -412,11 +441,11 @@ class TxRepository:
             ) from exc
         return self._decode_transition_result(result, tx_id)
 
-    async def persist_abort_failure(self, tx_id: str, error: str) -> TxRecord:
+    async def persist_abort_failure(self, tx_id: str, order_id: str, error: str) -> TxRecord:
         updated_at = time.time()
         try:
             result = await self._transition_script(
-                keys=[self._tx_key(tx_id)],
+                keys=[self._tx_key(order_id, tx_id)],
                 args=[
                     TxState.ABORTING.value,
                     updated_at,
@@ -442,6 +471,7 @@ class TxRepository:
     async def finalize_commit(
         self,
         tx_id: str,
+        order_id: str,
         stock_committed_items: list[tuple[str, int]],
         payment_committed: bool,
         attempts_increment: int,
@@ -449,7 +479,7 @@ class TxRepository:
         updated_at = time.time()
         try:
             result = await self._finalize_commit_script(
-                keys=[self._tx_key(tx_id), self.TX_ACTIVE],
+                keys=[self._tx_key(order_id, tx_id)],
                 args=[
                     TxState.COMMITTED.value,
                     updated_at,
@@ -460,24 +490,27 @@ class TxRepository:
             )
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to finalize commit for transaction {tx_id} in Redis") from exc
-        return self._decode_transition_result(result, tx_id)
+        tx = self._decode_transition_result(result, tx_id)
+        await self.remove_active(tx_id)
+        return tx
 
-    async def finalize_abort(self, tx_id: str, error: str | None = None) -> TxRecord:
+    async def finalize_abort(self, tx_id: str, order_id: str, error: str | None = None) -> TxRecord:
         updated_at = time.time()
         try:
             result = await self._finalize_abort_script(
-                keys=[self._tx_key(tx_id), self.TX_ACTIVE],
+                keys=[self._tx_key(order_id, tx_id)],
                 args=[
                     TxState.ABORTED.value,
                     updated_at,
                     self._flag(error is not None),
                     error or "",
-                    self.TX_ORDER_PREFIX,
                 ],
             )
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to finalize abort for transaction {tx_id} in Redis") from exc
-        return self._decode_transition_result(result, tx_id)
+        tx = self._decode_transition_result(result, tx_id)
+        await self.remove_active(tx_id)
+        return tx
 
     async def add_active(self, tx_id: str):
         try:
@@ -507,14 +540,20 @@ class TxRepository:
             raise self._db_error(f"Failed to clear the transaction mapping for order {order_id}") from exc
 
     async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 120) -> bool:
+        order_id = await self._get_order_id_for_tx(tx_id)
+        if order_id is None:
+            return False
         try:
-            was_set = await self.db.set(self._tx_lock_key(tx_id), "1", nx=True, ex=ttl_seconds)
+            was_set = await self.db.set(self._tx_lock_key(order_id, tx_id), "1", nx=True, ex=ttl_seconds)
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to acquire the lock for transaction {tx_id}") from exc
         return bool(was_set)
 
     async def release_tx_lock(self, tx_id: str):
+        order_id = await self._get_order_id_for_tx(tx_id)
+        if order_id is None:
+            return
         try:
-            await self.db.delete(self._tx_lock_key(tx_id))
+            await self.db.delete(self._tx_lock_key(order_id, tx_id))
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to release the lock for transaction {tx_id}") from exc

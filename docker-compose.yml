@@ -1,4 +1,10 @@
 version: "3"
+
+# Redis Cluster topology:
+#   main-cluster-1..6  — 3 masters + 3 replicas, shared by order/stock/payment services
+#   saga-cluster-1..6  — 3 masters + 3 replicas, shared by all saga MQ workers
+# cluster-init creates both clusters once on first boot.
+
 services:
 
   gateway:
@@ -22,10 +28,16 @@ services:
       - TX_MODE=${TX_MODE:-2pc}
       - ORDER_GUNICORN_WORKERS=${ORDER_GUNICORN_WORKERS:-2}
       - ENABLE_ORDER_DISPATCHER=${ENABLE_ORDER_DISPATCHER:-true}
-      - SAGA_MQ_REDIS_HOST=saga-broker
+      - REDIS_HOST=main-cluster-1
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+      - REDIS_CLUSTER_NODES=main-cluster-1:6379,main-cluster-2:6379,main-cluster-3:6379,main-cluster-4:6379,main-cluster-5:6379,main-cluster-6:6379
+      - SAGA_MQ_REDIS_HOST=saga-cluster-1
       - SAGA_MQ_REDIS_PORT=6379
       - SAGA_MQ_REDIS_PASSWORD=redis
       - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_CLUSTER_NODES=saga-cluster-1:6379,saga-cluster-2:6379,saga-cluster-3:6379,saga-cluster-4:6379,saga-cluster-5:6379,saga-cluster-6:6379
       - SAGA_MQ_STREAM_PARTITIONS=${SAGA_MQ_STREAM_PARTITIONS:-4}
       - SAGA_MQ_RESPONSE_TIMEOUT_MS=${SAGA_MQ_RESPONSE_TIMEOUT_MS:-6000}
       - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
@@ -36,47 +48,13 @@ services:
       - SAGA_MQ_DISPATCH_BLOCK_MS=${SAGA_MQ_DISPATCH_BLOCK_MS:-1000}
       - SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS=${SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS:-10}
       - SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS=${SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS:-2.0}
-      - REDIS_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
-      - REDIS_MASTER_NAME=order-db
-      - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
-      - SAGA_MQ_MASTER_NAME=saga-broker
-    env_file:
-      - env/order_redis.env
     depends_on:
-      - order-db
-      - saga-broker
-      - sentinel-1
-      - sentinel-2
-      - sentinel-3
+      cluster-init:
+        condition: service_completed_successfully
     restart: always
     command: >
       sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
       -w $${ORDER_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
-
-  order-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
-    restart: always
-
-  order-db-replica:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --replicaof order-db 6379 --masterauth redis
-    depends_on:
-      - order-db
-    restart: always
-
-  saga-broker:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
-    restart: always
-
-  saga-broker-replica:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --replicaof saga-broker 6379 --masterauth redis
-    depends_on:
-      - saga-broker
-    restart: always
-
 
   stock-service:
     build: ./stock
@@ -84,10 +62,16 @@ services:
     environment:
       - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
       - STOCK_GUNICORN_WORKERS=${STOCK_GUNICORN_WORKERS:-1}
-      - SAGA_MQ_REDIS_HOST=saga-broker
+      - REDIS_HOST=main-cluster-1
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+      - REDIS_CLUSTER_NODES=main-cluster-1:6379,main-cluster-2:6379,main-cluster-3:6379,main-cluster-4:6379,main-cluster-5:6379,main-cluster-6:6379
+      - SAGA_MQ_REDIS_HOST=saga-cluster-1
       - SAGA_MQ_REDIS_PORT=6379
       - SAGA_MQ_REDIS_PASSWORD=redis
       - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_CLUSTER_NODES=saga-cluster-1:6379,saga-cluster-2:6379,saga-cluster-3:6379,saga-cluster-4:6379,saga-cluster-5:6379,saga-cluster-6:6379
       - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
       - ENABLE_SAGA_WORKER=${STOCK_ENABLE_SAGA_WORKER:-true}
       - ENABLE_RECOVERY_LOOP=${STOCK_ENABLE_RECOVERY_LOOP:-true}
@@ -99,34 +83,13 @@ services:
       - SAGA_MQ_BATCH_SIZE=${SAGA_MQ_BATCH_SIZE:-16}
       - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
       - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
-      - REDIS_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
-      - REDIS_MASTER_NAME=stock-db
-      - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
-      - SAGA_MQ_MASTER_NAME=saga-broker
-    env_file:
-      - env/stock_redis.env
     depends_on:
-      - stock-db
-      - saga-broker
-      - sentinel-1
-      - sentinel-2
-      - sentinel-3
+      cluster-init:
+        condition: service_completed_successfully
     restart: always
     command: >
       sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
       -w $${STOCK_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
-
-  stock-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
-    restart: always
-
-  stock-db-replica:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --replicaof stock-db 6379 --masterauth redis
-    depends_on:
-      - stock-db
-    restart: always
 
   payment-service:
     build: ./payment
@@ -134,10 +97,16 @@ services:
     environment:
       - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
       - PAYMENT_GUNICORN_WORKERS=${PAYMENT_GUNICORN_WORKERS:-1}
-      - SAGA_MQ_REDIS_HOST=saga-broker
+      - REDIS_HOST=main-cluster-1
+      - REDIS_PORT=6379
+      - REDIS_PASSWORD=redis
+      - REDIS_DB=0
+      - REDIS_CLUSTER_NODES=main-cluster-1:6379,main-cluster-2:6379,main-cluster-3:6379,main-cluster-4:6379,main-cluster-5:6379,main-cluster-6:6379
+      - SAGA_MQ_REDIS_HOST=saga-cluster-1
       - SAGA_MQ_REDIS_PORT=6379
       - SAGA_MQ_REDIS_PASSWORD=redis
       - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_CLUSTER_NODES=saga-cluster-1:6379,saga-cluster-2:6379,saga-cluster-3:6379,saga-cluster-4:6379,saga-cluster-5:6379,saga-cluster-6:6379
       - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
       - ENABLE_SAGA_WORKER=${PAYMENT_ENABLE_SAGA_WORKER:-true}
       - ENABLE_RECOVERY_LOOP=${PAYMENT_ENABLE_RECOVERY_LOOP:-true}
@@ -149,98 +118,159 @@ services:
       - SAGA_MQ_BATCH_SIZE=${SAGA_MQ_BATCH_SIZE:-16}
       - SAGA_MQ_COMMAND_STREAM_MAXLEN=${SAGA_MQ_COMMAND_STREAM_MAXLEN:-100000}
       - SAGA_MQ_RESULT_STREAM_MAXLEN=${SAGA_MQ_RESULT_STREAM_MAXLEN:-100000}
-      - REDIS_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
-      - REDIS_MASTER_NAME=payment-db
-      - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
-      - SAGA_MQ_MASTER_NAME=saga-broker
-    env_file:
-      - env/payment_redis.env
     depends_on:
-      - payment-db
-      - saga-broker
-      - sentinel-1
-      - sentinel-2
-      - sentinel-3
+      cluster-init:
+        condition: service_completed_successfully
     restart: always
     command: >
       sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
       -w $${PAYMENT_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
 
-  payment-db:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
-    restart: always
 
-  payment-db-replica:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes --replicaof payment-db 6379 --masterauth redis
-    depends_on:
-      - payment-db
-    restart: always
+  # --- Main Redis Cluster (order, stock, payment data) ---
 
-
-  # --- Redis Sentinel (3 nodes, monitors all 4 Redis instances) ---
-
-  sentinel-1:
+  main-cluster-1:
     image: redis:7.2-bookworm
     command: >
-      sh -c "cp /etc/redis/sentinel-base.conf /tmp/sentinel.conf && redis-sentinel /tmp/sentinel.conf"
-    volumes:
-      - ./sentinel.conf:/etc/redis/sentinel-base.conf:ro
-    depends_on:
-      - order-db
-      - stock-db
-      - payment-db
-      - saga-broker
-      - order-db-replica
-      - stock-db-replica
-      - payment-db-replica
-      - saga-broker-replica
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname main-cluster-1
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
     restart: always
 
-  sentinel-2:
+  main-cluster-2:
     image: redis:7.2-bookworm
     command: >
-      sh -c "cp /etc/redis/sentinel-base.conf /tmp/sentinel.conf && redis-sentinel /tmp/sentinel.conf"
-    volumes:
-      - ./sentinel.conf:/etc/redis/sentinel-base.conf:ro
-    depends_on:
-      - order-db
-      - stock-db
-      - payment-db
-      - saga-broker
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname main-cluster-2
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
     restart: always
 
-  sentinel-3:
+  main-cluster-3:
     image: redis:7.2-bookworm
     command: >
-      sh -c "cp /etc/redis/sentinel-base.conf /tmp/sentinel.conf && redis-sentinel /tmp/sentinel.conf"
-    volumes:
-      - ./sentinel.conf:/etc/redis/sentinel-base.conf:ro
-    depends_on:
-      - order-db
-      - stock-db
-      - payment-db
-      - saga-broker
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname main-cluster-3
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
     restart: always
 
-
-  watchdog:
-    image: docker:cli
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    restart: always
+  main-cluster-4:
+    image: redis:7.2-bookworm
     command: >
-      sh -c "
-        echo 'Watchdog started - monitoring containers every 3 seconds';
-        while true; do
-          for svc in stock-service payment-service order-service gateway order-db stock-db payment-db saga-broker order-db-replica stock-db-replica payment-db-replica saga-broker-replica sentinel-1 sentinel-2 sentinel-3; do
-            CONTAINER=$$(docker ps -a -q --filter label=com.docker.compose.service=$${svc} --filter status=exited | head -n 1);
-            if [ -n \"$$CONTAINER\" ]; then
-              echo \"Restarting $$svc...\";
-              docker start $$CONTAINER;
-            fi;
-          done;
-          sleep 3;
-        done
-      "
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname main-cluster-4
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
+    restart: always
+
+  main-cluster-5:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname main-cluster-5
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
+    restart: always
+
+  main-cluster-6:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname main-cluster-6
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
+    restart: always
+
+
+  # --- Saga MQ Redis Cluster ---
+
+  saga-cluster-1:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname saga-cluster-1
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
+    restart: always
+
+  saga-cluster-2:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname saga-cluster-2
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
+    restart: always
+
+  saga-cluster-3:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname saga-cluster-3
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
+    restart: always
+
+  saga-cluster-4:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname saga-cluster-4
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
+    restart: always
+
+  saga-cluster-5:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname saga-cluster-5
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
+    restart: always
+
+  saga-cluster-6:
+    image: redis:7.2-bookworm
+    command: >
+      redis-server
+      --cluster-enabled yes --cluster-config-file /data/nodes.conf
+      --cluster-node-timeout 5000 --cluster-announce-hostname saga-cluster-6
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes --requirepass redis --masterauth redis
+    restart: always
+
+
+  # --- Cluster initializer (runs once, creates both clusters) ---
+
+  cluster-init:
+    image: redis:7.2-bookworm
+    volumes:
+      - ./cluster-init.sh:/cluster-init.sh:ro
+    depends_on:
+      - main-cluster-1
+      - main-cluster-2
+      - main-cluster-3
+      - main-cluster-4
+      - main-cluster-5
+      - main-cluster-6
+      - saga-cluster-1
+      - saga-cluster-2
+      - saga-cluster-3
+      - saga-cluster-4
+      - saga-cluster-5
+      - saga-cluster-6
+    restart: "no"
+    command: sh /cluster-init.sh

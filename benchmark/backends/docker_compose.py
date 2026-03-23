@@ -18,17 +18,15 @@ COMPOSE_KILL_TARGETS = {
     "order-db": "order-db",
 }
 COMPOSE_REDIS_SERVICES = (
-    "order-db",
-    "order-db-replica",
-    "stock-db",
-    "stock-db-replica",
-    "payment-db",
-    "payment-db-replica",
-    "saga-broker",
-    "saga-broker-replica",
+    "main-cluster-1",
+    "main-cluster-2",
+    "main-cluster-3",
+    "saga-cluster-1",
+    "saga-cluster-2",
+    "saga-cluster-3",
 )
-COMPOSE_SENTINEL_SERVICES = ("sentinel-1", "sentinel-2", "sentinel-3")
-COMPOSE_SENTINEL_MASTERS = ("order-db", "stock-db", "payment-db", "saga-broker")
+COMPOSE_SENTINEL_SERVICES: tuple[()] = ()
+COMPOSE_SENTINEL_MASTERS: tuple[()] = ()
 COMPOSE_REDIS_PASSWORD = "redis"
 
 

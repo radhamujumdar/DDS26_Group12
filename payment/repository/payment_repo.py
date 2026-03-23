@@ -6,18 +6,53 @@ from redis.exceptions import RedisError
 
 from models import DB_ERROR_STR, PrepareRecord, SagaDebitRecord, SagaDebitState, TxnState, UserValue
 
+# ---------------------------------------------------------------------------
+# Key helpers — all co-located on the same hash slot as the user_id UUID.
+#
+# Redis Cluster routes by hash tag: the first {…} substring in a key.
+# A raw UUID key "abc-123" hashes on the full string "abc-123".
+# A key "{abc-123}:anything" also hashes on "abc-123" (the hash-tag content).
+# Therefore all keys below land on the same cluster slot as the user record.
+# ---------------------------------------------------------------------------
 
-def txn_key(txn_id: str) -> str:
-    return f"txn:{txn_id}"
+
+def _user_key(user_id: str) -> str:
+    """Primary user record key.  Prefixed to avoid collision with other services."""
+    return f"pay:{{{user_id}}}"
 
 
-def prepared_user_key(user_id: str) -> str:
-    return f"txn:user:{user_id}:prepared"
+def _user_txn_key(user_id: str, txn_id: str) -> str:
+    """Transaction prepare record.  Slot = slot(user_id)."""
+    return f"{{{user_id}}}:pay:txn:{txn_id}"
 
 
+def _prepared_user_key(user_id: str) -> str:
+    """Set of in-progress txn IDs for a user.  Slot = slot(user_id)."""
+    return f"{{{user_id}}}:prepared"
 
-# Lua script for atomic prepare_transaction (uses msgpack maps)
-# KEYS[1] = user_id key, KEYS[2] = txn_key, KEYS[3] = prepared_user_key
+
+def _user_debit_key(user_id: str, tx_id: str) -> str:
+    """Saga debit record.  Slot = slot(user_id)."""
+    return f"{{{user_id}}}:debit:{tx_id}"
+
+
+def _txn_uid_index_key(txn_id: str) -> str:
+    """Secondary index: txn_id → user_id (for commit/abort without user_id)."""
+    return f"txn:uid:{txn_id}"
+
+
+def _debit_uid_index_key(tx_id: str) -> str:
+    """Secondary index: tx_id → user_id (for saga_refund without user_id)."""
+    return f"debit:uid:{tx_id}"
+
+
+# ---------------------------------------------------------------------------
+# Lua scripts — all KEYS are on the same hash slot (user_id).
+# ---------------------------------------------------------------------------
+
+# KEYS[1] = pay:{user_id} (prefixed user key)
+# KEYS[2] = {user_id}:pay:txn:{txn_id}
+# KEYS[3] = {user_id}:prepared
 # ARGV[1] = txn_id, ARGV[2] = user_id, ARGV[3] = amount
 PAYMENT_PREPARE_LUA = """
 local user_key = KEYS[1]
@@ -60,8 +95,7 @@ redis.call('SADD', prep_user_key, txn_id)
 return {0, cmsgpack.pack(rec)}
 """
 
-# Lua script for atomic commit_transaction
-# KEYS[1] = txn_key
+# KEYS[1] = {user_id}:txn:{txn_id}
 PAYMENT_COMMIT_LUA = """
 local tx_key = KEYS[1]
 
@@ -70,7 +104,7 @@ if not raw then
     return {-1, 'Unknown transaction'}
 end
 local rec = cmsgpack.unpack(raw)
-local prep_user_key = 'txn:user:' .. rec['user_id'] .. ':prepared'
+local prep_user_key = '{' .. rec['user_id'] .. '}:prepared'
 if rec['state'] == 'aborted' then
     return {-1, 'Transaction was already aborted'}
 end
@@ -89,8 +123,7 @@ redis.call('SREM', prep_user_key, rec['txn_id'])
 return {0, packed}
 """
 
-# Lua script for atomic abort_transaction
-# KEYS[1] = txn_key
+# KEYS[1] = {user_id}:txn:{txn_id}
 PAYMENT_ABORT_LUA = """
 local tx_key = KEYS[1]
 
@@ -100,7 +133,7 @@ if not raw then
 end
 local rec = cmsgpack.unpack(raw)
 local user_key = rec['user_id']
-local prep_user_key = 'txn:user:' .. rec['user_id'] .. ':prepared'
+local prep_user_key = '{' .. rec['user_id'] .. '}:prepared'
 if rec['state'] == 'committed' then
     return {-1, 'Cannot abort committed transaction'}
 end
@@ -144,19 +177,22 @@ class PaymentRepository:
 
     async def create_user(self, user_id: str, credit: int = 0):
         try:
-            await self.db.set(user_id, msgpack.encode(UserValue(credit=credit)))
+            await self.db.set(_user_key(user_id), msgpack.encode(UserValue(credit=credit)))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def batch_init_users(self, kv_pairs: dict[str, bytes]):
         try:
-            await self.db.mset(kv_pairs)
+            async with self.db.pipeline(transaction=False) as pipe:
+                for k, v in kv_pairs.items():
+                    pipe.set(_user_key(k), v)
+                await pipe.execute()
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def get_user(self, user_id: str) -> UserValue | None:
         try:
-            raw = await self.db.get(user_id)
+            raw = await self.db.get(_user_key(user_id))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         if raw is None:
@@ -171,13 +207,26 @@ class PaymentRepository:
 
     async def save_user(self, user_id: str, user: UserValue):
         try:
-            await self.db.set(user_id, msgpack.encode(user))
+            await self.db.set(_user_key(user_id), msgpack.encode(user))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
-    async def get_prepare_record(self, txn_id: str) -> PrepareRecord | None:
+    async def _get_user_id_for_txn(self, txn_id: str) -> str | None:
+        """Look up user_id via secondary index (needed for commit/abort by txn_id)."""
         try:
-            raw = await self.db.get(txn_key(txn_id))
+            raw = await self.db.get(_txn_uid_index_key(txn_id))
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+        if raw is None:
+            return None
+        return raw.decode() if isinstance(raw, bytes) else str(raw)
+
+    async def get_prepare_record(self, txn_id: str) -> PrepareRecord | None:
+        user_id = await self._get_user_id_for_txn(txn_id)
+        if user_id is None:
+            return None
+        try:
+            raw = await self.db.get(_user_txn_key(user_id, txn_id))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         if raw is None:
@@ -186,23 +235,25 @@ class PaymentRepository:
 
     async def save_prepare_record(self, rec: PrepareRecord):
         try:
-            await self.db.set(txn_key(rec.txn_id), msgpack.encode(rec))
+            await self.db.set(_user_txn_key(rec.user_id, rec.txn_id), msgpack.encode(rec))
+            await self.db.set(_txn_uid_index_key(rec.txn_id), rec.user_id)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def list_prepared_tx_ids(self) -> list[str]:
         prepared: list[str] = []
         try:
-            async for raw_key in self.db.scan_iter(match="txn:*"):
+            async for raw_key in self.db.scan_iter(match="*:pay:txn:*"):
                 key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
-                if key.startswith("txn:user:"):
+                if not key.startswith("{"):
                     continue
-
                 raw_record = await self.db.get(key)
                 if raw_record is None:
                     continue
-
-                record = self._decode_prepare(raw_record)
+                try:
+                    record = self._decode_prepare(raw_record)
+                except HTTPException:
+                    continue
                 if record.state == TxnState.PREPARED:
                     prepared.append(record.txn_id)
         except RedisError as exc:
@@ -211,16 +262,21 @@ class PaymentRepository:
 
     async def has_active_prepare(self, user_id: str) -> bool:
         try:
-            return int(await self.db.scard(prepared_user_key(user_id))) > 0
+            return int(await self.db.scard(_prepared_user_key(user_id))) > 0
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def prepare_transaction(self, txn_id: str, user_id: str, amount: int) -> PrepareRecord:
-        tx_key = txn_key(txn_id)
-        prep_key = prepared_user_key(user_id)
+        tx_key = _user_txn_key(user_id, txn_id)
+        prep_key = _prepared_user_key(user_id)
+        # Secondary index set before Lua (best-effort; commit/abort depend on it).
+        try:
+            await self.db.set(_txn_uid_index_key(txn_id), user_id)
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         try:
             result = await self._prepare_script(
-                keys=[user_id, tx_key, prep_key],
+                keys=[_user_key(user_id), tx_key, prep_key],
                 args=[txn_id, user_id, amount],
             )
             status_code = int(result[0])
@@ -238,7 +294,10 @@ class PaymentRepository:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def commit_transaction(self, txn_id: str) -> PrepareRecord:
-        tx_key = txn_key(txn_id)
+        user_id = await self._get_user_id_for_txn(txn_id)
+        if user_id is None:
+            raise HTTPException(status_code=400, detail=f"Transaction {txn_id}: unknown txn_id")
+        tx_key = _user_txn_key(user_id, txn_id)
         try:
             result = await self._commit_script(keys=[tx_key], args=[txn_id])
             status_code = int(result[0])
@@ -255,7 +314,10 @@ class PaymentRepository:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def abort_transaction(self, txn_id: str) -> bool:
-        tx_key = txn_key(txn_id)
+        user_id = await self._get_user_id_for_txn(txn_id)
+        if user_id is None:
+            return True  # nothing was prepared, treat as already aborted
+        tx_key = _user_txn_key(user_id, txn_id)
         try:
             result = await self._abort_script(keys=[tx_key], args=[])
             status_code = int(result[0])
@@ -270,15 +332,15 @@ class PaymentRepository:
             async with self.db.pipeline(transaction=True) as pipe:
                 while True:
                     try:
-                        await pipe.watch(user_id, prepared_user_key(user_id))
-                        if int(await pipe.scard(prepared_user_key(user_id))) > 0:
+                        await pipe.watch(_user_key(user_id), _prepared_user_key(user_id))
+                        if int(await pipe.scard(_prepared_user_key(user_id))) > 0:
                             await pipe.unwatch()
                             raise HTTPException(
                                 status_code=400,
                                 detail=f"User: {user_id} has a prepared transaction in progress",
                             )
 
-                        raw_user = await pipe.get(user_id)
+                        raw_user = await pipe.get(_user_key(user_id))
                         if raw_user is None:
                             await pipe.unwatch()
                             raise HTTPException(status_code=400, detail=f"User: {user_id} not found!")
@@ -293,7 +355,7 @@ class PaymentRepository:
                             )
 
                         pipe.multi()
-                        pipe.set(user_id, msgpack.encode(user_entry))
+                        pipe.set(_user_key(user_id), msgpack.encode(user_entry))
                         await pipe.execute()
                         return user_entry.credit
                     except redis.WatchError:
@@ -304,12 +366,17 @@ class PaymentRepository:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def saga_debit(self, tx_id: str, user_id: str, amount: int) -> tuple[bool, bool, str | None]:
-        debit_key = f"saga:payment:debit:{tx_id}"
+        debit_key = _user_debit_key(user_id, tx_id)
+        # Secondary index for saga_refund (may arrive without user_id).
+        try:
+            await self.db.set(_debit_uid_index_key(tx_id), user_id)
+        except RedisError as exc:
+            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         try:
             async with self.db.pipeline(transaction=True) as pipe:
                 while True:
                     try:
-                        await pipe.watch(user_id, debit_key)
+                        await pipe.watch(_user_key(user_id), debit_key)
 
                         existing_raw = await pipe.get(debit_key)
                         if existing_raw is not None:
@@ -321,7 +388,7 @@ class PaymentRepository:
                                 return True, False, None
                             return False, False, "Debit previously failed (insufficient credit)"
 
-                        user_raw = await pipe.get(user_id)
+                        user_raw = await pipe.get(_user_key(user_id))
                         if user_raw is None:
                             await pipe.unwatch()
                             return False, False, f"User: {user_id} not found!"
@@ -351,7 +418,7 @@ class PaymentRepository:
                             state=SagaDebitState.DEBITED,
                         )
                         pipe.multi()
-                        pipe.set(user_id, msgpack.encode(UserValue(credit=new_credit)))
+                        pipe.set(_user_key(user_id), msgpack.encode(UserValue(credit=new_credit)))
                         pipe.set(debit_key, msgpack.encode(rec))
                         await pipe.execute()
                         return True, False, None
@@ -368,14 +435,24 @@ class PaymentRepository:
         user_id: str | None = None,
         amount: int | None = None,
     ) -> tuple[bool, bool, str | None]:
-        debit_key = f"saga:payment:debit:{tx_id}"
+        # Resolve user_id if not supplied (HTTP refund endpoint omits it).
+        if user_id is None:
+            try:
+                raw_uid = await self.db.get(_debit_uid_index_key(tx_id))
+            except RedisError as exc:
+                raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+            if raw_uid is None:
+                return True, False, None  # no debit was recorded → nothing to refund
+            user_id = raw_uid.decode() if isinstance(raw_uid, bytes) else str(raw_uid)
+
+        debit_key = _user_debit_key(user_id, tx_id)
         try:
             existing_raw = await self.db.get(debit_key)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
         if existing_raw is None:
-            if user_id is None or amount is None:
+            if amount is None:
                 return True, False, None
 
             refunded = SagaDebitRecord(
@@ -411,7 +488,7 @@ class PaymentRepository:
             async with self.db.pipeline(transaction=True) as pipe:
                 while True:
                     try:
-                        await pipe.watch(existing.user_id, debit_key)
+                        await pipe.watch(_user_key(existing.user_id), debit_key)
 
                         rec_raw = await pipe.get(debit_key)
                         if rec_raw is None:
@@ -423,7 +500,7 @@ class PaymentRepository:
                             await pipe.unwatch()
                             return True, False, None
 
-                        user_raw = await pipe.get(rec.user_id)
+                        user_raw = await pipe.get(_user_key(rec.user_id))
                         if user_raw is None:
                             await pipe.unwatch()
                             return False, True, f"User: {rec.user_id} not found during refund"
@@ -438,7 +515,7 @@ class PaymentRepository:
                             state=SagaDebitState.REFUNDED,
                         )
                         pipe.multi()
-                        pipe.set(rec.user_id, msgpack.encode(UserValue(credit=user.credit + rec.amount)))
+                        pipe.set(_user_key(rec.user_id), msgpack.encode(UserValue(credit=user.credit + rec.amount)))
                         pipe.set(debit_key, msgpack.encode(updated_rec))
                         await pipe.execute()
                         return True, False, None

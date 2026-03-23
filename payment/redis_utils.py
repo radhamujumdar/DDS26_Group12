@@ -1,9 +1,7 @@
 """
-Shared Redis client factory with optional Sentinel support.
+Redis client factory supporting Cluster, Sentinel, or direct connections.
 
-When REDIS_SENTINEL_HOSTS is set, creates a Sentinel-aware client that
-automatically discovers the current master and handles failover.
-Otherwise, falls back to a direct Redis connection.
+Priority: REDIS_CLUSTER_NODES > REDIS_SENTINEL_HOSTS > direct host:port.
 """
 
 from redis.asyncio import Redis
@@ -24,6 +22,11 @@ COMMON_REDIS_KWARGS = dict(
     max_connections=2000,
 )
 
+CLUSTER_REDIS_KWARGS = dict(
+    socket_timeout=5.0,
+    socket_connect_timeout=5.0,
+)
+
 
 def create_redis_client(
     host: str,
@@ -32,21 +35,35 @@ def create_redis_client(
     db: int,
     sentinel_hosts: str | None = None,
     master_name: str | None = None,
+    cluster_nodes: str | None = None,
 ) -> Redis:
     """
-    Create a Redis client, optionally backed by Sentinel.
+    Create a Redis client: Cluster > Sentinel > direct.
 
     Args:
-        host: Redis host (used as fallback when Sentinel is not configured).
-        port: Redis port (used as fallback when Sentinel is not configured).
+        cluster_nodes: Comma-separated "host:port" pairs for cluster startup
+                       nodes, e.g. "redis-node-1:6379,redis-node-2:6379".
+                       When set, cluster mode is used and sentinel/direct args
+                       are ignored.
+        host/port: Used for direct connection fallback.
+        sentinel_hosts: Comma-separated sentinel "host:port" pairs.
+        master_name: Sentinel master name (required when sentinel_hosts set).
         password: Redis password.
-        db: Redis database number.
-        sentinel_hosts: Comma-separated list of sentinel host:port pairs,
-                        e.g. "sentinel-1:26379,sentinel-2:26379,sentinel-3:26379".
-                        If empty/None, falls back to direct connection.
-        master_name: The Sentinel master name (e.g. "payment-db").
-                     Required when sentinel_hosts is set.
+        db: Redis DB number (ignored in cluster mode; cluster uses db=0).
     """
+    if cluster_nodes:
+        from redis.asyncio.cluster import ClusterNode, RedisCluster
+
+        nodes = []
+        for entry in cluster_nodes.split(","):
+            h, p = entry.strip().rsplit(":", 1)
+            nodes.append(ClusterNode(h, int(p)))
+        return RedisCluster(
+            startup_nodes=nodes,
+            password=password,
+            **CLUSTER_REDIS_KWARGS,
+        )
+
     if sentinel_hosts and master_name:
         from redis.asyncio.sentinel import Sentinel
 

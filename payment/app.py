@@ -28,6 +28,7 @@ async def lifespan(the_app: FastAPI):
         db=config.redis_db,
         sentinel_hosts=config.redis_sentinel_hosts,
         master_name=config.redis_master_name,
+        cluster_nodes=config.redis_cluster_nodes,
     )
     gateway_client = httpx.AsyncClient(timeout=2.0)
     payment_repo = PaymentRepository(db)
@@ -54,6 +55,7 @@ async def lifespan(the_app: FastAPI):
             db=config.saga_mq_redis_db,
             sentinel_hosts=config.saga_mq_sentinel_hosts,
             master_name=config.saga_mq_master_name,
+            cluster_nodes=config.saga_mq_cluster_nodes,
         )
         from services import PaymentSagaMqWorkerService
 

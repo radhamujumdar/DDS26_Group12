@@ -51,8 +51,10 @@ class StockConfig:
     saga_mq_result_stream_maxlen: int
     redis_sentinel_hosts: str | None
     redis_master_name: str | None
+    redis_cluster_nodes: str | None
     saga_mq_sentinel_hosts: str | None
     saga_mq_master_name: str | None
+    saga_mq_cluster_nodes: str | None
 
     @classmethod
     def from_env(cls) -> "StockConfig":
@@ -94,6 +96,8 @@ class StockConfig:
             ),
             redis_sentinel_hosts=os.environ.get("REDIS_SENTINEL_HOSTS"),
             redis_master_name=os.environ.get("REDIS_MASTER_NAME"),
+            redis_cluster_nodes=os.environ.get("REDIS_CLUSTER_NODES"),
             saga_mq_sentinel_hosts=os.environ.get("SAGA_MQ_SENTINEL_HOSTS"),
             saga_mq_master_name=os.environ.get("SAGA_MQ_MASTER_NAME"),
+            saga_mq_cluster_nodes=os.environ.get("SAGA_MQ_CLUSTER_NODES"),
         )

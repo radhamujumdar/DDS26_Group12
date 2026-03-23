@@ -8,26 +8,28 @@ from redis.asyncio import Redis
 
 from models import SagaState, SagaTxRecord
 
+# Keys on same slot (anchored on order_id):
+#   {order_id}:saga:{tx_id}  – saga tx record
+#   {order_id}:sgord         – order_id → tx_id mapping
+#   {order_id}:sglk:{tx_id} – distributed lock
+# Secondary index (random slot):
+#   saga:oid:{tx_id}         – tx_id → order_id
+
 CREATE_SAGA_TX_BY_ORDER_SCRIPT = """
-local order_key = KEYS[1]
+local order_sgord_key = KEYS[1]
 local tx_key = KEYS[2]
-local active_key = KEYS[3]
-local existing = redis.call('GET', order_key)
+local existing = redis.call('GET', order_sgord_key)
 if existing then
     return {existing, 0}
 end
-redis.call('SET', order_key, ARGV[1])
+redis.call('SET', order_sgord_key, ARGV[1])
 redis.call('SET', tx_key, ARGV[2])
-redis.call('SADD', active_key, ARGV[1])
 return {ARGV[1], 1}
 """
 
 
 class SagaTxRepository:
-    TX_PREFIX = "saga:tx:"
     TX_ACTIVE = "saga:tx:active"
-    TX_ORDER_PREFIX = "saga:tx:order:"
-    TX_LOCK_PREFIX = "saga:tx:lock:"
 
     def __init__(self, db: Redis):
         self.db = db
@@ -36,14 +38,21 @@ class SagaTxRepository:
     def _db_error(detail: str) -> HTTPException:
         return HTTPException(status_code=400, detail=detail)
 
-    def _tx_key(self, tx_id: str) -> str:
-        return f"{self.TX_PREFIX}{tx_id}"
+    @staticmethod
+    def _tx_key(order_id: str, tx_id: str) -> str:
+        return f"{{{order_id}}}:saga:{tx_id}"
 
-    def _tx_order_key(self, order_id: str) -> str:
-        return f"{self.TX_ORDER_PREFIX}{order_id}"
+    @staticmethod
+    def _tx_order_key(order_id: str) -> str:
+        return f"{{{order_id}}}:sgord"
 
-    def _tx_lock_key(self, tx_id: str) -> str:
-        return f"{self.TX_LOCK_PREFIX}{tx_id}"
+    @staticmethod
+    def _tx_lock_key(order_id: str, tx_id: str) -> str:
+        return f"{{{order_id}}}:sglk:{tx_id}"
+
+    @staticmethod
+    def _saga_oid_index_key(tx_id: str) -> str:
+        return f"saga:oid:{tx_id}"
 
     @staticmethod
     def _decode_str(value) -> str:
@@ -80,6 +89,15 @@ class SagaTxRepository:
             updated_at=now,
         )
 
+    async def _get_order_id_for_tx(self, tx_id: str) -> str | None:
+        try:
+            raw = await self.db.get(self._saga_oid_index_key(tx_id))
+        except redis.exceptions.RedisError as exc:
+            raise self._db_error(f"Failed to look up order_id for saga transaction {tx_id}") from exc
+        if raw is None:
+            return None
+        return raw.decode() if isinstance(raw, bytes) else str(raw)
+
     async def create(
         self,
         order_id: str,
@@ -97,11 +115,12 @@ class SagaTxRepository:
             state=state,
         )
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
-                pipe.set(self._tx_key(record.tx_id), msgpack.encode(record))
-                pipe.sadd(self.TX_ACTIVE, record.tx_id)
-                pipe.set(self._tx_order_key(order_id), record.tx_id)
-                await pipe.execute()
+            pipe = self.db.pipeline(transaction=False)
+            pipe.set(self._tx_key(order_id, record.tx_id), msgpack.encode(record))
+            pipe.set(self._tx_order_key(order_id), record.tx_id)
+            pipe.set(self._saga_oid_index_key(record.tx_id), order_id)
+            await pipe.execute()
+            await self.db.sadd(self.TX_ACTIVE, record.tx_id)
         except redis.exceptions.RedisError as exc:
             raise self._db_error(
                 f"Failed to create saga transaction {record.tx_id} for order {order_id} in Redis"
@@ -132,10 +151,9 @@ class SagaTxRepository:
             try:
                 result = await self.db.eval(
                     CREATE_SAGA_TX_BY_ORDER_SCRIPT,
-                    3,
+                    2,
                     self._tx_order_key(order_id),
-                    self._tx_key(proposed_tx_id),
-                    self.TX_ACTIVE,
+                    self._tx_key(order_id, proposed_tx_id),
                     proposed_tx_id,
                     msgpack.encode(proposed_record),
                 )
@@ -147,6 +165,13 @@ class SagaTxRepository:
             existing_tx_id = self._decode_str(result[0] if isinstance(result, (list, tuple)) and result else None)
             created = bool(result[1]) if isinstance(result, (list, tuple)) and len(result) > 1 else False
             if created:
+                try:
+                    pipe = self.db.pipeline(transaction=False)
+                    pipe.set(self._saga_oid_index_key(proposed_tx_id), order_id)
+                    pipe.sadd(self.TX_ACTIVE, proposed_tx_id)
+                    await pipe.execute()
+                except redis.exceptions.RedisError:
+                    pass  # non-critical; recovery can proceed without these
                 return proposed_record, True
 
             existing = await self.get(existing_tx_id)
@@ -161,14 +186,15 @@ class SagaTxRepository:
                 )
 
     async def get(self, tx_id: str) -> SagaTxRecord | None:
+        order_id = await self._get_order_id_for_tx(tx_id)
+        if order_id is None:
+            return None
         try:
-            entry: bytes = await self.db.get(self._tx_key(tx_id))
+            entry: bytes = await self.db.get(self._tx_key(order_id, tx_id))
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to load saga transaction {tx_id} from Redis") from exc
-
         if not entry:
             return None
-
         return self._decode_record_bytes(entry, tx_id)
 
     async def get_by_order(self, order_id: str) -> SagaTxRecord | None:
@@ -190,7 +216,7 @@ class SagaTxRepository:
 
     async def save(self, record: SagaTxRecord):
         try:
-            await self.db.set(self._tx_key(record.tx_id), msgpack.encode(record))
+            await self.db.set(self._tx_key(record.order_id, record.tx_id), msgpack.encode(record))
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to save saga transaction {record.tx_id} in Redis") from exc
 
@@ -250,15 +276,21 @@ class SagaTxRepository:
             ) from exc
 
     async def acquire_tx_lock(self, tx_id: str, ttl_seconds: int = 30) -> str | None:
+        order_id = await self._get_order_id_for_tx(tx_id)
+        if order_id is None:
+            return None
         token = str(uuid.uuid4())
         try:
-            was_set = await self.db.set(self._tx_lock_key(tx_id), token, nx=True, ex=ttl_seconds)
+            was_set = await self.db.set(self._tx_lock_key(order_id, tx_id), token, nx=True, ex=ttl_seconds)
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to acquire the lock for saga transaction {tx_id}") from exc
         return token if was_set else None
 
     async def renew_tx_lock(self, tx_id: str, token: str, ttl_seconds: int = 30) -> bool:
-        lock_key = self._tx_lock_key(tx_id)
+        order_id = await self._get_order_id_for_tx(tx_id)
+        if order_id is None:
+            return False
+        lock_key = self._tx_lock_key(order_id, tx_id)
         try:
             async with self.db.pipeline(transaction=True) as pipe:
                 while True:
@@ -278,7 +310,10 @@ class SagaTxRepository:
             raise self._db_error(f"Failed to renew the lock for saga transaction {tx_id}") from exc
 
     async def release_tx_lock(self, tx_id: str, token: str) -> bool:
-        lock_key = self._tx_lock_key(tx_id)
+        order_id = await self._get_order_id_for_tx(tx_id)
+        if order_id is None:
+            return False
+        lock_key = self._tx_lock_key(order_id, tx_id)
         try:
             async with self.db.pipeline(transaction=True) as pipe:
                 while True:

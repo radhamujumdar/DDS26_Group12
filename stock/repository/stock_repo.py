@@ -7,12 +7,16 @@ from redis.exceptions import RedisError, WatchError
 from models import DB_ERROR_STR, Reservation, ReservationState, StockValue
 
 
+def item_key(item_id: str) -> str:
+    return f"stk:{{{item_id}}}"
+
+
 def reservation_key(tx_id: str, item_id: str) -> str:
-    return f"txn:{tx_id}:{item_id}"
+    return f"{{{item_id}}}:txn:{tx_id}"
 
 
 def saga_reservation_key(tx_id: str, item_id: str) -> str:
-    return f"saga:stock:tx:{tx_id}:item:{item_id}"
+    return f"{{{item_id}}}:saga:{tx_id}"
 
 
 
@@ -252,19 +256,22 @@ class StockRepository:
     async def create_item(self, item_id: str, price: int):
         value = msgpack.encode(StockValue(stock=0, price=int(price)))
         try:
-            await self.db.set(item_id, value)
+            await self.db.set(item_key(item_id), value)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def batch_init_items(self, kv_pairs: dict[str, bytes]):
         try:
-            await self.db.mset(kv_pairs)
+            pipe = self.db.pipeline(transaction=False)
+            for k, v in kv_pairs.items():
+                pipe.set(item_key(k), v)
+            await pipe.execute()
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def get_item(self, item_id: str) -> StockValue | None:
         try:
-            raw = await self.db.get(item_id)
+            raw = await self.db.get(item_key(item_id))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         if raw is None:
@@ -279,7 +286,7 @@ class StockRepository:
 
     async def save_item(self, item_id: str, item: StockValue):
         try:
-            await self.db.set(item_id, msgpack.encode(item))
+            await self.db.set(item_key(item_id), msgpack.encode(item))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
@@ -317,10 +324,10 @@ class StockRepository:
     async def list_prepared_reservations(self) -> list[Reservation]:
         prepared: list[Reservation] = []
         try:
-            async for raw_key in self.db.scan_iter(match="txn:*:*"):
+            async for raw_key in self.db.scan_iter(match="{*}:txn:*"):
                 key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
-                if key.count(":") != 2:
-                    continue
+                if key.startswith("{") and ":pay:txn:" in key:
+                    continue  # skip payment txn keys
                 raw_record = await self.db.get(key)
                 if raw_record is None:
                     continue
@@ -335,7 +342,7 @@ class StockRepository:
         rkey = reservation_key(tx_id, item_id)
         try:
             result = await self._prepare_script(
-                keys=[item_id, rkey],
+                keys=[item_key(item_id), rkey],
                 args=[amount, tx_id, item_id],
             )
             status_code = int(result[0])
@@ -367,7 +374,7 @@ class StockRepository:
     async def abort_reservation(self, tx_id: str, item_id: str, amount: int) -> str:
         rkey = reservation_key(tx_id, item_id)
         try:
-            result = await self._abort_script(keys=[item_id, rkey], args=[])
+            result = await self._abort_script(keys=[item_key(item_id), rkey], args=[])
             status_code = int(result[0])
             detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
             if status_code == 0:
@@ -382,7 +389,7 @@ class StockRepository:
         skey = saga_reservation_key(tx_id, item_id)
         try:
             result = await self._saga_reserve_script(
-                keys=[item_id, skey],
+                keys=[item_key(item_id), skey],
                 args=[tx_id, item_id, amount, ttl_seconds],
             )
             status_code = int(result[0])
@@ -399,7 +406,7 @@ class StockRepository:
         skey = saga_reservation_key(tx_id, item_id)
         try:
             result = await self._saga_release_script(
-                keys=[item_id, skey],
+                keys=[item_key(item_id), skey],
                 args=[tx_id, item_id, amount, ttl_seconds],
             )
             status_code = int(result[0])
