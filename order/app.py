@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -38,6 +39,15 @@ async def lifespan(app: FastAPI):
         master_name=config.redis_master_name,
         cluster_nodes=config.redis_cluster_nodes,
     )
+    for attempt in range(30):
+        try:
+            await db.ping()
+            break
+        except Exception:
+            if attempt == 29:
+                raise
+            await asyncio.sleep(2.0)
+
     saga_broker_db: Redis | None = None
     saga_bus: SagaCommandBus | None = None
     if config.tx_mode == TxMode.SAGA.value:

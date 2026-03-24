@@ -66,6 +66,8 @@ class SagaCommandBus:
         self._dispatcher_task: asyncio.Task | None = None
         self._owned_partitions: set[int] = set()
         self._stream_cursors: dict[str, str] = {}
+        self._result_events: dict[str, asyncio.Event] = {}
+        self._result_values: dict[str, dict[str, str]] = {}
 
     async def start(self):
         if self._dispatcher_task is not None and not self._dispatcher_task.done():
@@ -225,7 +227,13 @@ class SagaCommandBus:
             command_stream=command_stream,
         )
 
-        result = await self._await_result(correlation_id, self.response_timeout_ms)
+        event = asyncio.Event()
+        self._result_events[correlation_id] = event
+        try:
+            result = await self._await_result(correlation_id, self.response_timeout_ms)
+        finally:
+            self._result_events.pop(correlation_id, None)
+            self._result_values.pop(correlation_id, None)
         return ParticipantResult(
             ok=result.ok,
             retryable=result.retryable,
@@ -272,10 +280,30 @@ class SagaCommandBus:
         )
 
     async def _await_result(self, correlation_id: str, timeout_ms: int) -> PendingCommandResult:
+        event = self._result_events.get(correlation_id)
         pending_key = self._pending_key(correlation_id)
-        deadline = asyncio.get_running_loop().time() + (int(timeout_ms) / 1000.0)
+        deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000.0)
 
         while asyncio.get_running_loop().time() < deadline:
+            # Wait for in-process event (instant if same worker dispatches)
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            if event is not None:
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=min(remaining, 0.05))
+                except asyncio.TimeoutError:
+                    pass
+
+            # Check in-process result (set by dispatcher on this worker)
+            fields = self._result_values.get(correlation_id)
+            if fields is not None:
+                ok = fields.get("ok", "0").lower() in ("1", "true", "yes")
+                retryable = fields.get("retryable", "0").lower() in ("1", "true", "yes")
+                detail = fields.get("detail") or None
+                return PendingCommandResult(status="completed", ok=ok, retryable=retryable, detail=detail)
+
+            # Check Redis fallback (covers results dispatched by other workers)
             raw = await self.db.hgetall(pending_key)
             decoded = self._decode_dict(raw)
             status = decoded.get("status", "")
@@ -284,8 +312,8 @@ class SagaCommandBus:
                 retryable = decoded.get("retryable", "0").lower() in ("1", "true", "yes")
                 detail = decoded.get("detail") or None
                 return PendingCommandResult(status=status, ok=ok, retryable=retryable, detail=detail)
-            await asyncio.sleep(self.poll_interval_seconds)
 
+        # Timed out
         await self.db.hset(
             pending_key,
             mapping={
@@ -320,15 +348,22 @@ class SagaCommandBus:
                     await asyncio.sleep(self.dispatch_renew_interval_seconds)
                     continue
 
-                streams = await self._load_result_cursors(owned_partitions)
-                block_ms = min(
-                    self.dispatcher_block_ms,
-                    max(100, int(self.dispatch_renew_interval_seconds * 1000)),
-                )
-                entries = await self.db.xread(streams=streams, count=128, block=block_ms)
-            except redis.exceptions.RedisError as exc:
-                await self._incr_metric("dispatcher_read_failed_total")
-                self._log("saga_mq_dispatcher_read_failed", level="warning", detail=str(exc))
+                # Read per-participant to avoid cross-slot errors in Redis Cluster.
+                # Non-blocking reads so we cycle as fast as messages arrive.
+                entries = []
+                for participant in self.participants:
+                    p_streams = await self._load_result_cursors_for(participant, owned_partitions)
+                    p_entries = await self.db.xread(streams=p_streams, count=512)
+                    if p_entries:
+                        entries.extend(p_entries)
+                if not entries:
+                    await asyncio.sleep(0.05)
+            except (redis.exceptions.RedisError, Exception) as exc:
+                if "RedisCluster" in type(exc).__name__ or "crossslot" in str(exc).lower():
+                    pass  # cluster slot error, continue
+                else:
+                    await self._incr_metric("dispatcher_read_failed_total")
+                    self._log("saga_mq_dispatcher_read_failed", level="warning", detail=str(exc))
                 await asyncio.sleep(0.2)
                 continue
 
@@ -355,14 +390,12 @@ class SagaCommandBus:
                             stream=stream_name,
                             message_id=message_id,
                         )
-                        streams[stream_name] = message_id
                         self._stream_cursors[stream_name] = message_id
                         await self.db.set(self._cursor_key(participant, partition), message_id)
                         continue
 
                     await self._apply_result(correlation_id, fields)
 
-                    streams[stream_name] = message_id
                     self._stream_cursors[stream_name] = message_id
                     await self.db.set(self._cursor_key(participant, partition), message_id)
 
@@ -405,6 +438,12 @@ class SagaCommandBus:
             await self._incr_metric("result_ok_total")
         else:
             await self._incr_metric("result_fail_total")
+
+        # Wake up the waiting coroutine in-process (if on this worker)
+        event = self._result_events.get(correlation_id)
+        if event is not None:
+            self._result_values[correlation_id] = fields
+            event.set()
         self._log(
             "saga_mq_result_applied",
             tx_id=fields.get("tx_id"),
@@ -424,16 +463,21 @@ class SagaCommandBus:
     async def _load_result_cursors(self, partitions: set[int]) -> dict[str, str]:
         streams: dict[str, str] = {}
         for participant in self.participants:
-            for partition in sorted(partitions):
-                stream = self._result_stream(participant, partition)
-                cached = self._stream_cursors.get(stream)
-                if cached is not None:
-                    streams[stream] = cached
-                    continue
-                cursor = await self.db.get(self._cursor_key(participant, partition))
-                value = self._decode(cursor) if cursor is not None else "0-0"
-                streams[stream] = value
-                self._stream_cursors[stream] = value
+            streams.update(await self._load_result_cursors_for(participant, partitions))
+        return streams
+
+    async def _load_result_cursors_for(self, participant: str, partitions: set[int]) -> dict[str, str]:
+        streams: dict[str, str] = {}
+        for partition in sorted(partitions):
+            stream = self._result_stream(participant, partition)
+            cached = self._stream_cursors.get(stream)
+            if cached is not None:
+                streams[stream] = cached
+                continue
+            cursor = await self.db.get(self._cursor_key(participant, partition))
+            value = self._decode(cursor) if cursor is not None else "0-0"
+            streams[stream] = value
+            self._stream_cursors[stream] = value
         return streams
 
     async def _refresh_partition_leases(self) -> set[int]:
@@ -462,10 +506,10 @@ class SagaCommandBus:
         return int(digest, 16) % self.stream_partitions
 
     def _command_stream(self, participant: str, partition: int) -> str:
-        return f"{self.COMMAND_STREAM_PREFIX}{participant}:p{partition}"
+        return f"{{{self.COMMAND_STREAM_PREFIX}{participant}}}:p{partition}"
 
     def _result_stream(self, participant: str, partition: int) -> str:
-        return f"{self.RESULT_STREAM_PREFIX}{participant}:p{partition}"
+        return f"{{{self.RESULT_STREAM_PREFIX}{participant}}}:p{partition}"
 
     def _pending_key(self, correlation_id: str) -> str:
         return f"{self.PENDING_PREFIX}{correlation_id}"
@@ -491,8 +535,10 @@ class SagaCommandBus:
         return {self._decode(key): self._decode(value) for key, value in raw.items()}
 
     def _parse_result_stream(self, stream_name: str) -> tuple[str | None, int]:
-        # Expected shape: saga:res:<participant>:p<partition>
-        parts = stream_name.split(":")
+        # Expected shape: {saga:res:<participant>}:p<partition>
+        # Strip hash tags before parsing
+        clean = stream_name.replace("{", "").replace("}", "")
+        parts = clean.split(":")
         if len(parts) != 4 or parts[0] != "saga" or parts[1] != "res":
             self._log("saga_mq_unknown_result_stream", level="warning", stream=stream_name)
             return None, -1

@@ -123,6 +123,19 @@ def run_init_orders(stress_test_dir: Path) -> tuple[bool, str]:
     return result.returncode == 0, output
 
 
+def run_consistency_test(consistency_test_dir: Path, benchmark_dir: Path) -> tuple[bool, str]:
+    result = subprocess.run(
+        [sys.executable, "run_consistency_test.py"],
+        cwd=consistency_test_dir,
+        capture_output=True,
+        text=True,
+        timeout=600,
+        check=False,
+    )
+    output = (result.stdout or "") + (("\n" if result.stderr and result.stdout else "") + (result.stderr or ""))
+    return result.returncode == 0, output
+
+
 def collect_locust_csvs(csv_prefix: str, output_dir: Path) -> None:
     prefix_path = Path(csv_prefix)
     prefix_dir = prefix_path.parent if prefix_path.parent != Path("") else Path(".")
@@ -253,6 +266,7 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
             log("Waiting for databases and services to recover")
         else:
             log("Waiting for databases and services to remain ready")
+            time.sleep(15)
         if not backend.wait_ready(scenario):
             diagnostics_needed = True
             (output_dir / "consistency.txt").write_text(
@@ -260,6 +274,27 @@ def run_single_benchmark(config: BenchmarkConfig, run_spec: RunSpec) -> bool:
                 encoding="utf-8",
             )
             return False
+
+        # Restart stack for a clean consistency test (saga MQ streams may have backlog)
+        log("Restarting stack for consistency test")
+        backend.down()
+        backend.up(run_spec.mode, scenario)
+        if not backend.wait_ready(scenario):
+            diagnostics_needed = True
+            (output_dir / "consistency.txt").write_text(
+                "SKIPPED: Services did not recover for consistency test\n",
+                encoding="utf-8",
+            )
+            return locust_exit_code == 0
+        configure_benchmark_urls(config.paths.benchmark_dir, backend.resolve_gateway_url())
+
+        log("Running consistency test")
+        consistency_ok, consistency_output = run_consistency_test(
+            config.paths.consistency_test_dir, config.paths.benchmark_dir,
+        )
+        (output_dir / "consistency.txt").write_text(consistency_output, encoding="utf-8")
+        if not consistency_ok:
+            log("Consistency test failed; see consistency.txt")
 
         diagnostics_needed = diagnostics_needed or locust_exit_code != 0
         return locust_exit_code == 0

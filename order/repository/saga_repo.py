@@ -286,26 +286,32 @@ class SagaTxRepository:
             raise self._db_error(f"Failed to acquire the lock for saga transaction {tx_id}") from exc
         return token if was_set else None
 
+    _RENEW_LOCK_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[1] then
+    redis.call('EXPIRE', KEYS[1], ARGV[2])
+    return 1
+end
+return 0
+"""
+
+    _RELEASE_LOCK_SCRIPT = """
+local current = redis.call('GET', KEYS[1])
+if current == ARGV[1] then
+    redis.call('DEL', KEYS[1])
+    return 1
+end
+return 0
+"""
+
     async def renew_tx_lock(self, tx_id: str, token: str, ttl_seconds: int = 30) -> bool:
         order_id = await self._get_order_id_for_tx(tx_id)
         if order_id is None:
             return False
         lock_key = self._tx_lock_key(order_id, tx_id)
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
-                while True:
-                    try:
-                        await pipe.watch(lock_key)
-                        current = await pipe.get(lock_key)
-                        if self._decode_str(current) != token:
-                            await pipe.unwatch()
-                            return False
-                        pipe.multi()
-                        pipe.expire(lock_key, ttl_seconds)
-                        await pipe.execute()
-                        return True
-                    except redis.WatchError:
-                        continue
+            result = await self.db.eval(self._RENEW_LOCK_SCRIPT, 1, lock_key, token, str(ttl_seconds))
+            return bool(result)
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to renew the lock for saga transaction {tx_id}") from exc
 
@@ -315,22 +321,7 @@ class SagaTxRepository:
             return False
         lock_key = self._tx_lock_key(order_id, tx_id)
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
-                while True:
-                    try:
-                        await pipe.watch(lock_key)
-                        current = await pipe.get(lock_key)
-                        if current is None:
-                            await pipe.unwatch()
-                            return False
-                        if self._decode_str(current) != token:
-                            await pipe.unwatch()
-                            return False
-                        pipe.multi()
-                        pipe.delete(lock_key)
-                        await pipe.execute()
-                        return True
-                    except redis.WatchError:
-                        continue
+            result = await self.db.eval(self._RELEASE_LOCK_SCRIPT, 1, lock_key, token)
+            return bool(result)
         except redis.exceptions.RedisError as exc:
             raise self._db_error(f"Failed to release the lock for saga transaction {tx_id}") from exc

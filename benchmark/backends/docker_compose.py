@@ -61,6 +61,8 @@ class DockerComposeBackend:
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "").strip()
             raise RuntimeError(f"docker compose up failed: {message}")
+        # Restart gateway so nginx re-resolves service IPs after container rebuild.
+        self._run_compose(self.compose_file, ["restart", "gateway"], capture_output=True)
 
     def wait_ready(self, scenario: ScenarioSpec) -> bool:
         del scenario

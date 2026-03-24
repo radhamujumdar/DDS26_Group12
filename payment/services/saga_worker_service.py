@@ -14,8 +14,8 @@ from services.payment_service import PaymentService
 class PaymentSagaMqWorkerService:
     PARTICIPANT = "payment"
     SCHEMA_VERSION = "v1"
-    COMMAND_STREAM_PREFIX = "saga:cmd:payment:p"
-    RESULT_STREAM_PREFIX = "saga:res:payment:p"
+    COMMAND_STREAM_PREFIX = "{saga:cmd:payment}:p"
+    RESULT_STREAM_PREFIX = "{saga:res:payment}:p"
 
     def __init__(
         self,

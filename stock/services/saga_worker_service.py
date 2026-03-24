@@ -14,8 +14,8 @@ from services.stock_service import StockService
 class StockSagaMqWorkerService:
     PARTICIPANT = "stock"
     SCHEMA_VERSION = "v1"
-    COMMAND_STREAM_PREFIX = "saga:cmd:stock:p"
-    RESULT_STREAM_PREFIX = "saga:res:stock:p"
+    COMMAND_STREAM_PREFIX = "{saga:cmd:stock}:p"
+    RESULT_STREAM_PREFIX = "{saga:res:stock}:p"
 
     def __init__(
         self,
