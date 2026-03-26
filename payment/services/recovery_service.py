@@ -105,12 +105,13 @@ class PaymentRecoveryService:
 
     async def _acquire_or_renew_leadership(self) -> bool:
         try:
-            current_owner = await self.repo.db.get(self.lease_key)
+            primary = self.repo.db.primary()
+            current_owner = await primary.get(self.lease_key)
             if self._decode(current_owner) == self.owner_id:
-                await self.repo.db.expire(self.lease_key, self.lease_ttl_seconds)
+                await primary.expire(self.lease_key, self.lease_ttl_seconds)
                 return True
             if current_owner is None:
-                acquired = await self.repo.db.set(
+                acquired = await primary.set(
                     self.lease_key,
                     self.owner_id,
                     nx=True,

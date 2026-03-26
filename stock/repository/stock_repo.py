@@ -5,6 +5,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError, WatchError
 
 from models import DB_ERROR_STR, Reservation, ReservationState, StockValue
+from sharded_redis import ShardedRedis
 
 
 def reservation_key(tx_id: str, item_id: str) -> str:
@@ -13,7 +14,6 @@ def reservation_key(tx_id: str, item_id: str) -> str:
 
 def saga_reservation_key(tx_id: str, item_id: str) -> str:
     return f"saga:stock:tx:{tx_id}:item:{item_id}"
-
 
 
 # Lua script for atomic prepare: eliminates WATCH/retry loops
@@ -241,30 +241,35 @@ return {0, 'released'}
 
 
 class StockRepository:
-    def __init__(self, db: Redis):
+    def __init__(self, db: ShardedRedis):
         self.db = db
-        self._prepare_script = db.register_script(PREPARE_LUA)
-        self._commit_script = db.register_script(COMMIT_LUA)
-        self._abort_script = db.register_script(ABORT_LUA)
-        self._saga_reserve_script = db.register_script(SAGA_RESERVE_LUA)
-        self._saga_release_script = db.register_script(SAGA_RELEASE_LUA)
+        self._prepare_scripts = db.register_script_on_all(PREPARE_LUA)
+        self._commit_scripts = db.register_script_on_all(COMMIT_LUA)
+        self._abort_scripts = db.register_script_on_all(ABORT_LUA)
+        self._saga_reserve_scripts = db.register_script_on_all(SAGA_RESERVE_LUA)
+        self._saga_release_scripts = db.register_script_on_all(SAGA_RELEASE_LUA)
+
+    def _shard_and_script(self, item_id: str, scripts: list):
+        """Return (script, shard) for the given item_id."""
+        idx = self.db.shard_index_for(item_id)
+        return scripts[idx]
 
     async def create_item(self, item_id: str, price: int):
         value = msgpack.encode(StockValue(stock=0, price=int(price)))
         try:
-            await self.db.set(item_id, value)
+            await self.db.shard_for(item_id).set(item_id, value)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def batch_init_items(self, kv_pairs: dict[str, bytes]):
         try:
-            await self.db.mset(kv_pairs)
+            await self.db.mset_sharded(kv_pairs)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def get_item(self, item_id: str) -> StockValue | None:
         try:
-            raw = await self.db.get(item_id)
+            raw = await self.db.shard_for(item_id).get(item_id)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         if raw is None:
@@ -279,7 +284,7 @@ class StockRepository:
 
     async def save_item(self, item_id: str, item: StockValue):
         try:
-            await self.db.set(item_id, msgpack.encode(item))
+            await self.db.shard_for(item_id).set(item_id, msgpack.encode(item))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
@@ -300,7 +305,7 @@ class StockRepository:
     async def get_reservation(self, tx_id: str, item_id: str) -> Reservation | None:
         rkey = reservation_key(tx_id, item_id)
         try:
-            raw = await self.db.get(rkey)
+            raw = await self.db.shard_for(item_id).get(rkey)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         if raw is None:
@@ -310,18 +315,18 @@ class StockRepository:
     async def save_reservation(self, reservation: Reservation):
         rkey = reservation_key(reservation.tx_id, reservation.item_id)
         try:
-            await self.db.set(rkey, msgpack.encode(reservation))
+            await self.db.shard_for(reservation.item_id).set(rkey, msgpack.encode(reservation))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def list_prepared_reservations(self) -> list[Reservation]:
         prepared: list[Reservation] = []
         try:
-            async for raw_key in self.db.scan_iter(match="txn:*:*"):
+            async for raw_key, shard in self.db.scan_all(match="txn:*:*"):
                 key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
                 if key.count(":") != 2:
                     continue
-                raw_record = await self.db.get(key)
+                raw_record = await shard.get(key)
                 if raw_record is None:
                     continue
                 reservation = self._decode_reservation(raw_record)
@@ -333,8 +338,9 @@ class StockRepository:
 
     async def prepare_reservation(self, tx_id: str, item_id: str, amount: int) -> str:
         rkey = reservation_key(tx_id, item_id)
+        script = self._shard_and_script(item_id, self._prepare_scripts)
         try:
-            result = await self._prepare_script(
+            result = await script(
                 keys=[item_id, rkey],
                 args=[amount, tx_id, item_id],
             )
@@ -352,8 +358,9 @@ class StockRepository:
 
     async def commit_reservation(self, tx_id: str, item_id: str, amount: int) -> str:
         rkey = reservation_key(tx_id, item_id)
+        script = self._shard_and_script(item_id, self._commit_scripts)
         try:
-            result = await self._commit_script(keys=[rkey], args=[amount])
+            result = await script(keys=[rkey], args=[amount])
             status_code = int(result[0])
             detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
             if status_code == 0:
@@ -366,8 +373,9 @@ class StockRepository:
 
     async def abort_reservation(self, tx_id: str, item_id: str, amount: int) -> str:
         rkey = reservation_key(tx_id, item_id)
+        script = self._shard_and_script(item_id, self._abort_scripts)
         try:
-            result = await self._abort_script(keys=[item_id, rkey], args=[])
+            result = await script(keys=[item_id, rkey], args=[])
             status_code = int(result[0])
             detail = result[1].decode() if isinstance(result[1], bytes) else str(result[1])
             if status_code == 0:
@@ -380,8 +388,9 @@ class StockRepository:
 
     async def saga_reserve_item(self, tx_id: str, item_id: str, amount: int, ttl_seconds: int) -> str:
         skey = saga_reservation_key(tx_id, item_id)
+        script = self._shard_and_script(item_id, self._saga_reserve_scripts)
         try:
-            result = await self._saga_reserve_script(
+            result = await script(
                 keys=[item_id, skey],
                 args=[tx_id, item_id, amount, ttl_seconds],
             )
@@ -397,8 +406,9 @@ class StockRepository:
 
     async def saga_release_item(self, tx_id: str, item_id: str, amount: int, ttl_seconds: int) -> str:
         skey = saga_reservation_key(tx_id, item_id)
+        script = self._shard_and_script(item_id, self._saga_release_scripts)
         try:
-            result = await self._saga_release_script(
+            result = await script(
                 keys=[item_id, skey],
                 args=[tx_id, item_id, amount, ttl_seconds],
             )
