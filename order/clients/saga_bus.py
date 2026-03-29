@@ -66,6 +66,7 @@ class SagaCommandBus:
         self._dispatcher_task: asyncio.Task | None = None
         self._owned_partitions: set[int] = set()
         self._stream_cursors: dict[str, str] = {}
+        self._result_events: dict[str, asyncio.Event] = {}
 
     async def start(self):
         if self._dispatcher_task is not None and not self._dispatcher_task.done():
@@ -279,18 +280,37 @@ class SagaCommandBus:
 
     async def _await_result(self, correlation_id: str, timeout_ms: int) -> PendingCommandResult:
         pending_key = self._pending_key(correlation_id)
-        deadline = asyncio.get_running_loop().time() + (int(timeout_ms) / 1000.0)
+        timeout_s = int(timeout_ms) / 1000.0
+        deadline = asyncio.get_running_loop().time() + timeout_s
 
-        while asyncio.get_running_loop().time() < deadline:
-            raw = await self.db.hgetall(pending_key)
-            decoded = self._decode_dict(raw)
-            status = decoded.get("status", "")
-            if status in ("completed", "failed", "timed_out"):
-                ok = decoded.get("ok", "0").lower() in ("1", "true", "yes")
-                retryable = decoded.get("retryable", "0").lower() in ("1", "true", "yes")
-                detail = decoded.get("detail") or None
-                return PendingCommandResult(status=status, ok=ok, retryable=retryable, detail=detail)
-            await asyncio.sleep(self.poll_interval_seconds)
+        # Register an in-memory event so the dispatcher can notify us directly
+        # (avoids polling Redis every 10ms — the main scalability bottleneck).
+        event = asyncio.Event()
+        self._result_events[correlation_id] = event
+
+        try:
+            while asyncio.get_running_loop().time() < deadline:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                # Wait for in-memory notification from the dispatcher, with a
+                # slow Redis poll fallback every 200ms for cross-worker results
+                # (the dispatcher in another gunicorn worker can't set our event).
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=min(0.2, remaining))
+                except asyncio.TimeoutError:
+                    pass
+
+                raw = await self.db.hgetall(pending_key)
+                decoded = self._decode_dict(raw)
+                status = decoded.get("status", "")
+                if status in ("completed", "failed", "timed_out"):
+                    ok = decoded.get("ok", "0").lower() in ("1", "true", "yes")
+                    retryable = decoded.get("retryable", "0").lower() in ("1", "true", "yes")
+                    detail = decoded.get("detail") or None
+                    return PendingCommandResult(status=status, ok=ok, retryable=retryable, detail=detail)
+        finally:
+            self._result_events.pop(correlation_id, None)
 
         await self.db.hset(
             pending_key,
@@ -406,6 +426,10 @@ class SagaCommandBus:
             },
         )
         await self.db.expire(pending_key, self.pending_ttl_seconds)
+        # Wake up the waiting coroutine in this worker (if present)
+        event = self._result_events.pop(correlation_id, None)
+        if event is not None:
+            event.set()
         await self._incr_metric("result_applied_total")
         if ok.lower() in ("1", "true", "yes"):
             await self._incr_metric("result_ok_total")
