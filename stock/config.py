@@ -53,6 +53,7 @@ class StockConfig:
     redis_master_name: str | None
     saga_mq_sentinel_hosts: str | None
     saga_mq_master_name: str | None
+    redis_shard_hosts: str | None
 
     @classmethod
     def from_env(cls) -> "StockConfig":
@@ -96,4 +97,5 @@ class StockConfig:
             redis_master_name=os.environ.get("REDIS_MASTER_NAME"),
             saga_mq_sentinel_hosts=os.environ.get("SAGA_MQ_SENTINEL_HOSTS"),
             saga_mq_master_name=os.environ.get("SAGA_MQ_MASTER_NAME"),
+            redis_shard_hosts=os.environ.get("REDIS_SHARD_HOSTS"),
         )

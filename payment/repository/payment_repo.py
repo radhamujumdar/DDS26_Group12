@@ -5,6 +5,7 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from models import DB_ERROR_STR, PrepareRecord, SagaDebitRecord, SagaDebitState, TxnState, UserValue
+from sharded_redis import ShardedRedis
 
 
 def txn_key(txn_id: str) -> str:
@@ -128,11 +129,14 @@ return {0, packed}
 
 
 class PaymentRepository:
-    def __init__(self, db: Redis):
+    def __init__(self, db: ShardedRedis):
         self.db = db
-        self._prepare_script = db.register_script(PAYMENT_PREPARE_LUA)
-        self._commit_script = db.register_script(PAYMENT_COMMIT_LUA)
-        self._abort_script = db.register_script(PAYMENT_ABORT_LUA)
+        self._prepare_scripts = db.register_script_on_all(PAYMENT_PREPARE_LUA)
+        self._commit_scripts = db.register_script_on_all(PAYMENT_COMMIT_LUA)
+        self._abort_scripts = db.register_script_on_all(PAYMENT_ABORT_LUA)
+        # In-memory cache: txn_id -> shard index, populated during prepare,
+        # avoids broadcast GET on commit/abort in the hot path.
+        self._txn_shard_cache: dict[str, int] = {}
 
     @staticmethod
     def _decode_str(value) -> str:
@@ -144,19 +148,19 @@ class PaymentRepository:
 
     async def create_user(self, user_id: str, credit: int = 0):
         try:
-            await self.db.set(user_id, msgpack.encode(UserValue(credit=credit)))
+            await self.db.shard_for(user_id).set(user_id, msgpack.encode(UserValue(credit=credit)))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def batch_init_users(self, kv_pairs: dict[str, bytes]):
         try:
-            await self.db.mset(kv_pairs)
+            await self.db.mset_sharded(kv_pairs)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def get_user(self, user_id: str) -> UserValue | None:
         try:
-            raw = await self.db.get(user_id)
+            raw = await self.db.shard_for(user_id).get(user_id)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         if raw is None:
@@ -171,13 +175,31 @@ class PaymentRepository:
 
     async def save_user(self, user_id: str, user: UserValue):
         try:
-            await self.db.set(user_id, msgpack.encode(user))
+            await self.db.shard_for(user_id).set(user_id, msgpack.encode(user))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
+    async def _find_txn_shard_index(self, txn_id: str) -> tuple[bytes | None, int | None]:
+        """Find which shard holds a txn record. Uses cache first, broadcasts on miss."""
+        tk = txn_key(txn_id)
+        cached_idx = self._txn_shard_cache.get(txn_id)
+        if cached_idx is not None:
+            raw = await self.db.shards[cached_idx].get(tk)
+            if raw is not None:
+                return raw, cached_idx
+            # Cache stale, fall through to broadcast
+            self._txn_shard_cache.pop(txn_id, None)
+
+        raw, shard = await self.db.get_from_any(tk)
+        if raw is not None and shard is not None:
+            idx = self.db.shards.index(shard)
+            self._txn_shard_cache[txn_id] = idx
+            return raw, idx
+        return None, None
+
     async def get_prepare_record(self, txn_id: str) -> PrepareRecord | None:
         try:
-            raw = await self.db.get(txn_key(txn_id))
+            raw, _ = await self._find_txn_shard_index(txn_id)
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
         if raw is None:
@@ -186,19 +208,19 @@ class PaymentRepository:
 
     async def save_prepare_record(self, rec: PrepareRecord):
         try:
-            await self.db.set(txn_key(rec.txn_id), msgpack.encode(rec))
+            await self.db.shard_for(rec.user_id).set(txn_key(rec.txn_id), msgpack.encode(rec))
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def list_prepared_tx_ids(self) -> list[str]:
         prepared: list[str] = []
         try:
-            async for raw_key in self.db.scan_iter(match="txn:*"):
+            async for raw_key, shard in self.db.scan_all(match="txn:*"):
                 key = raw_key.decode() if isinstance(raw_key, bytes) else str(raw_key)
                 if key.startswith("txn:user:"):
                     continue
 
-                raw_record = await self.db.get(key)
+                raw_record = await shard.get(key)
                 if raw_record is None:
                     continue
 
@@ -211,15 +233,18 @@ class PaymentRepository:
 
     async def has_active_prepare(self, user_id: str) -> bool:
         try:
-            return int(await self.db.scard(prepared_user_key(user_id))) > 0
+            return int(await self.db.shard_for(user_id).scard(prepared_user_key(user_id))) > 0
         except RedisError as exc:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def prepare_transaction(self, txn_id: str, user_id: str, amount: int) -> PrepareRecord:
         tx_key = txn_key(txn_id)
         prep_key = prepared_user_key(user_id)
+        idx = self.db.shard_index_for(user_id)
+        self._txn_shard_cache[txn_id] = idx
+        script = self._prepare_scripts[idx]
         try:
-            result = await self._prepare_script(
+            result = await script(
                 keys=[user_id, tx_key, prep_key],
                 args=[txn_id, user_id, amount],
             )
@@ -238,12 +263,17 @@ class PaymentRepository:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def commit_transaction(self, txn_id: str) -> PrepareRecord:
-        tx_key = txn_key(txn_id)
+        tx_k = txn_key(txn_id)
+        raw, shard_idx = await self._find_txn_shard_index(txn_id)
+        if raw is None or shard_idx is None:
+            raise HTTPException(status_code=400, detail=f"Transaction {txn_id}: Unknown transaction")
+        script = self._commit_scripts[shard_idx]
         try:
-            result = await self._commit_script(keys=[tx_key], args=[txn_id])
+            result = await script(keys=[tx_k], args=[txn_id])
             status_code = int(result[0])
             payload = result[1]
             if status_code == 0:
+                self._txn_shard_cache.pop(txn_id, None)
                 if not isinstance(payload, (bytes, bytearray)):
                     raise HTTPException(status_code=400, detail=DB_ERROR_STR)
                 return self._decode_prepare(bytes(payload))
@@ -255,10 +285,16 @@ class PaymentRepository:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def abort_transaction(self, txn_id: str) -> bool:
-        tx_key = txn_key(txn_id)
+        tx_k = txn_key(txn_id)
+        raw, shard_idx = await self._find_txn_shard_index(txn_id)
+        if raw is None or shard_idx is None:
+            return True  # no record means already aborted / never existed
+        script = self._abort_scripts[shard_idx]
         try:
-            result = await self._abort_script(keys=[tx_key], args=[])
+            result = await script(keys=[tx_k], args=[])
             status_code = int(result[0])
+            if status_code == 0:
+                self._txn_shard_cache.pop(txn_id, None)
             return status_code == 0
         except HTTPException:
             raise
@@ -266,8 +302,9 @@ class PaymentRepository:
             raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
     async def pay(self, user_id: str, amount: int) -> int:
+        shard = self.db.shard_for(user_id)
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
+            async with shard.pipeline(transaction=True) as pipe:
                 while True:
                     try:
                         await pipe.watch(user_id, prepared_user_key(user_id))
@@ -305,8 +342,9 @@ class PaymentRepository:
 
     async def saga_debit(self, tx_id: str, user_id: str, amount: int) -> tuple[bool, bool, str | None]:
         debit_key = f"saga:payment:debit:{tx_id}"
+        shard = self.db.shard_for(user_id)
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
+            async with shard.pipeline(transaction=True) as pipe:
                 while True:
                     try:
                         await pipe.watch(user_id, debit_key)
@@ -369,10 +407,20 @@ class PaymentRepository:
         amount: int | None = None,
     ) -> tuple[bool, bool, str | None]:
         debit_key = f"saga:payment:debit:{tx_id}"
-        try:
-            existing_raw = await self.db.get(debit_key)
-        except RedisError as exc:
-            raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+
+        # If user_id is known, go directly to the right shard.
+        # Otherwise broadcast to find the debit record.
+        if user_id is not None:
+            shard = self.db.shard_for(user_id)
+            try:
+                existing_raw = await shard.get(debit_key)
+            except RedisError as exc:
+                raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
+        else:
+            try:
+                existing_raw, shard = await self.db.get_from_any(debit_key)
+            except RedisError as exc:
+                raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
 
         if existing_raw is None:
             if user_id is None or amount is None:
@@ -386,14 +434,15 @@ class PaymentRepository:
                 new_credit=0,
                 state=SagaDebitState.REFUNDED,
             )
+            shard = self.db.shard_for(user_id)
             try:
-                created = await self.db.set(debit_key, msgpack.encode(refunded), nx=True)
+                created = await shard.set(debit_key, msgpack.encode(refunded), nx=True)
             except RedisError as exc:
                 raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
             if created:
                 return True, False, None
             try:
-                existing_raw = await self.db.get(debit_key)
+                existing_raw = await shard.get(debit_key)
             except RedisError as exc:
                 raise HTTPException(status_code=400, detail=DB_ERROR_STR) from exc
             if existing_raw is None:
@@ -407,8 +456,10 @@ class PaymentRepository:
         if existing.state in (SagaDebitState.REFUNDED, SagaDebitState.FAILED):
             return True, False, None
 
+        # Use the shard for the existing record's user_id
+        refund_shard = self.db.shard_for(existing.user_id)
         try:
-            async with self.db.pipeline(transaction=True) as pipe:
+            async with refund_shard.pipeline(transaction=True) as pipe:
                 while True:
                     try:
                         await pipe.watch(existing.user_id, debit_key)

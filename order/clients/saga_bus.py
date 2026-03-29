@@ -66,6 +66,7 @@ class SagaCommandBus:
         self._dispatcher_task: asyncio.Task | None = None
         self._owned_partitions: set[int] = set()
         self._stream_cursors: dict[str, str] = {}
+        self._result_futures: dict[str, asyncio.Future] = {}
 
     async def start(self):
         if self._dispatcher_task is not None and not self._dispatcher_task.done():
@@ -279,18 +280,39 @@ class SagaCommandBus:
 
     async def _await_result(self, correlation_id: str, timeout_ms: int) -> PendingCommandResult:
         pending_key = self._pending_key(correlation_id)
-        deadline = asyncio.get_running_loop().time() + (int(timeout_ms) / 1000.0)
+        timeout_s = int(timeout_ms) / 1000.0
+        deadline = asyncio.get_running_loop().time() + timeout_s
 
-        while asyncio.get_running_loop().time() < deadline:
-            raw = await self.db.hgetall(pending_key)
-            decoded = self._decode_dict(raw)
-            status = decoded.get("status", "")
-            if status in ("completed", "failed", "timed_out"):
-                ok = decoded.get("ok", "0").lower() in ("1", "true", "yes")
-                retryable = decoded.get("retryable", "0").lower() in ("1", "true", "yes")
-                detail = decoded.get("detail") or None
-                return PendingCommandResult(status=status, ok=ok, retryable=retryable, detail=detail)
-            await asyncio.sleep(self.poll_interval_seconds)
+        # Register a future so the dispatcher can deliver the result directly
+        # without the caller needing to poll Redis.
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[PendingCommandResult] = loop.create_future()
+        self._result_futures[correlation_id] = fut
+
+        try:
+            while asyncio.get_running_loop().time() < deadline:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                # Wait for in-memory future from the dispatcher, with a
+                # slow Redis poll fallback every 200ms for cross-worker results
+                # (the dispatcher in another gunicorn worker can't set our future).
+                try:
+                    result = await asyncio.wait_for(asyncio.shield(fut), timeout=min(0.2, remaining))
+                    return result
+                except asyncio.TimeoutError:
+                    pass
+
+                raw = await self.db.hgetall(pending_key)
+                decoded = self._decode_dict(raw)
+                status = decoded.get("status", "")
+                if status in ("completed", "failed", "timed_out"):
+                    ok = decoded.get("ok", "0").lower() in ("1", "true", "yes")
+                    retryable = decoded.get("retryable", "0").lower() in ("1", "true", "yes")
+                    detail = decoded.get("detail") or None
+                    return PendingCommandResult(status=status, ok=ok, retryable=retryable, detail=detail)
+        finally:
+            self._result_futures.pop(correlation_id, None)
 
         await self.db.hset(
             pending_key,
@@ -341,6 +363,7 @@ class SagaCommandBus:
             if not entries:
                 continue
 
+            cursor_updates: dict[str, str] = {}
             for stream_name_raw, stream_entries in entries:
                 stream_name = self._decode(stream_name_raw)
                 participant, partition = self._parse_result_stream(stream_name)
@@ -361,16 +384,19 @@ class SagaCommandBus:
                             stream=stream_name,
                             message_id=message_id,
                         )
-                        streams[stream_name] = message_id
-                        self._stream_cursors[stream_name] = message_id
-                        await self.db.set(self._cursor_key(participant, partition), message_id)
-                        continue
-
-                    await self._apply_result(correlation_id, fields)
+                    else:
+                        await self._apply_result(correlation_id, fields)
 
                     streams[stream_name] = message_id
                     self._stream_cursors[stream_name] = message_id
-                    await self.db.set(self._cursor_key(participant, partition), message_id)
+                    cursor_updates[self._cursor_key(participant, partition)] = message_id
+
+            # Batch-update cursors in a single pipeline instead of one SET per result
+            if cursor_updates:
+                async with self.db.pipeline(transaction=False) as pipe:
+                    for key, value in cursor_updates.items():
+                        pipe.set(key, value)
+                    await pipe.execute()
 
     async def _apply_result(self, correlation_id: str, fields: dict[str, str]):
         pending_key = self._pending_key(correlation_id)
@@ -406,6 +432,18 @@ class SagaCommandBus:
             },
         )
         await self.db.expire(pending_key, self.pending_ttl_seconds)
+        # Deliver result directly to the waiting coroutine in this worker
+        # (avoids an extra HGETALL round-trip for same-worker results).
+        fut = self._result_futures.pop(correlation_id, None)
+        if fut is not None and not fut.done():
+            ok_bool = ok.lower() in ("1", "true", "yes")
+            retryable_bool = retryable.lower() in ("1", "true", "yes")
+            fut.set_result(PendingCommandResult(
+                status="completed",
+                ok=ok_bool,
+                retryable=retryable_bool,
+                detail=detail or None,
+            ))
         await self._incr_metric("result_applied_total")
         if ok.lower() in ("1", "true", "yes"):
             await self._incr_metric("result_ok_total")

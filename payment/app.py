@@ -10,7 +10,7 @@ from redis.asyncio import Redis
 from api import router
 from config import PaymentConfig
 from logging_utils import log_event
-from redis_utils import create_redis_client
+from redis_utils import create_redis_client, create_sharded_redis
 from repository.payment_repo import PaymentRepository
 from services import PaymentRecoveryService, PaymentService
 
@@ -21,7 +21,8 @@ logger = logging.getLogger("payment-service")
 @asynccontextmanager
 async def lifespan(the_app: FastAPI):
     config = PaymentConfig.from_env()
-    db = create_redis_client(
+    sharded_db = create_sharded_redis(
+        shard_hosts=config.redis_shard_hosts,
         host=config.redis_host,
         port=config.redis_port,
         password=config.redis_password,
@@ -30,7 +31,7 @@ async def lifespan(the_app: FastAPI):
         master_name=config.redis_master_name,
     )
     gateway_client = httpx.AsyncClient(timeout=2.0)
-    payment_repo = PaymentRepository(db)
+    payment_repo = PaymentRepository(sharded_db)
     payment_service = PaymentService(payment_repo, logger)
     recovery_service = PaymentRecoveryService(
         repo=payment_repo,
@@ -72,7 +73,7 @@ async def lifespan(the_app: FastAPI):
         log_event(logger, "saga_worker_disabled", service="payment-service")
 
     the_app.state.config = config
-    the_app.state.db = db
+    the_app.state.db = sharded_db
     the_app.state.payment_repository = payment_repo
     the_app.state.payment_service = payment_service
     the_app.state.recovery_service = recovery_service
@@ -105,7 +106,7 @@ async def lifespan(the_app: FastAPI):
     await gateway_client.aclose()
     if saga_broker_db is not None:
         await saga_broker_db.aclose()
-    await db.aclose()
+    await sharded_db.close_all()
     log_event(logger, "shutdown_complete", service="payment-service")
 
 

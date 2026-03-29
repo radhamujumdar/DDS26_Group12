@@ -103,10 +103,12 @@ services:
       - REDIS_MASTER_NAME=stock-db
       - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
       - SAGA_MQ_MASTER_NAME=saga-broker
+      - REDIS_SHARD_HOSTS=${STOCK_REDIS_SHARD_HOSTS:-}
     env_file:
       - env/stock_redis.env
     depends_on:
       - stock-db
+      - stock-db-shard-1
       - saga-broker
       - sentinel-1
       - sentinel-2
@@ -117,6 +119,11 @@ services:
       -w $${STOCK_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
 
   stock-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    restart: always
+
+  stock-db-shard-1:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
@@ -153,10 +160,12 @@ services:
       - REDIS_MASTER_NAME=payment-db
       - SAGA_MQ_SENTINEL_HOSTS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
       - SAGA_MQ_MASTER_NAME=saga-broker
+      - REDIS_SHARD_HOSTS=${PAYMENT_REDIS_SHARD_HOSTS:-}
     env_file:
       - env/payment_redis.env
     depends_on:
       - payment-db
+      - payment-db-shard-1
       - saga-broker
       - sentinel-1
       - sentinel-2
@@ -167,6 +176,11 @@ services:
       -w $${PAYMENT_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
 
   payment-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
+    restart: always
+
+  payment-db-shard-1:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb --appendonly yes
     restart: always
@@ -234,7 +248,7 @@ services:
       sh -c "
         echo 'Watchdog started - monitoring containers every 3 seconds';
         while true; do
-          for svc in stock-service payment-service order-service gateway order-db stock-db payment-db saga-broker order-db-replica stock-db-replica payment-db-replica saga-broker-replica sentinel-1 sentinel-2 sentinel-3; do
+          for svc in stock-service payment-service order-service gateway order-db stock-db stock-db-shard-1 payment-db payment-db-shard-1 saga-broker order-db-replica stock-db-replica payment-db-replica saga-broker-replica sentinel-1 sentinel-2 sentinel-3; do
             CONTAINER=$$(docker ps -a -q --filter label=com.docker.compose.service=$${svc} --filter status=exited | head -n 1);
             if [ -n \"$$CONTAINER\" ]; then
               echo \"Restarting $$svc...\";

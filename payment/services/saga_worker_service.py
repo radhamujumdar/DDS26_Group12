@@ -67,6 +67,7 @@ class PaymentSagaMqWorkerService:
             if not entries:
                 continue
 
+            tasks = []
             for stream_name_raw, stream_entries in entries:
                 stream_name = self._decode(stream_name_raw)
                 partition = self._parse_partition(stream_name)
@@ -75,7 +76,9 @@ class PaymentSagaMqWorkerService:
                 for message_id_raw, fields_raw in stream_entries:
                     message_id = self._decode(message_id_raw)
                     fields = self._decode_dict(fields_raw)
-                    await self._handle_command(stream_name, message_id, fields, partition)
+                    tasks.append(self._handle_command(stream_name, message_id, fields, partition))
+            if tasks:
+                await asyncio.gather(*tasks)
 
     async def _handle_command(self, stream_name: str, message_id: str, fields: dict[str, str], partition: int):
         correlation_id = fields.get("correlation_id", "")
