@@ -58,3 +58,29 @@ services:
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+  fluxi-server:
+    build:
+      context: .
+      dockerfile: fluxi-server/Dockerfile
+    image: fluxi-server:latest
+    environment:
+      - FLUXI_REDIS_URL=redis://:redis@fluxi-db:6379/0
+    depends_on:
+      - fluxi-db
+    ports:
+      - "8001:8001"
+
+  fluxi-scheduler:
+    build:
+      context: .
+      dockerfile: fluxi-scheduler/Dockerfile
+    image: fluxi-scheduler:latest
+    environment:
+      - FLUXI_REDIS_URL=redis://:redis@fluxi-db:6379/0
+    depends_on:
+      - fluxi-db
+
+  fluxi-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
