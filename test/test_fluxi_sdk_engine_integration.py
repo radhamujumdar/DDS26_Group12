@@ -76,7 +76,7 @@ class FluxiSdkEngineAsyncTestCase(unittest.IsolatedAsyncioTestCase):
         self.settings = FluxiSettings(
             redis_url=self.harness.url,
             key_prefix=f"fluxi-sdk-test:{self._testMethodName}",
-            workflow_task_timeout_ms=50,
+            workflow_task_timeout_ms=5000,
             result_poll_interval_ms=10,
             timer_poll_interval_ms=10,
             pending_idle_threshold_ms=1,
@@ -138,6 +138,33 @@ class FluxiSdkEngineAsyncTestCase(unittest.IsolatedAsyncioTestCase):
                 if time.time() >= deadline:
                     raise TimeoutError("Timed out waiting for fluxi-server to become ready.")
                 await asyncio.sleep(0.1)
+
+    async def _wait_for_run_id(self, workflow_id: str, timeout_seconds: float = 10) -> str:
+        deadline = time.time() + timeout_seconds
+        while True:
+            snapshot = await self.assertion_store.get_workflow_result(workflow_id)
+            if snapshot is not None and snapshot.run_id is not None:
+                return snapshot.run_id
+            if time.time() >= deadline:
+                raise TimeoutError(f"Timed out waiting for workflow {workflow_id!r} to start.")
+            await asyncio.sleep(0.01)
+
+    async def _wait_for_history_event(
+        self,
+        run_id: str,
+        event_type: str,
+        timeout_seconds: float = 10,
+    ) -> list[dict]:
+        deadline = time.time() + timeout_seconds
+        while True:
+            history = await self.assertion_store.get_history(run_id)
+            if any(event.get("event_type") == event_type for event in history):
+                return history
+            if time.time() >= deadline:
+                raise TimeoutError(
+                    f"Timed out waiting for history event {event_type!r} on run {run_id!r}."
+                )
+            await asyncio.sleep(0.01)
 
 
 class TestFluxiSdkEngineIntegration(FluxiSdkEngineAsyncTestCase):
@@ -226,12 +253,15 @@ class TestFluxiSdkEngineIntegration(FluxiSdkEngineAsyncTestCase):
 
     async def test_activity_timeout_retries_and_rejects_stale_completion(self) -> None:
         attempts = {"count": 0}
+        first_attempt_started = asyncio.Event()
+        release_first_attempt = asyncio.Event()
 
         @activity.defn(name="flaky_charge")
         async def flaky_charge() -> str:
             attempts["count"] += 1
             if attempts["count"] == 1:
-                await asyncio.sleep(0.12)
+                first_attempt_started.set()
+                await release_first_attempt.wait()
             return "charged"
 
         @workflow.defn(name="RetryWorkflow")
@@ -262,14 +292,26 @@ class TestFluxiSdkEngineIntegration(FluxiSdkEngineAsyncTestCase):
         )
 
         async with workflow_worker, activity_worker:
-            result = await client.execute_workflow(
-                RetryWorkflow.run,
-                id="retry:1",
-                task_queue="orders",
+            execution = asyncio.create_task(
+                client.execute_workflow(
+                    RetryWorkflow.run,
+                    id="retry:1",
+                    task_queue="orders",
+                )
             )
+            await asyncio.wait_for(first_attempt_started.wait(), timeout=10)
+            run_id = await self._wait_for_run_id("retry:1")
+            history = await self._wait_for_history_event(run_id, "ActivityRetryScheduled")
+            release_first_attempt.set()
+            result = await asyncio.wait_for(execution, timeout=20)
 
         self.assertEqual(result, "charged")
         self.assertEqual(attempts["count"], 2)
+        self.assertIn("ActivityAttemptTimedOut", [event["event_type"] for event in history])
+        self.assertIn("ActivityRetryScheduled", [event["event_type"] for event in history])
+
+        final_history = await self.assertion_store.get_history(run_id)
+        self.assertIn("ActivityCompleted", [event["event_type"] for event in final_history])
 
     async def test_non_deterministic_workflow_fails(self) -> None:
         mode = {"use_second": False}

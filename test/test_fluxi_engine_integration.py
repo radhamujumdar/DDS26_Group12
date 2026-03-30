@@ -16,6 +16,7 @@ class TestFluxiEngineIntegration(FluxiEngineAsyncTestCase):
         _, workflow_task = await self.latest_stream_payload(self.workflow_stream_key())
         self.assertEqual(workflow_task["kind"], "workflow_task")
         self.assertEqual(workflow_task["attempt_no"], 1)
+        self.assertEqual(workflow_task["workflow_name"], "CheckoutWorkflow")
 
         schedule_response = await self.client.post(
             "/workflow-tasks/complete",
@@ -56,6 +57,7 @@ class TestFluxiEngineIntegration(FluxiEngineAsyncTestCase):
 
         _, workflow_task_2 = await self.latest_stream_payload(self.workflow_stream_key())
         self.assertEqual(workflow_task_2["attempt_no"], 1)
+        self.assertEqual(workflow_task_2["workflow_name"], "CheckoutWorkflow")
         self.assertNotEqual(
             workflow_task_2["workflow_task_id"],
             workflow_task["workflow_task_id"],
@@ -233,8 +235,9 @@ class TestFluxiEngineIntegration(FluxiEngineAsyncTestCase):
         await asyncio.sleep(0.05)
         timer_result = await scheduler.run_once()
         self.assertEqual(timer_result["timer_result"]["outcome"], "retried")
+        self.assertGreaterEqual(timer_result["cleaned_pending_entries"], 1)
         cleaned = await self.store.cleanup_stale_pending_entries()
-        self.assertGreaterEqual(cleaned, 1)
+        self.assertEqual(cleaned, 0)
 
         pending_after = await self.store.redis.xpending_range(
             self.workflow_stream_key(),
@@ -248,3 +251,4 @@ class TestFluxiEngineIntegration(FluxiEngineAsyncTestCase):
         _, retried_workflow_task = await self.latest_stream_payload(self.workflow_stream_key())
         self.assertEqual(retried_workflow_task["workflow_task_id"], workflow_task["workflow_task_id"])
         self.assertEqual(retried_workflow_task["attempt_no"], 2)
+        self.assertEqual(retried_workflow_task["workflow_name"], "CheckoutWorkflow")

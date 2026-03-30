@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 import inspect
 import logging
@@ -15,7 +15,7 @@ import uuid
 
 import httpx
 from redis.asyncio.sentinel import MasterNotFoundError
-from redis.exceptions import ConnectionError, ReadOnlyError, TimeoutError
+from redis.exceptions import ConnectionError, ReadOnlyError, ResponseError, TimeoutError
 
 from fluxi_engine.codecs import from_base64, to_base64, unpackb
 from fluxi_engine.config import FluxiSettings, create_redis_client
@@ -50,6 +50,8 @@ _ATTEMPT_EVENT_TYPES = {
     "ActivityAttemptTimedOut",
     "ActivityRetryScheduled",
 }
+_PENDING_RESULT = object()
+_RESULT_RETRYABLE_HTTP_STATUS_CODES = {404, 500, 502, 503, 504}
 _REDIS_RECOVERABLE_ERRORS = (
     ConnectionError,
     TimeoutError,
@@ -78,35 +80,40 @@ class EngineWorkflowBackend:
         input_payload = encode_args_payload(args)
 
         async with httpx.AsyncClient(base_url=self._config.server_url.rstrip("/")) as client:
-            response = await client.post(
-                "/workflows/start-or-attach",
-                json={
-                    "workflow_id": workflow_id,
-                    "workflow_name": workflow_name,
-                    "task_queue": task_queue,
-                    "start_policy": start_policy.value,
-                    "input_payload_b64": to_base64(input_payload),
-                },
+            start_request = {
+                "workflow_id": workflow_id,
+                "workflow_name": workflow_name,
+                "task_queue": task_queue,
+                "start_policy": start_policy.value,
+                "input_payload_b64": to_base64(input_payload),
+            }
+            body = await self._start_or_attach(
+                client,
+                request=start_request,
+                start_policy=start_policy,
             )
-            response.raise_for_status()
-            body = response.json()
-
-            if body["decision"] == "duplicate_rejected":
-                raise WorkflowAlreadyStartedError(
-                    f"Workflow id {workflow_id!r} is already in use."
-                )
-            if body["status"] == "completed":
-                return _decode_workflow_result(body.get("result_payload_b64"), run_callable)
-            if body["status"] == "failed":
-                raise _decode_workflow_failure(body.get("error_payload_b64"))
+            terminal = _resolve_terminal_start_response(
+                body,
+                workflow_id=workflow_id,
+            )
+            if terminal is not _PENDING_RESULT:
+                if terminal["status"] == "completed":
+                    return _decode_workflow_result(
+                        terminal.get("result_payload_b64"),
+                        run_callable,
+                    )
+                if terminal["status"] == "failed":
+                    raise _decode_workflow_failure(terminal.get("error_payload_b64"))
 
             while True:
-                result_response = await client.get(
-                    f"/workflows/{workflow_id}/result",
-                    params={"wait_ms": self._config.result_poll_interval_ms},
+                snapshot = await self._poll_workflow_result(
+                    client,
+                    workflow_id=workflow_id,
+                    start_policy=start_policy,
+                    start_request=start_request,
                 )
-                result_response.raise_for_status()
-                snapshot = result_response.json()
+                if snapshot is _PENDING_RESULT:
+                    continue
                 if snapshot["status"] == "completed":
                     return _decode_workflow_result(
                         snapshot.get("result_payload_b64"),
@@ -114,6 +121,67 @@ class EngineWorkflowBackend:
                     )
                 if snapshot["status"] == "failed":
                     raise _decode_workflow_failure(snapshot.get("error_payload_b64"))
+
+    async def _start_or_attach(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        request: dict[str, Any],
+        start_policy: StartPolicy,
+    ) -> dict[str, Any]:
+        while True:
+            try:
+                response = await client.post("/workflows/start-or-attach", json=request)
+                response.raise_for_status()
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                if not _should_retry_start_request(start_policy, exc.response.status_code):
+                    raise
+            except httpx.HTTPError:
+                if not _should_retry_start_request(start_policy, None):
+                    raise
+            await asyncio.sleep(self._config.result_poll_interval_ms / 1000)
+
+    async def _poll_workflow_result(
+        self,
+        client: httpx.AsyncClient,
+        *,
+        workflow_id: str,
+        start_policy: StartPolicy,
+        start_request: dict[str, Any],
+    ) -> dict[str, Any] | object:
+        while True:
+            try:
+                result_response = await client.get(
+                    f"/workflows/{workflow_id}/result",
+                    params={"wait_ms": self._config.result_poll_interval_ms},
+                )
+                if result_response.status_code == 404 and _should_retry_start_request(
+                    start_policy,
+                    404,
+                ):
+                    body = await self._start_or_attach(
+                        client,
+                        request=start_request,
+                        start_policy=start_policy,
+                    )
+                    terminal = _resolve_terminal_start_response(
+                        body,
+                        workflow_id=workflow_id,
+                    )
+                    if terminal is not _PENDING_RESULT:
+                        return terminal
+                    await asyncio.sleep(self._config.result_poll_interval_ms / 1000)
+                    return _PENDING_RESULT
+                result_response.raise_for_status()
+                return result_response.json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code in _RESULT_RETRYABLE_HTTP_STATUS_CODES:
+                    await asyncio.sleep(self._config.result_poll_interval_ms / 1000)
+                    continue
+                raise
+            except httpx.HTTPError:
+                await asyncio.sleep(self._config.result_poll_interval_ms / 1000)
 
     def _create_worker_binding(
         self,
@@ -138,6 +206,16 @@ class _EngineWorkerBinding:
     task_queue: str
     workflows: tuple[WorkflowRegistration, ...]
     activities: tuple[ActivityRegistration, ...]
+    _settings: FluxiSettings = field(init=False, repr=False)
+    _workflow_by_name: dict[str, WorkflowRegistration] = field(init=False, repr=False)
+    _activity_by_name: dict[str, ActivityRegistration] = field(init=False, repr=False)
+    _consumer_name: str = field(init=False, repr=False)
+    _stop_event: asyncio.Event = field(init=False, repr=False)
+    _stopped_event: asyncio.Event = field(init=False, repr=False)
+    _redis_store: FluxiRedisStore | None = field(init=False, default=None, repr=False)
+    _http_client: httpx.AsyncClient | None = field(init=False, default=None, repr=False)
+    _tasks: list[asyncio.Task[None]] = field(init=False, default_factory=list, repr=False)
+    _running: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
         self._settings = FluxiSettings(
@@ -245,6 +323,16 @@ class _EngineWorkerBinding:
                         exc,
                     )
                     await self._wait_for_retry()
+                except ResponseError as exc:
+                    if _is_missing_stream_group_error(exc):
+                        logger.warning(
+                            "Recreating missing workflow consumer group for %s after Redis failover.",
+                            self.task_queue,
+                        )
+                        await self._ensure_workflow_group()
+                        await self._wait_for_retry(0.05)
+                        continue
+                    raise
                 except httpx.HTTPError as exc:
                     logger.warning(
                         "Transient HTTP error in Fluxi workflow worker loop for %s: %s",
@@ -290,6 +378,16 @@ class _EngineWorkerBinding:
                         exc,
                     )
                     await self._wait_for_retry()
+                except ResponseError as exc:
+                    if _is_missing_stream_group_error(exc):
+                        logger.warning(
+                            "Recreating missing activity consumer group for %s after Redis failover.",
+                            self.task_queue,
+                        )
+                        await self._ensure_activity_group()
+                        await self._wait_for_retry(0.05)
+                        continue
+                    raise
                 except httpx.HTTPError as exc:
                     logger.warning(
                         "Transient HTTP error in Fluxi activity worker loop for %s: %s",
@@ -312,6 +410,14 @@ class _EngineWorkerBinding:
         except asyncio.TimeoutError:
             return
 
+    async def _ensure_workflow_group(self) -> None:
+        assert self._redis_store is not None
+        await self._redis_store.ensure_workflow_queue(self.task_queue)
+
+    async def _ensure_activity_group(self) -> None:
+        assert self._redis_store is not None
+        await self._redis_store.ensure_activity_queue(self.task_queue)
+
     async def _process_workflow_task(self, task_payload: dict[str, Any]) -> bool:
         registration = self._workflow_by_name.get(str(task_payload["workflow_name"]))
         if registration is None:
@@ -328,36 +434,27 @@ class _EngineWorkerBinding:
             )
             return outcome in _WORKFLOW_ACK_OUTCOMES
 
+        history = await self._fetch_run_history(str(task_payload["run_id"]))
+        controller = _WorkflowReplayController(history, task_queue=self.task_queue)
+        workflow_instance = registration.workflow()
+        run_method = getattr(workflow_instance, registration.run_method_name)
+        args = decode_args_payload(controller.workflow_input_payload, run_method)
+
         try:
-            history = await self._fetch_run_history(str(task_payload["run_id"]))
-            controller = _WorkflowReplayController(history, task_queue=self.task_queue)
-            workflow_instance = registration.workflow()
-            run_method = getattr(workflow_instance, registration.run_method_name)
-            args = decode_args_payload(controller.workflow_input_payload, run_method)
-
-            try:
-                with workflow._activate_execution_context(
-                    registration,
-                    self.task_queue,
-                    controller.execute_activity,
-                ):
-                    result = await run_method(*args)
-            except _WorkflowSuspended:
-                outcome = await self._submit_workflow_schedule(
-                    run_id=str(task_payload["run_id"]),
-                    workflow_task_id=str(task_payload["workflow_task_id"]),
-                    attempt_no=int(task_payload["attempt_no"]),
-                    command=controller.pending_command,
-                )
-                return outcome in _WORKFLOW_ACK_OUTCOMES
-
+            with workflow._activate_execution_context(
+                registration,
+                self.task_queue,
+                controller.execute_activity,
+            ):
+                result = await run_method(*args)
             controller.assert_fully_replayed()
             result_payload = encode_payload(result)
-            outcome = await self._submit_workflow_completion(
+        except _WorkflowSuspended:
+            outcome = await self._submit_workflow_schedule(
                 run_id=str(task_payload["run_id"]),
                 workflow_task_id=str(task_payload["workflow_task_id"]),
                 attempt_no=int(task_payload["attempt_no"]),
-                result_payload=result_payload,
+                command=controller.pending_command,
             )
             return outcome in _WORKFLOW_ACK_OUTCOMES
         except BaseException as exc:
@@ -369,6 +466,14 @@ class _EngineWorkerBinding:
                 error_payload=failure_payload,
             )
             return outcome in _WORKFLOW_ACK_OUTCOMES
+
+        outcome = await self._submit_workflow_completion(
+            run_id=str(task_payload["run_id"]),
+            workflow_task_id=str(task_payload["workflow_task_id"]),
+            attempt_no=int(task_payload["attempt_no"]),
+            result_payload=result_payload,
+        )
+        return outcome in _WORKFLOW_ACK_OUTCOMES
 
     async def _process_activity_task(self, task_payload: dict[str, Any]) -> bool:
         registration = self._activity_by_name.get(str(task_payload["activity_name"]))
@@ -393,23 +498,20 @@ class _EngineWorkerBinding:
             result = registration.fn(*args)
             if inspect.isawaitable(result):
                 result = await result
-            payload = encode_payload(result)
-            outcome = await self._submit_activity_completion(
-                activity_execution_id=activity_execution_id,
-                attempt_no=attempt_no,
-                status="completed",
-                payload=payload,
-            )
-            return outcome in _ACTIVITY_ACK_OUTCOMES
         except BaseException as exc:
             payload = _safe_failure_payload(exc)
-            outcome = await self._submit_activity_completion(
-                activity_execution_id=activity_execution_id,
-                attempt_no=attempt_no,
-                status="failed",
-                payload=payload,
-            )
-            return outcome in _ACTIVITY_ACK_OUTCOMES
+            status = "failed"
+        else:
+            payload = encode_payload(result)
+            status = "completed"
+
+        outcome = await self._submit_activity_completion(
+            activity_execution_id=activity_execution_id,
+            attempt_no=attempt_no,
+            status=status,
+            payload=payload,
+        )
+        return outcome in _ACTIVITY_ACK_OUTCOMES
 
     async def _fetch_run_history(self, run_id: str) -> list[dict[str, Any]]:
         assert self._http_client is not None
@@ -738,3 +840,32 @@ def _decode_workflow_failure(payload_b64: str | None) -> BaseException:
         from_base64(payload_b64),
         fallback_error=RemoteWorkflowError,
     )
+
+
+def _resolve_terminal_start_response(
+    body: dict[str, Any],
+    *,
+    workflow_id: str,
+) -> dict[str, Any] | object:
+    if body["decision"] == "duplicate_rejected":
+        raise WorkflowAlreadyStartedError(
+            f"Workflow id {workflow_id!r} is already in use."
+        )
+    if body["status"] in {"completed", "failed"}:
+        return body
+    return _PENDING_RESULT
+
+
+def _should_retry_start_request(
+    start_policy: StartPolicy,
+    status_code: int | None,
+) -> bool:
+    if start_policy == StartPolicy.ALLOW_DUPLICATE:
+        return False
+    if status_code is None:
+        return True
+    return status_code in _RESULT_RETRYABLE_HTTP_STATUS_CODES
+
+
+def _is_missing_stream_group_error(exc: ResponseError) -> bool:
+    return "NOGROUP" in str(exc).upper()

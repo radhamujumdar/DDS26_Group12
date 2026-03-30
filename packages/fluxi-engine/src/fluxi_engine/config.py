@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+from collections.abc import Callable
 from typing import Any
 from urllib.parse import unquote, urlparse
 
@@ -144,16 +145,80 @@ def create_redis_client(settings: FluxiSettings) -> Redis:
     if settings.redis_mode == "direct":
         return Redis.from_url(settings.redis_url, decode_responses=False)
 
-    sentinel = Sentinel(
-        _parse_sentinel_endpoints(settings.sentinel_endpoints),
+    sentinel_endpoints = _parse_sentinel_endpoints(settings.sentinel_endpoints)
+    sentinel = _FluxiSentinel(
+        sentinel_endpoints,
         min_other_sentinels=settings.sentinel_min_other_sentinels,
         sentinel_kwargs=_sentinel_kwargs(settings),
+        address_remap=_sentinel_discovery_remap(sentinel_endpoints),
     )
     return sentinel.master_for(
         settings.sentinel_service_name,
         redis_class=Redis,
         **_redis_connection_kwargs_from_url(settings.redis_url),
     )
+
+
+async def close_redis_client(redis: Redis) -> None:
+    """Close a Redis client and any Sentinel discovery clients it owns."""
+
+    close_error: BaseException | None = None
+    try:
+        await redis.aclose(close_connection_pool=True)
+    except TypeError:
+        await redis.aclose()
+    except BaseException as exc:
+        close_error = exc
+
+    pool = getattr(redis, "connection_pool", None)
+    if pool is not None:
+        with_context = getattr(pool, "aclose", None)
+        if callable(with_context):
+            try:
+                await with_context()
+            except BaseException as exc:
+                close_error = close_error or exc
+
+        disconnect = getattr(pool, "disconnect", None)
+        if callable(disconnect):
+            try:
+                await disconnect(inuse_connections=True)
+            except TypeError:
+                try:
+                    await disconnect()
+                except BaseException as exc:
+                    close_error = close_error or exc
+            except BaseException as exc:
+                close_error = close_error or exc
+
+        sentinel_manager = getattr(pool, "sentinel_manager", None)
+        sentinels = getattr(sentinel_manager, "sentinels", ())
+        for sentinel_client in sentinels:
+            try:
+                await sentinel_client.aclose(close_connection_pool=True)
+            except TypeError:
+                try:
+                    await sentinel_client.aclose()
+                except BaseException as exc:
+                    close_error = close_error or exc
+            except BaseException as exc:
+                close_error = close_error or exc
+
+            sentinel_pool = getattr(sentinel_client, "connection_pool", None)
+            sentinel_disconnect = getattr(sentinel_pool, "disconnect", None)
+            if callable(sentinel_disconnect):
+                try:
+                    await sentinel_disconnect(inuse_connections=True)
+                except TypeError:
+                    try:
+                        await sentinel_disconnect()
+                    except BaseException as exc:
+                        close_error = close_error or exc
+                except BaseException as exc:
+                    close_error = close_error or exc
+
+    if close_error is not None:
+        raise close_error
 
 
 def _normalize_optional_text(value: str | None) -> str | None:
@@ -231,3 +296,36 @@ def _redis_connection_kwargs_from_url(redis_url: str) -> dict[str, Any]:
         kwargs["ssl"] = True
 
     return kwargs
+
+
+class _FluxiSentinel(Sentinel):
+    def __init__(
+        self,
+        *args: Any,
+        address_remap: Callable[[tuple[str, int]], tuple[str, int]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._address_remap = address_remap
+
+    async def discover_master(self, service_name: str) -> tuple[str, int]:
+        address = await super().discover_master(service_name)
+        if self._address_remap is None:
+            return address
+        return self._address_remap(address)
+
+
+def _sentinel_discovery_remap(
+    endpoints: tuple[tuple[str, int], ...],
+) -> Callable[[tuple[str, int]], tuple[str, int]] | None:
+    loopback_hosts = {"127.0.0.1", "::1", "localhost"}
+    if not endpoints or not all(host in loopback_hosts for host, _ in endpoints):
+        return None
+
+    def remap(address: tuple[str, int]) -> tuple[str, int]:
+        host, port = address
+        if host in {"host.docker.internal", "gateway.docker.internal"}:
+            return ("127.0.0.1", port)
+        return (host, port)
+
+    return remap

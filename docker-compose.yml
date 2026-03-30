@@ -4,7 +4,7 @@ services:
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
-      - "8000:80"
+      - "${DDS_GATEWAY_PORT:-8000}:80"
     depends_on:
       - order-service
       - stock-service
@@ -75,7 +75,7 @@ services:
       - fluxi-sentinel-2
       - fluxi-sentinel-3
     ports:
-      - "8001:8001"
+      - "${DDS_FLUXI_SERVER_PORT:-8001}:8001"
 
   fluxi-scheduler:
     build:
@@ -111,8 +111,6 @@ services:
       - redis
       - --maxmemory
       - 512mb
-    ports:
-      - "6379:6379"
 
   fluxi-redis-replica:
     image: redis:7.2-bookworm
@@ -139,8 +137,6 @@ services:
       - 512mb
     depends_on:
       - fluxi-redis-master
-    ports:
-      - "6380:6379"
 
   fluxi-sentinel-1:
     image: redis:7.2-bookworm
@@ -164,8 +160,6 @@ services:
     depends_on:
       - fluxi-redis-master
       - fluxi-redis-replica
-    ports:
-      - "26379:26379"
 
   fluxi-sentinel-2:
     image: redis:7.2-bookworm
@@ -189,8 +183,6 @@ services:
     depends_on:
       - fluxi-redis-master
       - fluxi-redis-replica
-    ports:
-      - "26380:26379"
 
   fluxi-sentinel-3:
     image: redis:7.2-bookworm
@@ -214,5 +206,3 @@ services:
     depends_on:
       - fluxi-redis-master
       - fluxi-redis-replica
-    ports:
-      - "26381:26379"

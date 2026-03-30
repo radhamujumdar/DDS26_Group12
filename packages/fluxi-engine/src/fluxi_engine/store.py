@@ -12,7 +12,7 @@ from redis.asyncio import Redis
 from redis.exceptions import ResponseError
 
 from .codecs import packb, unpackb
-from .config import FluxiSettings
+from .config import FluxiSettings, close_redis_client
 from .keys import (
     activity_queue,
     activity_state,
@@ -86,7 +86,7 @@ class FluxiRedisStore:
         self.settings = settings
 
     async def aclose(self) -> None:
-        await self.redis.aclose()
+        await close_redis_client(self.redis)
 
     async def flushdb(self) -> None:
         await self.redis.flushdb()
@@ -433,14 +433,25 @@ class FluxiRedisStore:
             if not queue_name:
                 continue
             stream_key = stream_builder(self.settings.key_prefix, queue_name)
-            claimed = await self.redis.xautoclaim(
-                stream_key,
-                group_name,
-                "fluxi-scheduler",
-                self.settings.pending_idle_threshold_ms,
-                start_id="0-0",
-                count=self.settings.pending_claim_count,
-            )
+            try:
+                claimed = await self.redis.xautoclaim(
+                    stream_key,
+                    group_name,
+                    "fluxi-scheduler",
+                    self.settings.pending_idle_threshold_ms,
+                    start_id="0-0",
+                    count=self.settings.pending_claim_count,
+                )
+            except ResponseError as exc:
+                if "NOGROUP" in str(exc).upper():
+                    await self._ensure_stream_group(
+                        stream_key=stream_key,
+                        group_name=group_name,
+                        registry_key=registry_key,
+                        task_queue=queue_name,
+                    )
+                    continue
+                raise
             messages = claimed[1] if isinstance(claimed, (list, tuple)) and len(claimed) > 1 else []
             for message_id, values in messages:
                 payload = values.get(b"payload") or values.get("payload")

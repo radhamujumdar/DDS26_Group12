@@ -353,6 +353,7 @@ redis.call('ZREM', timers_key, activity_timeout_timer_member)
 local activity_execution_id = redis.call('HGET', activity_key, 'activity_execution_id')
 local run_id = redis.call('HGET', activity_key, 'run_id')
 local workflow_id = redis.call('HGET', activity_key, 'workflow_id')
+local workflow_name = redis.call('HGET', run_state_key, 'workflow_name')
 local workflow_task_queue = redis.call('HGET', run_state_key, 'workflow_task_queue')
 local activity_name = redis.call('HGET', activity_key, 'activity_name')
 local next_event_id = tonumber(redis.call('HGET', run_state_key, 'next_history_event_id') or '1')
@@ -374,6 +375,7 @@ if completion_status == 'completed' then
     local workflow_task = pack({
         kind = 'workflow_task',
         workflow_id = workflow_id,
+        workflow_name = workflow_name,
         run_id = run_id,
         task_queue = workflow_task_queue,
         workflow_task_id = next_workflow_task_id,
@@ -487,6 +489,7 @@ local final_event = pack({
 local workflow_task = pack({
     kind = 'workflow_task',
     workflow_id = workflow_id,
+    workflow_name = workflow_name,
     run_id = run_id,
     task_queue = workflow_task_queue,
     workflow_task_id = next_workflow_task_id,
@@ -554,12 +557,14 @@ if timer_kind == 'workflow-timeout' then
 
     local run_id = redis.call('HGET', run_state_key, 'run_id')
     local workflow_id = redis.call('HGET', run_state_key, 'workflow_id')
+    local workflow_name = redis.call('HGET', run_state_key, 'workflow_name')
     local workflow_task_queue = redis.call('HGET', run_state_key, 'workflow_task_queue')
     local next_event_id = tonumber(redis.call('HGET', run_state_key, 'next_history_event_id') or '1')
     local retried_attempt_no = attempt_no + 1
     local workflow_task = pack({
         kind = 'workflow_task',
         workflow_id = workflow_id,
+        workflow_name = workflow_name,
         run_id = run_id,
         task_queue = workflow_task_queue,
         workflow_task_id = logical_id,
@@ -726,11 +731,13 @@ if attempt_no < max_attempts then
 end
 
 local workflow_task_queue = redis.call('HGET', run_state_key, 'workflow_task_queue')
+local workflow_name = redis.call('HGET', run_state_key, 'workflow_name')
 local next_workflow_task_sequence_no = tonumber(redis.call('HGET', run_state_key, 'next_workflow_task_sequence_no') or '1')
 local next_workflow_task_id = 'wft-' .. tostring(next_workflow_task_sequence_no)
 local workflow_task = pack({
     kind = 'workflow_task',
     workflow_id = workflow_id,
+    workflow_name = workflow_name,
     run_id = run_id,
     task_queue = workflow_task_queue,
     workflow_task_id = next_workflow_task_id,
