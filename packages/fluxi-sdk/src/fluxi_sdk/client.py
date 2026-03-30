@@ -18,33 +18,101 @@ def _env(name: str, default: str) -> str:
     return value
 
 
+def _optional_env(name: str) -> str | None:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    return value.strip()
+
+
 @dataclass(frozen=True, slots=True)
 class EngineConnectionConfig:
     server_url: str = "http://127.0.0.1:8000"
+    redis_mode: str = "direct"
     redis_url: str = "redis://localhost:6379/0"
+    sentinel_endpoints: str = ""
+    sentinel_service_name: str = "fluxi-master"
+    sentinel_min_other_sentinels: int = 0
+    sentinel_username: str | None = None
+    sentinel_password: str | None = None
     key_prefix: str = "fluxi"
     workflow_consumer_group: str = "fluxi-workflow-workers"
     activity_consumer_group: str = "fluxi-activity-workers"
     result_poll_interval_ms: int = 100
 
+    def __post_init__(self) -> None:
+        mode = self.redis_mode.strip().lower()
+        if mode not in {"direct", "sentinel"}:
+            raise ValueError("redis_mode must be either 'direct' or 'sentinel'.")
+        object.__setattr__(self, "redis_mode", mode)
+
+        sentinel_service_name = self.sentinel_service_name.strip()
+        object.__setattr__(self, "sentinel_service_name", sentinel_service_name)
+
+        sentinel_endpoints = ",".join(
+            part.strip()
+            for part in self.sentinel_endpoints.split(",")
+            if part.strip()
+        )
+        object.__setattr__(self, "sentinel_endpoints", sentinel_endpoints)
+
+        object.__setattr__(
+            self,
+            "sentinel_username",
+            _normalize_optional_text(self.sentinel_username),
+        )
+        object.__setattr__(
+            self,
+            "sentinel_password",
+            _normalize_optional_text(self.sentinel_password),
+        )
+
+        if self.sentinel_min_other_sentinels < 0:
+            raise ValueError("sentinel_min_other_sentinels must be at least 0.")
+
+        if mode == "sentinel":
+            if not sentinel_service_name:
+                raise ValueError(
+                    "sentinel_service_name must be a non-empty string in sentinel mode."
+                )
+            _parse_sentinel_endpoints(sentinel_endpoints)
+
     @classmethod
     def from_env(cls) -> EngineConnectionConfig:
+        defaults = cls()
         return cls(
-            server_url=_env("FLUXI_SERVER_URL", cls.server_url),
-            redis_url=_env("FLUXI_REDIS_URL", cls.redis_url),
-            key_prefix=_env("FLUXI_KEY_PREFIX", cls.key_prefix),
+            server_url=_env("FLUXI_SERVER_URL", defaults.server_url),
+            redis_mode=_env("FLUXI_REDIS_MODE", defaults.redis_mode),
+            redis_url=_env("FLUXI_REDIS_URL", defaults.redis_url),
+            sentinel_endpoints=_env(
+                "FLUXI_SENTINEL_ENDPOINTS",
+                defaults.sentinel_endpoints,
+            ),
+            sentinel_service_name=_env(
+                "FLUXI_SENTINEL_SERVICE_NAME",
+                defaults.sentinel_service_name,
+            ),
+            sentinel_min_other_sentinels=int(
+                _env(
+                    "FLUXI_SENTINEL_MIN_OTHER_SENTINELS",
+                    str(defaults.sentinel_min_other_sentinels),
+                )
+            ),
+            sentinel_username=_optional_env("FLUXI_SENTINEL_USERNAME"),
+            sentinel_password=_optional_env("FLUXI_SENTINEL_PASSWORD"),
+            key_prefix=_env("FLUXI_KEY_PREFIX", defaults.key_prefix),
             workflow_consumer_group=_env(
                 "FLUXI_WORKFLOW_CONSUMER_GROUP",
-                cls.workflow_consumer_group,
+                defaults.workflow_consumer_group,
             ),
             activity_consumer_group=_env(
                 "FLUXI_ACTIVITY_CONSUMER_GROUP",
-                cls.activity_consumer_group,
+                defaults.activity_consumer_group,
             ),
             result_poll_interval_ms=int(
                 _env(
                     "FLUXI_RESULT_POLL_INTERVAL_MS",
-                    str(cls.result_poll_interval_ms),
+                    str(defaults.result_poll_interval_ms),
                 )
             ),
         )
@@ -159,6 +227,13 @@ def _coalesce_workflow_id(id: str | None, workflow_key: str | None) -> str:
     return workflow_id
 
 
+def _normalize_optional_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
 def _normalize_workflow_args(
     workflow_args: tuple[Any, ...],
     args: Sequence[Any] | None,
@@ -168,6 +243,40 @@ def _normalize_workflow_args(
     if args is not None:
         return tuple(args)
     return workflow_args
+
+
+def _parse_sentinel_endpoints(value: str) -> tuple[tuple[str, int], ...]:
+    endpoints: list[tuple[str, int]] = []
+    for raw_entry in value.split(","):
+        entry = raw_entry.strip()
+        if not entry:
+            continue
+        if ":" not in entry:
+            raise ValueError(
+                "sentinel_endpoints must be a comma-separated list of host:port entries."
+            )
+        host, port_text = entry.rsplit(":", 1)
+        host = host.strip()
+        port_text = port_text.strip()
+        if not host:
+            raise ValueError("Sentinel endpoint host must be non-empty.")
+        try:
+            port = int(port_text)
+        except ValueError as exc:
+            raise ValueError(
+                f"Sentinel endpoint {entry!r} has an invalid port."
+            ) from exc
+        if port < 1 or port > 65535:
+            raise ValueError(
+                f"Sentinel endpoint {entry!r} has a port outside 1-65535."
+            )
+        endpoints.append((host, port))
+
+    if not endpoints:
+        raise ValueError(
+            "sentinel_endpoints must include at least one host:port entry in sentinel mode."
+        )
+    return tuple(endpoints)
 
 
 __all__ = ["EngineConnectionConfig", "WorkflowClient"]

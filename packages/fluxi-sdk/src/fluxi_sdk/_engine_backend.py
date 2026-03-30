@@ -7,12 +7,15 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import timedelta
 import inspect
+import logging
 import os
 import socket
 from typing import Any, Callable
 import uuid
 
 import httpx
+from redis.asyncio.sentinel import MasterNotFoundError
+from redis.exceptions import ConnectionError, ReadOnlyError, TimeoutError
 
 from fluxi_engine.codecs import from_base64, to_base64, unpackb
 from fluxi_engine.config import FluxiSettings, create_redis_client
@@ -47,6 +50,14 @@ _ATTEMPT_EVENT_TYPES = {
     "ActivityAttemptTimedOut",
     "ActivityRetryScheduled",
 }
+_REDIS_RECOVERABLE_ERRORS = (
+    ConnectionError,
+    TimeoutError,
+    MasterNotFoundError,
+    ReadOnlyError,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class EngineWorkflowBackend:
@@ -130,7 +141,13 @@ class _EngineWorkerBinding:
 
     def __post_init__(self) -> None:
         self._settings = FluxiSettings(
+            redis_mode=self.config.redis_mode,
             redis_url=self.config.redis_url,
+            sentinel_endpoints=self.config.sentinel_endpoints,
+            sentinel_service_name=self.config.sentinel_service_name,
+            sentinel_min_other_sentinels=self.config.sentinel_min_other_sentinels,
+            sentinel_username=self.config.sentinel_username,
+            sentinel_password=self.config.sentinel_password,
             key_prefix=self.config.key_prefix,
             workflow_consumer_group=self.config.workflow_consumer_group,
             activity_consumer_group=self.config.activity_consumer_group,
@@ -204,22 +221,43 @@ class _EngineWorkerBinding:
         stream_key = workflow_queue(self._settings.key_prefix, self.task_queue)
         try:
             while not self._stop_event.is_set():
-                payload = await _read_stream_payload(
-                    self._redis_store,
-                    stream_key=stream_key,
-                    group_name=self._settings.workflow_consumer_group,
-                    consumer_name=self._consumer_name,
-                )
-                if payload is None:
-                    continue
-                message_id, task_payload = payload
-                should_ack = await self._process_workflow_task(task_payload)
-                if should_ack:
-                    await self._redis_store.redis.xack(
-                        stream_key,
-                        self._settings.workflow_consumer_group,
-                        message_id,
+                try:
+                    payload = await _read_stream_payload(
+                        self._redis_store,
+                        stream_key=stream_key,
+                        group_name=self._settings.workflow_consumer_group,
+                        consumer_name=self._consumer_name,
                     )
+                    if payload is None:
+                        continue
+                    message_id, task_payload = payload
+                    should_ack = await self._process_workflow_task(task_payload)
+                    if should_ack:
+                        await self._redis_store.redis.xack(
+                            stream_key,
+                            self._settings.workflow_consumer_group,
+                            message_id,
+                        )
+                except _REDIS_RECOVERABLE_ERRORS as exc:
+                    logger.warning(
+                        "Transient Redis/Sentinel error in Fluxi workflow worker loop for %s: %s",
+                        self.task_queue,
+                        exc,
+                    )
+                    await self._wait_for_retry()
+                except httpx.HTTPError as exc:
+                    logger.warning(
+                        "Transient HTTP error in Fluxi workflow worker loop for %s: %s",
+                        self.task_queue,
+                        exc,
+                    )
+                    await self._wait_for_retry()
+                except Exception:
+                    logger.exception(
+                        "Unexpected error in Fluxi workflow worker loop for %s.",
+                        self.task_queue,
+                    )
+                    await self._wait_for_retry()
         except asyncio.CancelledError:
             raise
 
@@ -228,24 +266,51 @@ class _EngineWorkerBinding:
         stream_key = activity_queue(self._settings.key_prefix, self.task_queue)
         try:
             while not self._stop_event.is_set():
-                payload = await _read_stream_payload(
-                    self._redis_store,
-                    stream_key=stream_key,
-                    group_name=self._settings.activity_consumer_group,
-                    consumer_name=self._consumer_name,
-                )
-                if payload is None:
-                    continue
-                message_id, task_payload = payload
-                should_ack = await self._process_activity_task(task_payload)
-                if should_ack:
-                    await self._redis_store.redis.xack(
-                        stream_key,
-                        self._settings.activity_consumer_group,
-                        message_id,
+                try:
+                    payload = await _read_stream_payload(
+                        self._redis_store,
+                        stream_key=stream_key,
+                        group_name=self._settings.activity_consumer_group,
+                        consumer_name=self._consumer_name,
                     )
+                    if payload is None:
+                        continue
+                    message_id, task_payload = payload
+                    should_ack = await self._process_activity_task(task_payload)
+                    if should_ack:
+                        await self._redis_store.redis.xack(
+                            stream_key,
+                            self._settings.activity_consumer_group,
+                            message_id,
+                        )
+                except _REDIS_RECOVERABLE_ERRORS as exc:
+                    logger.warning(
+                        "Transient Redis/Sentinel error in Fluxi activity worker loop for %s: %s",
+                        self.task_queue,
+                        exc,
+                    )
+                    await self._wait_for_retry()
+                except httpx.HTTPError as exc:
+                    logger.warning(
+                        "Transient HTTP error in Fluxi activity worker loop for %s: %s",
+                        self.task_queue,
+                        exc,
+                    )
+                    await self._wait_for_retry()
+                except Exception:
+                    logger.exception(
+                        "Unexpected error in Fluxi activity worker loop for %s.",
+                        self.task_queue,
+                    )
+                    await self._wait_for_retry()
         except asyncio.CancelledError:
             raise
+
+    async def _wait_for_retry(self, delay_seconds: float = 0.5) -> None:
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=delay_seconds)
+        except asyncio.TimeoutError:
+            return
 
     async def _process_workflow_task(self, task_payload: dict[str, Any]) -> bool:
         registration = self._workflow_by_name.get(str(task_payload["workflow_name"]))

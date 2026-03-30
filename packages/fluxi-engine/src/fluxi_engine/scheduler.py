@@ -4,9 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
+
+from redis.asyncio.sentinel import MasterNotFoundError
+from redis.exceptions import ConnectionError, ReadOnlyError, TimeoutError
 
 from .config import FluxiSettings, create_redis_client
 from .store import FluxiRedisStore
+
+_REDIS_RECOVERABLE_ERRORS = (
+    ConnectionError,
+    TimeoutError,
+    MasterNotFoundError,
+    ReadOnlyError,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class FluxiScheduler:
@@ -41,7 +54,15 @@ class FluxiScheduler:
 
     async def run_forever(self) -> None:
         while not self._stopped.is_set():
-            await self.run_once()
+            try:
+                await self.run_once()
+            except _REDIS_RECOVERABLE_ERRORS as exc:
+                logger.warning(
+                    "Transient Redis/Sentinel error in FluxiScheduler loop: %s",
+                    exc,
+                )
+            except Exception:
+                logger.exception("Unexpected error in FluxiScheduler loop.")
             await asyncio.sleep(self.settings.timer_poll_interval_ms / 1000)
 
     async def stop(self) -> None:

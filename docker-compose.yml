@@ -1,6 +1,4 @@
-version: "3"
 services:
-
   gateway:
     image: nginx:1.25-bookworm
     volumes:
@@ -65,9 +63,17 @@ services:
       dockerfile: fluxi-server/Dockerfile
     image: fluxi-server:latest
     environment:
-      - FLUXI_REDIS_URL=redis://:redis@fluxi-db:6379/0
+      - FLUXI_REDIS_MODE=sentinel
+      - FLUXI_REDIS_URL=redis://:redis@fluxi-redis-master:6379/0
+      - FLUXI_SENTINEL_ENDPOINTS=fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
+      - FLUXI_SENTINEL_SERVICE_NAME=fluxi-master
+      - FLUXI_SENTINEL_MIN_OTHER_SENTINELS=1
     depends_on:
-      - fluxi-db
+      - fluxi-redis-master
+      - fluxi-redis-replica
+      - fluxi-sentinel-1
+      - fluxi-sentinel-2
+      - fluxi-sentinel-3
     ports:
       - "8001:8001"
 
@@ -77,10 +83,136 @@ services:
       dockerfile: fluxi-scheduler/Dockerfile
     image: fluxi-scheduler:latest
     environment:
-      - FLUXI_REDIS_URL=redis://:redis@fluxi-db:6379/0
+      - FLUXI_REDIS_MODE=sentinel
+      - FLUXI_REDIS_URL=redis://:redis@fluxi-redis-master:6379/0
+      - FLUXI_SENTINEL_ENDPOINTS=fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
+      - FLUXI_SENTINEL_SERVICE_NAME=fluxi-master
+      - FLUXI_SENTINEL_MIN_OTHER_SENTINELS=1
     depends_on:
-      - fluxi-db
+      - fluxi-redis-master
+      - fluxi-redis-replica
+      - fluxi-sentinel-1
+      - fluxi-sentinel-2
+      - fluxi-sentinel-3
 
-  fluxi-db:
+  fluxi-redis-master:
     image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --requirepass
+      - redis
+      - --maxmemory
+      - 512mb
+    ports:
+      - "6379:6379"
+
+  fluxi-redis-replica:
+    image: redis:7.2-bookworm
+    command:
+      - redis-server
+      - --replicaof
+      - fluxi-redis-master
+      - "6379"
+      - --masterauth
+      - redis
+      - --requirepass
+      - redis
+      - --replica-announce-ip
+      - fluxi-redis-replica
+      - --replica-announce-port
+      - "6379"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --protected-mode
+      - "no"
+      - --maxmemory
+      - 512mb
+    depends_on:
+      - fluxi-redis-master
+    ports:
+      - "6380:6379"
+
+  fluxi-sentinel-1:
+    image: redis:7.2-bookworm
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor fluxi-master fluxi-redis-master 6379 2
+        sentinel auth-pass fluxi-master redis
+        sentinel down-after-milliseconds fluxi-master 3000
+        sentinel failover-timeout fluxi-master 10000
+        sentinel parallel-syncs fluxi-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - fluxi-redis-master
+      - fluxi-redis-replica
+    ports:
+      - "26379:26379"
+
+  fluxi-sentinel-2:
+    image: redis:7.2-bookworm
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor fluxi-master fluxi-redis-master 6379 2
+        sentinel auth-pass fluxi-master redis
+        sentinel down-after-milliseconds fluxi-master 3000
+        sentinel failover-timeout fluxi-master 10000
+        sentinel parallel-syncs fluxi-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - fluxi-redis-master
+      - fluxi-redis-replica
+    ports:
+      - "26380:26379"
+
+  fluxi-sentinel-3:
+    image: redis:7.2-bookworm
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor fluxi-master fluxi-redis-master 6379 2
+        sentinel auth-pass fluxi-master redis
+        sentinel down-after-milliseconds fluxi-master 3000
+        sentinel failover-timeout fluxi-master 10000
+        sentinel parallel-syncs fluxi-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - fluxi-redis-master
+      - fluxi-redis-replica
+    ports:
+      - "26381:26379"
