@@ -58,3 +58,55 @@ services:
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+  # ---------------------------------------------------------------------------
+  # Fluxi orchestrator infrastructure
+  # ---------------------------------------------------------------------------
+
+  fluxi-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
+  fluxi-server:
+    image: fluxi-server:latest
+    environment:
+      - FLUXI_REDIS_URL=redis://:redis@fluxi-db:6379/0
+    depends_on:
+      - fluxi-db
+
+  # ---------------------------------------------------------------------------
+  # Fluxi workers — one per service domain
+  # ---------------------------------------------------------------------------
+
+  order-checkout-worker:
+    image: order:latest
+    command: python workers/checkout_worker.py
+    environment:
+      - FLUXI_REDIS_URL=redis://:redis@fluxi-db:6379/0
+    env_file:
+      - env/order_redis.env
+    depends_on:
+      - order-db
+      - fluxi-server
+
+  stock-activity-worker:
+    image: stock:latest
+    command: python workers/stock_worker.py
+    environment:
+      - FLUXI_REDIS_URL=redis://:redis@fluxi-db:6379/0
+    env_file:
+      - env/stock_redis.env
+    depends_on:
+      - stock-db
+      - fluxi-server
+
+  payment-activity-worker:
+    image: user:latest
+    command: python workers/payment_worker.py
+    environment:
+      - FLUXI_REDIS_URL=redis://:redis@fluxi-db:6379/0
+    env_file:
+      - env/payment_redis.env
+    depends_on:
+      - payment-db
+      - fluxi-server
