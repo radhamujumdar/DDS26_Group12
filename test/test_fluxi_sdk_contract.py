@@ -6,6 +6,7 @@ import fluxi_sdk_test_support  # noqa: F401
 
 from fluxi_sdk import (
     ActivityOptions,
+    EngineConnectionConfig,
     FakeFluxiRuntime,
     RetryPolicy,
     StartPolicy,
@@ -105,6 +106,18 @@ class TestFluxiSdkContract(unittest.TestCase):
         self.assertIsInstance(client_facade, WorkflowClient)
         self.assertIsInstance(worker_facade, Worker)
         self.assertIs(runtime.create_client(), runtime.create_client())
+
+    def test_engine_connection_config_is_public(self):
+        config = EngineConnectionConfig(
+            server_url="http://localhost:8000",
+            redis_url="redis://localhost:6379/0",
+        )
+        self.assertEqual(config.server_url, "http://localhost:8000")
+        self.assertEqual(config.redis_url, "redis://localhost:6379/0")
+
+    def test_connect_requires_explicit_backend_selection(self):
+        with self.assertRaises(TypeError):
+            WorkflowClient.connect()
 
     def test_workflow_decorator_no_longer_declares_task_queue(self):
         @workflow.defn
