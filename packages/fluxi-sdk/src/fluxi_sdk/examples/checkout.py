@@ -1,4 +1,4 @@
-"""Reference checkout workflow and fake activities for phase 1."""
+"""Reference checkout workflow and activities for Fluxi SDK examples."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 
 from .. import activity, workflow
-from ..client import WorkflowClient
+from ..client import EngineConnectionConfig, WorkflowClient
 from ..testing import FakeFluxiRuntime
 from ..worker import Worker
 
@@ -212,6 +212,17 @@ def create_reference_checkout_environment(
     return runtime, client, workers
 
 
+def create_reference_checkout_engine_environment(
+    state: ReferenceCheckoutState,
+    engine: EngineConnectionConfig,
+) -> tuple[WorkflowClient, tuple[Worker, Worker, Worker]]:
+    """Create an engine-backed client plus workers for the reference example."""
+
+    client = WorkflowClient.connect(engine=engine)
+    workers = create_reference_checkout_workers(client, state)
+    return client, workers
+
+
 __all__ = [
     "CheckoutItem",
     "CheckoutOrder",
@@ -219,6 +230,7 @@ __all__ = [
     "OrderNotFoundError",
     "PaymentDeclinedError",
     "PaymentReceipt",
+    "create_reference_checkout_engine_environment",
     "ReferenceCheckoutError",
     "ReferenceCheckoutState",
     "ReferenceCheckoutWorkflow",

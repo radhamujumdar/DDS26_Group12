@@ -49,6 +49,35 @@ class WorkflowAlreadyStartedError(FluxiError):
     """Raised when a workflow key collides with a start policy."""
 
 
+class RemoteExecutionError(FluxiError):
+    """Raised when a remote workflow or activity fails without local rehydration."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        remote_module: str | None = None,
+        remote_qualname: str | None = None,
+        remote_args: tuple[object, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.remote_module = remote_module
+        self.remote_qualname = remote_qualname
+        self.remote_args = remote_args
+
+
+class RemoteWorkflowError(RemoteExecutionError):
+    """Raised when a remote workflow fails and cannot be rehydrated locally."""
+
+
+class RemoteActivityError(RemoteExecutionError):
+    """Raised when a remote activity fails and cannot be rehydrated locally."""
+
+
+class NonDeterministicWorkflowError(RemoteWorkflowError):
+    """Raised when workflow code does not match the stored event history."""
+
+
 class WorkerError(FluxiError):
     """Raised for worker lifecycle and task-queue availability failures."""
 

@@ -134,6 +134,31 @@ def _get_workflow_definition(workflow_cls: type[Any]) -> _WorkflowDefinition:
     return definition
 
 
+def _get_workflow_name(workflow_ref: WorkflowReference) -> str:
+    if isinstance(workflow_ref, str):
+        return workflow_ref
+    if inspect.isclass(workflow_ref):
+        return _get_workflow_definition(workflow_ref).name
+    if callable(workflow_ref):
+        workflow_cls = getattr(workflow_ref, _WORKFLOW_CLASS_ATTR, None)
+        if workflow_cls is not None:
+            return _get_workflow_definition(workflow_cls).name
+    raise InvalidWorkflowDefinitionError(
+        f"Workflow reference {workflow_ref!r} is not a decorated workflow."
+    )
+
+
+def _get_workflow_run_callable(
+    workflow_ref: WorkflowReference,
+) -> Callable[..., Any] | None:
+    if callable(workflow_ref) and not inspect.isclass(workflow_ref):
+        return workflow_ref
+    if inspect.isclass(workflow_ref):
+        definition = _get_workflow_definition(workflow_ref)
+        return getattr(workflow_ref, definition.run_method_name)
+    return None
+
+
 class WorkflowRegistry:
     """Explicit registry for workflow definitions."""
 
