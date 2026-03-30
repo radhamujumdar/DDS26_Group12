@@ -10,8 +10,10 @@ import subprocess
 import sys
 import time
 import unittest
+import uuid
 
 import httpx
+from redis.sentinel import Sentinel as SyncSentinel
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENGINE_SRC = REPO_ROOT / "packages" / "fluxi-engine" / "src"
@@ -31,6 +33,30 @@ def _find_free_port() -> int:
     return port
 
 
+def _docker_path() -> str:
+    docker = shutil.which("docker")
+    if docker is None:
+        raise unittest.SkipTest("Docker is not available for Fluxi integration tests.")
+    return docker
+
+
+def _ensure_docker_available() -> str:
+    docker = _docker_path()
+    try:
+        subprocess.run(
+            [docker, "info"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except Exception as exc:
+        raise unittest.SkipTest(
+            f"Docker is unavailable for Fluxi integration tests: {exc}"
+        ) from exc
+    return docker
+
+
 class RedisHarness:
     def __init__(self) -> None:
         self._container_id: str | None = None
@@ -44,22 +70,7 @@ class RedisHarness:
             self.url = explicit_url
             return
 
-        docker = shutil.which("docker")
-        if docker is None:
-            raise unittest.SkipTest("Docker is not available for Fluxi engine integration tests.")
-
-        try:
-            subprocess.run(
-                [docker, "info"],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except Exception as exc:
-            raise unittest.SkipTest(
-                f"Docker is unavailable for Fluxi engine integration tests: {exc}"
-            ) from exc
+        docker = _ensure_docker_available()
 
         self.port = _find_free_port()
         result = subprocess.run(
@@ -100,6 +111,283 @@ class RedisHarness:
             timeout=30,
         )
         self._container_id = None
+
+
+class SentinelHarness:
+    def __init__(self) -> None:
+        self.service_name = "fluxi-master"
+        self.redis_password = "redis"
+        self.redis_db = 0
+        self.master_port = _find_free_port()
+        self.replica_port = _find_free_port()
+        self.sentinel_ports = [_find_free_port() for _ in range(3)]
+        self._network_name = f"fluxi-sentinel-net-{uuid.uuid4().hex[:8]}"
+        self._master_name = f"fluxi-redis-master-{uuid.uuid4().hex[:8]}"
+        self._replica_name = f"fluxi-redis-replica-{uuid.uuid4().hex[:8]}"
+        self._sentinel_names = [
+            f"fluxi-sentinel-{index}-{uuid.uuid4().hex[:8]}"
+            for index in range(1, 4)
+        ]
+        self._master_container_id: str | None = None
+        self._replica_container_id: str | None = None
+        self._sentinel_container_ids: list[str] = []
+
+    @property
+    def redis_url(self) -> str:
+        return f"redis://:{self.redis_password}@127.0.0.1:{self.master_port}/{self.redis_db}"
+
+    @property
+    def sentinel_endpoints(self) -> str:
+        return ",".join(f"127.0.0.1:{port}" for port in self.sentinel_ports)
+
+    def start(self) -> None:
+        docker = _ensure_docker_available()
+        self._run(docker, ["network", "create", self._network_name])
+        try:
+            self._master_container_id = self._start_master(docker)
+            self._replica_container_id = self._start_replica(docker)
+            self._sentinel_container_ids = [
+                self._start_sentinel(docker, name, port)
+                for name, port in zip(self._sentinel_names, self.sentinel_ports, strict=True)
+            ]
+            self.wait_until_ready()
+        except Exception:
+            self.stop()
+            raise
+
+    def stop(self) -> None:
+        docker = shutil.which("docker")
+        if docker is None:
+            return
+        container_ids = [
+            *self._sentinel_container_ids,
+            self._replica_container_id,
+            self._master_container_id,
+        ]
+        for container_id in container_ids:
+            if not container_id:
+                continue
+            subprocess.run(
+                [docker, "rm", "-f", container_id],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        self._sentinel_container_ids = []
+        self._replica_container_id = None
+        self._master_container_id = None
+        subprocess.run(
+            [docker, "network", "rm", self._network_name],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def discover_master_address(self) -> tuple[str, int]:
+        sentinel = SyncSentinel(
+            [("127.0.0.1", port) for port in self.sentinel_ports],
+            socket_timeout=1.0,
+        )
+        host, port = sentinel.discover_master(self.service_name)
+        return str(host), int(port)
+
+    def wait_until_ready(self, timeout_seconds: float = 30.0) -> tuple[str, int]:
+        deadline = time.time() + timeout_seconds
+        last_error: BaseException | None = None
+        while time.time() < deadline:
+            try:
+                host, port = self.discover_master_address()
+                sentinel = SyncSentinel(
+                    [("127.0.0.1", sentinel_port) for sentinel_port in self.sentinel_ports],
+                    socket_timeout=1.0,
+                )
+                client = sentinel.master_for(
+                    self.service_name,
+                    password=self.redis_password,
+                    db=self.redis_db,
+                    socket_timeout=1.0,
+                )
+                client.ping()
+                return host, port
+            except Exception as exc:
+                last_error = exc
+                time.sleep(0.25)
+        raise TimeoutError(
+            f"Timed out waiting for Sentinel to become ready: {last_error}"
+        )
+
+    def force_failover(self, timeout_seconds: float = 30.0) -> tuple[str, int]:
+        docker = _docker_path()
+        old_host, old_port = self.wait_until_ready()
+        sentinel_container_id = self._sentinel_container_ids[0]
+        self._run(
+            docker,
+            [
+                "exec",
+                sentinel_container_id,
+                "redis-cli",
+                "-p",
+                "26379",
+                "SENTINEL",
+                "FAILOVER",
+                self.service_name,
+            ],
+        )
+
+        deadline = time.time() + timeout_seconds
+        last_error: BaseException | None = None
+        while time.time() < deadline:
+            try:
+                host, port = self.wait_until_ready(timeout_seconds=5.0)
+                if (host, port) != (old_host, old_port):
+                    return host, port
+            except Exception as exc:
+                last_error = exc
+            time.sleep(0.5)
+        raise TimeoutError(
+            f"Timed out waiting for Sentinel failover to complete: {last_error}"
+        )
+
+    def stop_current_master(self) -> None:
+        docker = _docker_path()
+        _, current_port = self.wait_until_ready()
+        if current_port == self.master_port and self._master_container_id is not None:
+            target = self._master_container_id
+        elif current_port == self.replica_port and self._replica_container_id is not None:
+            target = self._replica_container_id
+        else:
+            raise RuntimeError(f"Cannot map current master port {current_port} to a container.")
+        subprocess.run(
+            [docker, "rm", "-f", target],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def _start_master(self, docker: str) -> str:
+        result = self._run(
+            docker,
+            [
+                "run",
+                "--rm",
+                "-d",
+                "--name",
+                self._master_name,
+                "--network",
+                self._network_name,
+                "--publish",
+                f"{self.master_port}:6379",
+                "--add-host",
+                "host.docker.internal:host-gateway",
+                "redis:7.2-bookworm",
+                "redis-server",
+                "--appendonly",
+                "yes",
+                "--appendfsync",
+                "everysec",
+                "--save",
+                "",
+                "--protected-mode",
+                "no",
+                "--requirepass",
+                self.redis_password,
+                "--maxmemory",
+                "512mb",
+            ],
+        )
+        return result.stdout.strip()
+
+    def _start_replica(self, docker: str) -> str:
+        result = self._run(
+            docker,
+            [
+                "run",
+                "--rm",
+                "-d",
+                "--name",
+                self._replica_name,
+                "--network",
+                self._network_name,
+                "--publish",
+                f"{self.replica_port}:6379",
+                "--add-host",
+                "host.docker.internal:host-gateway",
+                "redis:7.2-bookworm",
+                "redis-server",
+                "--replicaof",
+                "host.docker.internal",
+                str(self.master_port),
+                "--masterauth",
+                self.redis_password,
+                "--requirepass",
+                self.redis_password,
+                "--replica-announce-ip",
+                "host.docker.internal",
+                "--replica-announce-port",
+                str(self.replica_port),
+                "--save",
+                "",
+                "--appendonly",
+                "no",
+                "--protected-mode",
+                "no",
+                "--maxmemory",
+                "512mb",
+            ],
+        )
+        return result.stdout.strip()
+
+    def _start_sentinel(self, docker: str, name: str, port: int) -> str:
+        sentinel_command = "\n".join(
+            [
+                "cat <<'EOF' >/tmp/sentinel.conf",
+                "port 26379",
+                "dir /tmp",
+                "protected-mode no",
+                "sentinel resolve-hostnames yes",
+                "sentinel announce-hostnames yes",
+                f"sentinel monitor {self.service_name} host.docker.internal {self.master_port} 2",
+                f"sentinel auth-pass {self.service_name} {self.redis_password}",
+                f"sentinel down-after-milliseconds {self.service_name} 3000",
+                f"sentinel failover-timeout {self.service_name} 10000",
+                f"sentinel parallel-syncs {self.service_name} 1",
+                "EOF",
+                "redis-server /tmp/sentinel.conf --sentinel",
+            ]
+        )
+        result = self._run(
+            docker,
+            [
+                "run",
+                "--rm",
+                "-d",
+                "--name",
+                name,
+                "--network",
+                self._network_name,
+                "--publish",
+                f"{port}:26379",
+                "--add-host",
+                "host.docker.internal:host-gateway",
+                "redis:7.2-bookworm",
+                "sh",
+                "-c",
+                sentinel_command,
+            ],
+        )
+        return result.stdout.strip()
+
+    def _run(self, docker: str, args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [docker, *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
 
 
 class FluxiEngineAsyncTestCase(unittest.IsolatedAsyncioTestCase):
@@ -187,7 +475,10 @@ class FluxiEngineAsyncTestCase(unittest.IsolatedAsyncioTestCase):
         entries = await self.store.redis.xrange(stream_key)
         entry_id, values = entries[-1]
         payload = values[b"payload"] if b"payload" in values else values["payload"]
-        return (entry_id.decode("utf-8") if isinstance(entry_id, bytes) else entry_id, unpackb(payload))
+        return (
+            entry_id.decode("utf-8") if isinstance(entry_id, bytes) else entry_id,
+            unpackb(payload),
+        )
 
     async def read_group_message(
         self,
@@ -206,7 +497,10 @@ class FluxiEngineAsyncTestCase(unittest.IsolatedAsyncioTestCase):
         stream_messages = messages[0][1]
         message_id, values = stream_messages[0]
         payload = values[b"payload"] if b"payload" in values else values["payload"]
-        return (message_id.decode("utf-8") if isinstance(message_id, bytes) else message_id, unpackb(payload))
+        return (
+            message_id.decode("utf-8") if isinstance(message_id, bytes) else message_id,
+            unpackb(payload),
+        )
 
     def workflow_stream_key(self, task_queue: str = "orders") -> str:
         return workflow_queue(self.settings.key_prefix, task_queue)
@@ -216,3 +510,42 @@ class FluxiEngineAsyncTestCase(unittest.IsolatedAsyncioTestCase):
 
     def payload_b64(self, payload: object) -> str:
         return base64.b64encode(packb(payload)).decode("ascii")
+
+
+class FluxiSentinelEngineAsyncTestCase(FluxiEngineAsyncTestCase):
+    harness: SentinelHarness
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        unittest.IsolatedAsyncioTestCase.setUpClass()
+        cls.harness = SentinelHarness()
+        cls.harness.start()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        cls.harness.stop()
+        unittest.IsolatedAsyncioTestCase.tearDownClass()
+
+    async def asyncSetUp(self) -> None:
+        self.settings = FluxiSettings(
+            redis_mode="sentinel",
+            redis_url=self.harness.redis_url,
+            sentinel_endpoints=self.harness.sentinel_endpoints,
+            sentinel_service_name=self.harness.service_name,
+            key_prefix=f"fluxi-sentinel-test:{self._testMethodName}",
+            workflow_task_timeout_ms=50,
+            result_poll_interval_ms=10,
+            timer_poll_interval_ms=10,
+            pending_idle_threshold_ms=1,
+            pending_claim_count=100,
+        )
+        redis = create_redis_client(self.settings)
+        self.store = FluxiRedisStore(redis, self.settings)
+        await self._wait_until_redis_ready()
+        await self.store.flushdb()
+
+        app = create_app(self.settings, store=self.store)
+        app.state.store = self.store
+        app.state.settings = self.settings
+        transport = httpx.ASGITransport(app=app)
+        self.client = httpx.AsyncClient(transport=transport, base_url="http://testserver")
