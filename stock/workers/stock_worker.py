@@ -19,8 +19,8 @@ from msgspec import Struct, msgpack
 
 from fluxi_sdk import activity
 from fluxi_sdk.client import WorkflowClient
+from fluxi_sdk.client import EngineConnectionConfig
 from fluxi_sdk.examples.checkout import StockReservation, StockUnavailableError
-from fluxi_sdk.runtime.redis import RedisFluxiRuntime
 from fluxi_sdk.worker import Worker
 
 
@@ -64,14 +64,14 @@ def release_stock(item_id: str, quantity: int) -> StockReservation:
 
 
 async def main() -> None:
-    runtime = RedisFluxiRuntime(redis_url=os.environ["FLUXI_REDIS_URL"])
-    client = WorkflowClient.connect(runtime=runtime)
+    engine = EngineConnectionConfig.from_env()
+    client = WorkflowClient.connect(engine=engine)
     worker = Worker(
         client,
         task_queue="stock",
         activities=[reserve_stock, release_stock],
     )
-    await worker.run_forever()
+    await worker.run()
 
 
 if __name__ == "__main__":

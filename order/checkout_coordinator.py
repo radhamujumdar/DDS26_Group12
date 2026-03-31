@@ -125,10 +125,10 @@ def build_checkout_coordinator(
             logger=logger,
         )
     if mode == "fluxi":
-        from fluxi_sdk.runtime.redis import RedisFluxiRuntime  # noqa: PLC0415
+        from fluxi_sdk.client import EngineConnectionConfig  # noqa: PLC0415
 
-        runtime = RedisFluxiRuntime(redis_url=os.environ["FLUXI_REDIS_URL"])
-        client = WorkflowClient.connect(runtime=runtime)
+        engine = EngineConnectionConfig.from_env()
+        client = WorkflowClient.connect(engine=engine)
         return FluxiCheckoutCoordinator(client=client, logger=logger)
     raise ValueError(
         "ORDER_CHECKOUT_COORDINATOR must be either 'legacy' or 'fluxi'."
