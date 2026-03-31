@@ -30,13 +30,14 @@ Basic project structure with Python's Flask and Redis.
     Folder containing some basic correctness tests for the entire system. (Feel free to enhance them)
 
 * `docs`
-    Additional project documentation, including the Fluxi phase-1 bootstrap guide in `docs/phase-1-fluxi-bootstrap.md`.
+    Additional project documentation, including the Fluxi phase-1 bootstrap guide in `docs/phase-1-fluxi-bootstrap.md` and Sentinel HA notes in `docs/fluxi-ha.md`.
 
 ### Deployment types:
 
 #### docker-compose (local development)
 
-After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct
+After coding the REST endpoint logic run `docker-compose up --build` in the base folder to test if your logic is correct.
+The Fluxi engine services now use Redis Sentinel discovery in the local Compose deployment; see `docs/fluxi-ha.md` for the required env contract and failover behavior.
 (you can use the provided tests in the `\test` folder and change them as you wish). 
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 

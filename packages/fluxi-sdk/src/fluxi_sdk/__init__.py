@@ -2,7 +2,7 @@
 
 from . import activity, client, errors, testing, types, worker, workflow
 from .activity import ActivityRegistration, ActivityRegistry
-from .client import WorkflowClient
+from .client import EngineConnectionConfig, WorkflowClient
 from .testing import (
     ActivityExecutionRecord,
     FakeFluxiRuntime,
@@ -18,6 +18,7 @@ __all__ = [
     "ActivityRegistry",
     "ActivityExecutionRecord",
     "ActivityOptions",
+    "EngineConnectionConfig",
     "FakeFluxiRuntime",
     "RetryPolicy",
     "StartPolicy",

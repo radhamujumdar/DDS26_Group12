@@ -9,7 +9,7 @@ from .client import WorkflowClient
 
 
 class Worker:
-    """Phase-1 in-process worker that owns registration and queue binding."""
+    """Worker facade that owns queue binding and backend lifecycle."""
 
     def __init__(
         self,
@@ -37,20 +37,24 @@ class Worker:
     def running(self) -> bool:
         return self._running
 
-    async def run(self) -> None:
+    async def start(self) -> None:
         if self._running:
             return
-        self._client._activate_worker_binding(self._binding)
+        await self._binding.start()
         self._running = True
+
+    async def run(self) -> None:
+        await self.start()
+        await self._binding.wait()
 
     async def shutdown(self) -> None:
         if not self._running:
             return
-        self._client._deactivate_worker_binding(self._binding)
+        await self._binding.shutdown()
         self._running = False
 
     async def __aenter__(self) -> Worker:
-        await self.run()
+        await self.start()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:

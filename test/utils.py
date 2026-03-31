@@ -1,6 +1,11 @@
+import os
+
 import requests
 
-ORDER_URL = STOCK_URL = PAYMENT_URL = "http://127.0.0.1:8000"
+ORDER_URL = STOCK_URL = PAYMENT_URL = os.getenv(
+    "DDS_GATEWAY_URL",
+    "http://127.0.0.1:8000",
+)
 
 
 ########################################################################################################################

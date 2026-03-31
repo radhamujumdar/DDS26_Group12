@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fluxi-engine"
+version = "0.1.0"
+description = "Fluxi Redis-backed workflow engine"
+requires-python = ">=3.12"
+dependencies = [
+    "msgpack==1.1.0",
+    "msgspec==0.19.0",
+    "redis==5.0.3",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -9,6 +9,7 @@ from .checkout import (
     ReferenceCheckoutState,
     ReferenceCheckoutWorkflow,
     StockReservation,
+    create_reference_checkout_engine_environment,
     create_reference_checkout_environment,
     create_reference_checkout_workers,
 )
@@ -22,6 +23,7 @@ __all__ = [
     "ReferenceCheckoutState",
     "ReferenceCheckoutWorkflow",
     "StockReservation",
+    "create_reference_checkout_engine_environment",
     "create_reference_checkout_environment",
     "create_reference_checkout_workers",
 ]

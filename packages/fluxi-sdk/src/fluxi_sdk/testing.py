@@ -66,6 +66,23 @@ class _WorkerBinding:
     workflows: tuple[WorkflowRegistration, ...]
     activities: tuple[ActivityRegistration, ...]
     running: bool = False
+    _stopped: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def start(self) -> None:
+        if self.running:
+            return
+        if self._stopped.is_set():
+            self._stopped = asyncio.Event()
+        self.running = True
+
+    async def wait(self) -> None:
+        await self._stopped.wait()
+
+    async def shutdown(self) -> None:
+        if not self.running:
+            return
+        self.running = False
+        self._stopped.set()
 
 
 class FakeFluxiRuntime:
@@ -278,12 +295,6 @@ class FakeFluxiRuntime:
         )
         self._worker_bindings.append(binding)
         return binding
-
-    def _activate_worker_binding(self, binding: _WorkerBinding) -> None:
-        binding.running = True
-
-    def _deactivate_worker_binding(self, binding: _WorkerBinding) -> None:
-        binding.running = False
 
     def _ensure_workflow_registered(
         self,
