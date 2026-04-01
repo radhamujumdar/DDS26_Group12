@@ -52,26 +52,50 @@ class StockRepository:
         return msgpack.decode(raw, type=StockValue)
 
     async def add_stock(self, item_id: str, amount: int) -> StockValue:
-        item = await self.get_item(item_id)
-        item.stock += amount
-        try:
-            await self._redis.set(item_id, msgpack.encode(item))
-        except RedisError as exc:
-            raise DatabaseError("DB error") from exc
-        return item
+        while True:
+            try:
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    await pipe.watch(item_id)
+                    raw = await pipe.get(item_id)
+                    if raw is None:
+                        raise StockItemNotFoundError(f"Item: {item_id} not found!")
+
+                    item = msgpack.decode(raw, type=StockValue)
+                    item.stock += amount
+
+                    pipe.multi()
+                    pipe.set(item_id, msgpack.encode(item))
+                    await pipe.execute()
+                    return item
+            except WatchError:
+                continue
+            except RedisError as exc:
+                raise DatabaseError("DB error") from exc
 
     async def subtract_stock(self, item_id: str, amount: int) -> StockValue:
-        item = await self.get_item(item_id)
-        item.stock -= amount
-        if item.stock < 0:
-            raise StockInsufficientError(
-                f"Item: {item_id} stock cannot get reduced below zero!"
-            )
-        try:
-            await self._redis.set(item_id, msgpack.encode(item))
-        except RedisError as exc:
-            raise DatabaseError("DB error") from exc
-        return item
+        while True:
+            try:
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    await pipe.watch(item_id)
+                    raw = await pipe.get(item_id)
+                    if raw is None:
+                        raise StockItemNotFoundError(f"Item: {item_id} not found!")
+
+                    item = msgpack.decode(raw, type=StockValue)
+                    item.stock -= amount
+                    if item.stock < 0:
+                        raise StockInsufficientError(
+                            f"Item: {item_id} stock cannot get reduced below zero!"
+                        )
+
+                    pipe.multi()
+                    pipe.set(item_id, msgpack.encode(item))
+                    await pipe.execute()
+                    return item
+            except WatchError:
+                continue
+            except RedisError as exc:
+                raise DatabaseError("DB error") from exc
 
     async def reserve_stock_idempotent(
         self,

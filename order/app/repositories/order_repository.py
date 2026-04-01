@@ -82,11 +82,26 @@ class OrderRepository:
         quantity: int,
         item_price: int,
     ) -> OrderValue:
-        order_entry = await self.get_order(order_id)
-        order_entry.items.append((item_id, quantity))
-        order_entry.total_cost += quantity * item_price
-        await self.save_order(order_id, order_entry)
-        return order_entry
+        while True:
+            try:
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    await pipe.watch(order_id)
+                    raw = await pipe.get(order_id)
+                    if raw is None:
+                        raise OrderNotFoundError(f"Order {order_id!r} not found")
+
+                    order_entry = msgpack.decode(raw, type=OrderValue)
+                    order_entry.items.append((item_id, quantity))
+                    order_entry.total_cost += quantity * item_price
+
+                    pipe.multi()
+                    pipe.set(order_id, msgpack.encode(order_entry))
+                    await pipe.execute()
+                    return order_entry
+            except WatchError:
+                continue
+            except RedisError as exc:
+                raise DatabaseError("DB error") from exc
 
     async def load_checkout_order(self, order_id: str) -> CheckoutOrder:
         entry = await self.get_order(order_id)

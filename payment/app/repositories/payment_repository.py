@@ -51,26 +51,50 @@ class PaymentRepository:
         return msgpack.decode(raw, type=UserValue)
 
     async def add_funds(self, user_id: str, amount: int) -> UserValue:
-        entry = await self.get_user(user_id)
-        entry.credit += amount
-        try:
-            await self._redis.set(user_id, msgpack.encode(entry))
-        except RedisError as exc:
-            raise DatabaseError("DB error") from exc
-        return entry
+        while True:
+            try:
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    await pipe.watch(user_id)
+                    raw = await pipe.get(user_id)
+                    if raw is None:
+                        raise UserNotFoundError(f"User: {user_id} not found!")
+
+                    entry = msgpack.decode(raw, type=UserValue)
+                    entry.credit += amount
+
+                    pipe.multi()
+                    pipe.set(user_id, msgpack.encode(entry))
+                    await pipe.execute()
+                    return entry
+            except WatchError:
+                continue
+            except RedisError as exc:
+                raise DatabaseError("DB error") from exc
 
     async def pay(self, user_id: str, amount: int) -> UserValue:
-        entry = await self.get_user(user_id)
-        entry.credit -= amount
-        if entry.credit < 0:
-            raise InsufficientCreditError(
-                f"User: {user_id} credit cannot get reduced below zero!"
-            )
-        try:
-            await self._redis.set(user_id, msgpack.encode(entry))
-        except RedisError as exc:
-            raise DatabaseError("DB error") from exc
-        return entry
+        while True:
+            try:
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    await pipe.watch(user_id)
+                    raw = await pipe.get(user_id)
+                    if raw is None:
+                        raise UserNotFoundError(f"User: {user_id} not found!")
+
+                    entry = msgpack.decode(raw, type=UserValue)
+                    entry.credit -= amount
+                    if entry.credit < 0:
+                        raise InsufficientCreditError(
+                            f"User: {user_id} credit cannot get reduced below zero!"
+                        )
+
+                    pipe.multi()
+                    pipe.set(user_id, msgpack.encode(entry))
+                    await pipe.execute()
+                    return entry
+            except WatchError:
+                continue
+            except RedisError as exc:
+                raise DatabaseError("DB error") from exc
 
     async def charge_payment_idempotent(
         self,

@@ -83,15 +83,25 @@ class ReferenceCheckoutWorkflow:
         order = await workflow.execute_activity("load_order", order_id)
         reservations: list[StockReservation] = []
 
-        for item in order.items:
-            reservation = await workflow.execute_activity(
-                "reserve_stock",
-                item.item_id,
-                item.quantity,
-                task_queue="stock",
-                schedule_to_close_timeout=timedelta(seconds=30),
-            )
-            reservations.append(reservation)
+        try:
+            for item in order.items:
+                reservation = await workflow.execute_activity(
+                    "reserve_stock",
+                    item.item_id,
+                    item.quantity,
+                    task_queue="stock",
+                    schedule_to_close_timeout=timedelta(seconds=30),
+                )
+                reservations.append(reservation)
+        except StockUnavailableError:
+            for reservation in reversed(reservations):
+                await workflow.execute_activity(
+                    "release_stock",
+                    reservation.item_id,
+                    reservation.quantity,
+                    task_queue="stock",
+                )
+            raise
 
         try:
             payment = await workflow.execute_activity(

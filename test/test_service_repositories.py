@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 import fluxi_sdk_test_support  # noqa: F401
@@ -42,8 +43,58 @@ class RepositoryRedisAsyncTestCase(unittest.IsolatedAsyncioTestCase):
         except TypeError:
             await self.redis.aclose()
 
+    def create_redis_client(self) -> Redis:
+        if self.harness.url is None:
+            raise unittest.SkipTest("No Redis URL available for repository tests.")
+        return Redis.from_url(self.harness.url, decode_responses=False)
+
+    async def close_redis_clients(self, *clients: Redis) -> None:
+        for client in clients:
+            try:
+                await client.aclose(close_connection_pool=True)
+            except TypeError:
+                await client.aclose()
+
 
 class TestServiceRepositories(RepositoryRedisAsyncTestCase):
+    async def test_order_add_item_accumulates_concurrent_updates(self) -> None:
+        repository = OrderRepository(self.redis)
+        await self.redis.set(
+            "order-concurrent",
+            msgpack.encode(
+                OrderValue(
+                    paid=False,
+                    items=[],
+                    user_id="user-1",
+                    total_cost=0,
+                )
+            ),
+        )
+        clients = [self.create_redis_client() for _ in range(12)]
+        repositories = [OrderRepository(client) for client in clients]
+
+        try:
+            await asyncio.gather(
+                *(
+                    repo.add_item(
+                        "order-concurrent",
+                        item_id=f"item-{index}",
+                        quantity=1,
+                        item_price=10,
+                    )
+                    for index, repo in enumerate(repositories)
+                )
+            )
+        finally:
+            await self.close_redis_clients(*clients)
+
+        order = await repository.get_order("order-concurrent")
+        self.assertEqual(order.total_cost, 120)
+        self.assertCountEqual(
+            order.items,
+            [(f"item-{index}", 1) for index in range(12)],
+        )
+
     async def test_stock_reserve_is_idempotent_across_duplicate_delivery(self) -> None:
         repository = StockRepository(self.redis)
         await self.redis.set("item-1", msgpack.encode(StockValue(stock=5, price=10)))
@@ -86,6 +137,50 @@ class TestServiceRepositories(RepositoryRedisAsyncTestCase):
         item = await repository.get_item("item-2")
         self.assertEqual(item.stock, 11)
 
+    async def test_stock_add_stock_accumulates_concurrent_updates(self) -> None:
+        repository = StockRepository(self.redis)
+        await self.redis.set(
+            "item-concurrent",
+            msgpack.encode(StockValue(stock=0, price=10)),
+        )
+        clients = [self.create_redis_client() for _ in range(20)]
+        repositories = [StockRepository(client) for client in clients]
+
+        try:
+            await asyncio.gather(
+                *(repo.add_stock("item-concurrent", 1) for repo in repositories)
+            )
+        finally:
+            await self.close_redis_clients(*clients)
+
+        item = await repository.get_item("item-concurrent")
+        self.assertEqual(item.stock, 20)
+
+    async def test_stock_subtract_rejects_concurrent_oversubscription(self) -> None:
+        repository = StockRepository(self.redis)
+        await self.redis.set(
+            "item-oversubscribe",
+            msgpack.encode(StockValue(stock=1, price=10)),
+        )
+        clients = [self.create_redis_client() for _ in range(2)]
+        repositories = [StockRepository(client) for client in clients]
+
+        try:
+            results = await asyncio.gather(
+                *(repo.subtract_stock("item-oversubscribe", 1) for repo in repositories),
+                return_exceptions=True,
+            )
+        finally:
+            await self.close_redis_clients(*clients)
+
+        successes = [result for result in results if not isinstance(result, Exception)]
+        failures = [result for result in results if isinstance(result, Exception)]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], StockInsufficientError)
+        item = await repository.get_item("item-oversubscribe")
+        self.assertEqual(item.stock, 0)
+
     async def test_payment_charge_is_idempotent_across_duplicate_delivery(self) -> None:
         repository = PaymentRepository(self.redis)
         await self.redis.set("user-1", msgpack.encode(UserValue(credit=30)))
@@ -127,6 +222,44 @@ class TestServiceRepositories(RepositoryRedisAsyncTestCase):
 
         user = await repository.get_user("user-2")
         self.assertEqual(user.credit, 55)
+
+    async def test_payment_add_funds_accumulates_concurrent_updates(self) -> None:
+        repository = PaymentRepository(self.redis)
+        await self.redis.set("user-concurrent", msgpack.encode(UserValue(credit=0)))
+        clients = [self.create_redis_client() for _ in range(20)]
+        repositories = [PaymentRepository(client) for client in clients]
+
+        try:
+            await asyncio.gather(
+                *(repo.add_funds("user-concurrent", 1) for repo in repositories)
+            )
+        finally:
+            await self.close_redis_clients(*clients)
+
+        user = await repository.get_user("user-concurrent")
+        self.assertEqual(user.credit, 20)
+
+    async def test_payment_pay_rejects_concurrent_oversubscription(self) -> None:
+        repository = PaymentRepository(self.redis)
+        await self.redis.set("user-oversubscribe", msgpack.encode(UserValue(credit=1)))
+        clients = [self.create_redis_client() for _ in range(2)]
+        repositories = [PaymentRepository(client) for client in clients]
+
+        try:
+            results = await asyncio.gather(
+                *(repo.pay("user-oversubscribe", 1) for repo in repositories),
+                return_exceptions=True,
+            )
+        finally:
+            await self.close_redis_clients(*clients)
+
+        successes = [result for result in results if not isinstance(result, Exception)]
+        failures = [result for result in results if isinstance(result, Exception)]
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], InsufficientCreditError)
+        user = await repository.get_user("user-oversubscribe")
+        self.assertEqual(user.credit, 0)
 
     async def test_mark_order_paid_is_idempotent_across_duplicate_delivery(self) -> None:
         repository = OrderRepository(self.redis)
