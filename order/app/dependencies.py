@@ -56,6 +56,7 @@ async def build_order_api_container() -> OrderApiContainer:
 
 
 async def close_order_api_container(container: OrderApiContainer) -> None:
+    await container.checkout_service.aclose()
     await container.gateway_client.aclose()
     await close_redis_client(container.redis)
 

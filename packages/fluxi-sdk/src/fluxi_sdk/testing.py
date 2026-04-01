@@ -108,6 +108,9 @@ class FakeFluxiRuntime:
     def create_client(self) -> WorkflowClient:
         return self._client
 
+    async def aclose(self) -> None:
+        return
+
     def register_workflow(
         self,
         workflow_cls: type[Any],

@@ -1,6 +1,7 @@
 import inspect
 from datetime import timedelta
 import unittest
+from unittest import mock
 
 import fluxi_sdk_test_support  # noqa: F401
 
@@ -14,6 +15,7 @@ from fluxi_sdk import (
     WorkflowClient,
 )
 from fluxi_sdk import activity, client, errors, testing, types, worker, workflow
+from fluxi_sdk._engine_backend import EngineWorkflowBackend
 
 
 class TestFluxiSdkContract(unittest.TestCase):
@@ -115,6 +117,12 @@ class TestFluxiSdkContract(unittest.TestCase):
         self.assertEqual(config.server_url, "http://localhost:8000")
         self.assertEqual(config.redis_url, "redis://localhost:6379/0")
         self.assertEqual(config.result_wait_timeout_ms, 5000)
+        self.assertEqual(config.http_connect_timeout_seconds, 2.0)
+        self.assertEqual(config.http_read_timeout_seconds, 10.0)
+        self.assertEqual(config.http_write_timeout_seconds, 10.0)
+        self.assertEqual(config.http_pool_timeout_seconds, 1.0)
+        self.assertEqual(config.http_max_connections, 32)
+        self.assertEqual(config.http_max_keepalive_connections, 16)
 
     def test_connect_requires_explicit_backend_selection(self):
         with self.assertRaises(TypeError):
@@ -171,6 +179,41 @@ class TestFluxiSdkContract(unittest.TestCase):
             value = "ok"
 
         self.assertEqual(value, "ok")
+
+class TestFluxiSdkEngineHttpClient(unittest.IsolatedAsyncioTestCase):
+    async def test_engine_backend_uses_separate_reused_http_clients(self):
+        config = EngineConnectionConfig(
+            server_url="http://localhost:8000",
+            redis_url="redis://localhost:6379/0",
+        )
+        backend = EngineWorkflowBackend(config)
+        created_clients: list[_FakeAsyncClient] = []
+
+        def _factory(_: EngineConnectionConfig) -> _FakeAsyncClient:
+            client = _FakeAsyncClient()
+            created_clients.append(client)
+            return client
+
+        with mock.patch("fluxi_sdk._engine_backend._build_http_client", side_effect=_factory):
+            control_first = await backend._get_control_http_client()
+            control_second = await backend._get_control_http_client()
+            result_first = await backend._get_result_http_client()
+            result_second = await backend._get_result_http_client()
+            self.assertIs(control_first, control_second)
+            self.assertIs(result_first, result_second)
+            self.assertIsNot(control_first, result_first)
+            self.assertEqual(len(created_clients), 2)
+            await backend.aclose()
+            self.assertTrue(control_first.is_closed)
+            self.assertTrue(result_first.is_closed)
+
+
+class _FakeAsyncClient:
+    def __init__(self) -> None:
+        self.is_closed = False
+
+    async def aclose(self) -> None:
+        self.is_closed = True
 
 
 if __name__ == "__main__":

@@ -65,6 +65,10 @@ logger = logging.getLogger(__name__)
 class EngineWorkflowBackend:
     def __init__(self, config: EngineConnectionConfig) -> None:
         self._config = config
+        self._control_http_client: httpx.AsyncClient | None = None
+        self._result_http_client: httpx.AsyncClient | None = None
+        self._control_client_lock: asyncio.Lock | None = None
+        self._result_client_lock: asyncio.Lock | None = None
 
     async def _execute_workflow(
         self,
@@ -79,48 +83,90 @@ class EngineWorkflowBackend:
         run_callable = _get_workflow_run_callable(workflow_ref)
         input_payload = encode_args_payload(args)
 
-        async with httpx.AsyncClient(base_url=self._config.server_url.rstrip("/")) as client:
-            start_request = {
-                "workflow_id": workflow_id,
-                "workflow_name": workflow_name,
-                "task_queue": task_queue,
-                "start_policy": start_policy.value,
-                "input_payload_b64": to_base64(input_payload),
-            }
-            body = await self._start_or_attach(
-                client,
-                request=start_request,
-                start_policy=start_policy,
-            )
-            terminal = _resolve_terminal_start_response(
-                body,
-                workflow_id=workflow_id,
-            )
-            if terminal is not _PENDING_RESULT:
-                if terminal["status"] == "completed":
-                    return _decode_workflow_result(
-                        terminal.get("result_payload_b64"),
-                        run_callable,
-                    )
-                if terminal["status"] == "failed":
-                    raise _decode_workflow_failure(terminal.get("error_payload_b64"))
-
-            while True:
-                snapshot = await self._poll_workflow_result(
-                    client,
-                    workflow_id=workflow_id,
-                    start_policy=start_policy,
-                    start_request=start_request,
+        control_client = await self._get_control_http_client()
+        start_request = {
+            "workflow_id": workflow_id,
+            "workflow_name": workflow_name,
+            "task_queue": task_queue,
+            "start_policy": start_policy.value,
+            "input_payload_b64": to_base64(input_payload),
+        }
+        body = await self._start_or_attach(
+            control_client,
+            request=start_request,
+            start_policy=start_policy,
+        )
+        terminal = _resolve_terminal_start_response(
+            body,
+            workflow_id=workflow_id,
+        )
+        if terminal is not _PENDING_RESULT:
+            if terminal["status"] == "completed":
+                return _decode_workflow_result(
+                    terminal.get("result_payload_b64"),
+                    run_callable,
                 )
-                if snapshot is _PENDING_RESULT:
-                    continue
-                if snapshot["status"] == "completed":
-                    return _decode_workflow_result(
-                        snapshot.get("result_payload_b64"),
-                        run_callable,
-                    )
-                if snapshot["status"] == "failed":
-                    raise _decode_workflow_failure(snapshot.get("error_payload_b64"))
+            if terminal["status"] == "failed":
+                raise _decode_workflow_failure(terminal.get("error_payload_b64"))
+
+        while True:
+            snapshot = await self._poll_workflow_result(
+                await self._get_result_http_client(),
+                workflow_id=workflow_id,
+                start_policy=start_policy,
+                start_request=start_request,
+                control_client=control_client,
+            )
+            if snapshot is _PENDING_RESULT:
+                continue
+            if snapshot["status"] == "completed":
+                return _decode_workflow_result(
+                    snapshot.get("result_payload_b64"),
+                    run_callable,
+                )
+            if snapshot["status"] == "failed":
+                raise _decode_workflow_failure(snapshot.get("error_payload_b64"))
+
+    async def aclose(self) -> None:
+        control_client = self._control_http_client
+        result_client = self._result_http_client
+        self._control_http_client = None
+        self._result_http_client = None
+        clients = []
+        if control_client is not None and not control_client.is_closed:
+            clients.append(control_client.aclose())
+        if result_client is not None and not result_client.is_closed:
+            clients.append(result_client.aclose())
+        if clients:
+            await asyncio.gather(*clients)
+
+    async def _get_control_http_client(self) -> httpx.AsyncClient:
+        client = self._control_http_client
+        if client is not None and not client.is_closed:
+            return client
+        if self._control_client_lock is None:
+            self._control_client_lock = asyncio.Lock()
+        async with self._control_client_lock:
+            client = self._control_http_client
+            if client is not None and not client.is_closed:
+                return client
+            client = _build_http_client(self._config)
+            self._control_http_client = client
+            return client
+
+    async def _get_result_http_client(self) -> httpx.AsyncClient:
+        client = self._result_http_client
+        if client is not None and not client.is_closed:
+            return client
+        if self._result_client_lock is None:
+            self._result_client_lock = asyncio.Lock()
+        async with self._result_client_lock:
+            client = self._result_http_client
+            if client is not None and not client.is_closed:
+                return client
+            client = _build_http_client(self._config)
+            self._result_http_client = client
+            return client
 
     async def _start_or_attach(
         self,
@@ -149,6 +195,7 @@ class EngineWorkflowBackend:
         workflow_id: str,
         start_policy: StartPolicy,
         start_request: dict[str, Any],
+        control_client: httpx.AsyncClient,
     ) -> dict[str, Any] | object:
         while True:
             try:
@@ -161,7 +208,7 @@ class EngineWorkflowBackend:
                     404,
                 ):
                     body = await self._start_or_attach(
-                        client,
+                        control_client,
                         request=start_request,
                         start_policy=start_policy,
                     )
@@ -276,7 +323,7 @@ class _EngineWorkerBinding:
         self._activity_inflight = set()
         redis = create_redis_client(self._settings)
         self._redis_store = FluxiRedisStore(redis, self._settings)
-        self._http_client = httpx.AsyncClient(base_url=self.config.server_url.rstrip("/"))
+        self._http_client = _build_http_client(self.config)
 
         if self.workflows:
             await self._redis_store.ensure_workflow_queue(self.task_queue)
@@ -1081,3 +1128,19 @@ def _should_retry_start_request(
 
 def _is_missing_stream_group_error(exc: ResponseError) -> bool:
     return "NOGROUP" in str(exc).upper()
+
+
+def _build_http_client(config: EngineConnectionConfig) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        base_url=config.server_url.rstrip("/"),
+        timeout=httpx.Timeout(
+            connect=config.http_connect_timeout_seconds,
+            read=config.http_read_timeout_seconds,
+            write=config.http_write_timeout_seconds,
+            pool=config.http_pool_timeout_seconds,
+        ),
+        limits=httpx.Limits(
+            max_connections=config.http_max_connections,
+            max_keepalive_connections=config.http_max_keepalive_connections,
+        ),
+    )

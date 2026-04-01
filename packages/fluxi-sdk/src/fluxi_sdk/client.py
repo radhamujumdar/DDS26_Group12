@@ -40,6 +40,12 @@ class EngineConnectionConfig:
     activity_consumer_group: str = "fluxi-activity-workers"
     result_wait_timeout_ms: int = 5000
     result_poll_interval_ms: int = 100
+    http_connect_timeout_seconds: float = 2.0
+    http_read_timeout_seconds: float = 10.0
+    http_write_timeout_seconds: float = 10.0
+    http_pool_timeout_seconds: float = 1.0
+    http_max_connections: int = 32
+    http_max_keepalive_connections: int = 16
 
     def __post_init__(self) -> None:
         mode = self.redis_mode.strip().lower()
@@ -72,6 +78,22 @@ class EngineConnectionConfig:
             raise ValueError("sentinel_min_other_sentinels must be at least 0.")
         if self.result_wait_timeout_ms < 0:
             raise ValueError("result_wait_timeout_ms must be at least 0.")
+        if self.http_connect_timeout_seconds <= 0:
+            raise ValueError("http_connect_timeout_seconds must be greater than 0.")
+        if self.http_read_timeout_seconds <= 0:
+            raise ValueError("http_read_timeout_seconds must be greater than 0.")
+        if self.http_write_timeout_seconds <= 0:
+            raise ValueError("http_write_timeout_seconds must be greater than 0.")
+        if self.http_pool_timeout_seconds <= 0:
+            raise ValueError("http_pool_timeout_seconds must be greater than 0.")
+        if self.http_max_connections < 1:
+            raise ValueError("http_max_connections must be at least 1.")
+        if self.http_max_keepalive_connections < 1:
+            raise ValueError("http_max_keepalive_connections must be at least 1.")
+        if self.http_max_keepalive_connections > self.http_max_connections:
+            raise ValueError(
+                "http_max_keepalive_connections cannot exceed http_max_connections."
+            )
 
         if mode == "sentinel":
             if not sentinel_service_name:
@@ -124,6 +146,42 @@ class EngineConnectionConfig:
                     str(defaults.result_poll_interval_ms),
                 )
             ),
+            http_connect_timeout_seconds=float(
+                _env(
+                    "FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS",
+                    str(defaults.http_connect_timeout_seconds),
+                )
+            ),
+            http_read_timeout_seconds=float(
+                _env(
+                    "FLUXI_HTTP_READ_TIMEOUT_SECONDS",
+                    str(defaults.http_read_timeout_seconds),
+                )
+            ),
+            http_write_timeout_seconds=float(
+                _env(
+                    "FLUXI_HTTP_WRITE_TIMEOUT_SECONDS",
+                    str(defaults.http_write_timeout_seconds),
+                )
+            ),
+            http_pool_timeout_seconds=float(
+                _env(
+                    "FLUXI_HTTP_POOL_TIMEOUT_SECONDS",
+                    str(defaults.http_pool_timeout_seconds),
+                )
+            ),
+            http_max_connections=int(
+                _env(
+                    "FLUXI_HTTP_MAX_CONNECTIONS",
+                    str(defaults.http_max_connections),
+                )
+            ),
+            http_max_keepalive_connections=int(
+                _env(
+                    "FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS",
+                    str(defaults.http_max_keepalive_connections),
+                )
+            ),
         )
 
 
@@ -155,6 +213,8 @@ class _WorkflowClientBackend(Protocol):
         max_concurrent_workflow_tasks: int,
         max_concurrent_activity_tasks: int,
     ) -> _WorkerBindingBackend: ...
+
+    async def aclose(self) -> None: ...
 
 
 class WorkflowClient:
@@ -229,6 +289,9 @@ class WorkflowClient:
         workflow: WorkflowReference,
     ) -> str:
         return _get_workflow_name(workflow)
+
+    async def aclose(self) -> None:
+        await self._backend.aclose()
 
 
 def _coalesce_workflow_id(id: str | None, workflow_key: str | None) -> str:

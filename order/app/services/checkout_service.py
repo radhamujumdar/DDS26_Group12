@@ -34,3 +34,6 @@ class CheckoutService:
         if result.status != "paid":
             raise RuntimeError(f"Unsupported terminal checkout status: {result.status}")
         return "Checkout successful"
+
+    async def aclose(self) -> None:
+        await self._client.aclose()

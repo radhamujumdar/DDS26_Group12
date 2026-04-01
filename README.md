@@ -40,6 +40,22 @@ After coding the REST endpoint logic run `docker-compose up --build` in the base
 The Fluxi engine services now use Redis Sentinel discovery in the local Compose deployment; see `docs/fluxi-ha.md` for the required env contract and failover behavior.
 (you can use the provided tests in the `\test` folder and change them as you wish). 
 
+For Fluxi-heavy benchmark runs, the local Compose deployment is tuned with:
+- `fluxi-server` running multiple Uvicorn workers via `FLUXI_SERVER_WORKERS` (default `4`)
+- `order-checkout-worker` using `FLUXI_ORDER_WORKFLOW_CONCURRENCY` (default `8`) and `FLUXI_ORDER_ACTIVITY_CONCURRENCY` (default `4`)
+- `stock-activity-worker` using `FLUXI_STOCK_ACTIVITY_CONCURRENCY` (default `16`)
+- `payment-activity-worker` using `FLUXI_PAYMENT_ACTIVITY_CONCURRENCY` (default `16`)
+
+You can scale the hot roles further during stress tests, for example:
+
+```bash
+docker compose up -d --build \
+  --scale fluxi-server=2 \
+  --scale order-checkout-worker=2 \
+  --scale stock-activity-worker=2 \
+  --scale payment-activity-worker=2
+```
+
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 
 K8s is also possible, but we do not require it as part of your submission. 

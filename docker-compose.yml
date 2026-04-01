@@ -23,7 +23,13 @@ services:
       - FLUXI_SENTINEL_ENDPOINTS=fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
       - FLUXI_SENTINEL_SERVICE_NAME=fluxi-master
       - FLUXI_SENTINEL_MIN_OTHER_SENTINELS=1
-    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info order.app.main:app
+      - FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS=${FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS:-2.0}
+      - FLUXI_HTTP_READ_TIMEOUT_SECONDS=${FLUXI_HTTP_READ_TIMEOUT_SECONDS:-10.0}
+      - FLUXI_HTTP_WRITE_TIMEOUT_SECONDS=${FLUXI_HTTP_WRITE_TIMEOUT_SECONDS:-10.0}
+      - FLUXI_HTTP_POOL_TIMEOUT_SECONDS=${FLUXI_HTTP_POOL_TIMEOUT_SECONDS:-1.0}
+      - FLUXI_HTTP_MAX_CONNECTIONS=${FLUXI_HTTP_MAX_CONNECTIONS:-32}
+      - FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS:-16}
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w ${ORDER_API_WORKERS:-4} --timeout 30 --log-level=info order.app.main:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -39,7 +45,7 @@ services:
       context: .
       dockerfile: stock/Dockerfile
     image: stock:latest
-    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info stock.app.main:app
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w ${STOCK_API_WORKERS:-2} --timeout 30 --log-level=info stock.app.main:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -54,7 +60,7 @@ services:
       context: .
       dockerfile: payment/Dockerfile
     image: user:latest
-    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info payment.app.main:app
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w ${PAYMENT_API_WORKERS:-2} --timeout 30 --log-level=info payment.app.main:app
     env_file:
       - env/payment_redis.env
     depends_on:
@@ -75,6 +81,8 @@ services:
       - FLUXI_SENTINEL_ENDPOINTS=fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
       - FLUXI_SENTINEL_SERVICE_NAME=fluxi-master
       - FLUXI_SENTINEL_MIN_OTHER_SENTINELS=1
+      - FLUXI_RESULT_WAIT_TIMEOUT_MS=5000
+    command: uvicorn app:app --host 0.0.0.0 --port 8001 --workers ${FLUXI_SERVER_WORKERS:-4}
     depends_on:
       - fluxi-redis-master
       - fluxi-redis-replica
@@ -231,6 +239,14 @@ services:
       - FLUXI_SENTINEL_ENDPOINTS=fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
       - FLUXI_SENTINEL_SERVICE_NAME=fluxi-master
       - FLUXI_SENTINEL_MIN_OTHER_SENTINELS=1
+      - FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS=${FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS:-2.0}
+      - FLUXI_HTTP_READ_TIMEOUT_SECONDS=${FLUXI_HTTP_READ_TIMEOUT_SECONDS:-10.0}
+      - FLUXI_HTTP_WRITE_TIMEOUT_SECONDS=${FLUXI_HTTP_WRITE_TIMEOUT_SECONDS:-10.0}
+      - FLUXI_HTTP_POOL_TIMEOUT_SECONDS=${FLUXI_HTTP_POOL_TIMEOUT_SECONDS:-1.0}
+      - FLUXI_HTTP_MAX_CONNECTIONS=${FLUXI_HTTP_MAX_CONNECTIONS:-32}
+      - FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS:-16}
+      - FLUXI_MAX_CONCURRENT_WORKFLOW_TASKS=${FLUXI_ORDER_WORKFLOW_CONCURRENCY:-8}
+      - FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS=${FLUXI_ORDER_ACTIVITY_CONCURRENCY:-4}
     env_file:
       - env/order_redis.env
     depends_on:
@@ -250,6 +266,13 @@ services:
       - FLUXI_SENTINEL_ENDPOINTS=fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
       - FLUXI_SENTINEL_SERVICE_NAME=fluxi-master
       - FLUXI_SENTINEL_MIN_OTHER_SENTINELS=1
+      - FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS=${FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS:-2.0}
+      - FLUXI_HTTP_READ_TIMEOUT_SECONDS=${FLUXI_HTTP_READ_TIMEOUT_SECONDS:-10.0}
+      - FLUXI_HTTP_WRITE_TIMEOUT_SECONDS=${FLUXI_HTTP_WRITE_TIMEOUT_SECONDS:-10.0}
+      - FLUXI_HTTP_POOL_TIMEOUT_SECONDS=${FLUXI_HTTP_POOL_TIMEOUT_SECONDS:-1.0}
+      - FLUXI_HTTP_MAX_CONNECTIONS=${FLUXI_HTTP_MAX_CONNECTIONS:-32}
+      - FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS:-16}
+      - FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS=${FLUXI_STOCK_ACTIVITY_CONCURRENCY:-16}
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -269,6 +292,13 @@ services:
       - FLUXI_SENTINEL_ENDPOINTS=fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
       - FLUXI_SENTINEL_SERVICE_NAME=fluxi-master
       - FLUXI_SENTINEL_MIN_OTHER_SENTINELS=1
+      - FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS=${FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS:-2.0}
+      - FLUXI_HTTP_READ_TIMEOUT_SECONDS=${FLUXI_HTTP_READ_TIMEOUT_SECONDS:-10.0}
+      - FLUXI_HTTP_WRITE_TIMEOUT_SECONDS=${FLUXI_HTTP_WRITE_TIMEOUT_SECONDS:-10.0}
+      - FLUXI_HTTP_POOL_TIMEOUT_SECONDS=${FLUXI_HTTP_POOL_TIMEOUT_SECONDS:-1.0}
+      - FLUXI_HTTP_MAX_CONNECTIONS=${FLUXI_HTTP_MAX_CONNECTIONS:-32}
+      - FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS:-16}
+      - FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS=${FLUXI_PAYMENT_ACTIVITY_CONCURRENCY:-16}
     env_file:
       - env/payment_redis.env
     depends_on:
