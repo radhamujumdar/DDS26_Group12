@@ -1,6 +1,6 @@
 # Distributed Data Systems Project Template
 
-Basic project structure with Python's Flask and Redis. 
+Basic project structure with Python's FastAPI and Redis.
 **You are free to use any web framework in any language and any database you like for this project.**
 
 ### Project structure
@@ -18,7 +18,7 @@ Basic project structure with Python's Flask and Redis.
     Folder containing the order application logic and dockerfile. 
 
 * `packages`
-    Folder containing shared local packages, including the `fluxi-sdk` phase-1 SDK.
+    Folder containing shared local packages, including the reusable `fluxi-sdk`, `fluxi-engine`, and project-level `shop-common` package.
 
 * `payment`
     Folder containing the payment application logic and dockerfile. 

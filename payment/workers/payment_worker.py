@@ -1,69 +1,31 @@
-"""Payment-side Fluxi activity worker.
-
-Handles the charge_payment activity by operating directly on payment-db.
-Runs as a separate process alongside the payment-service, polling the
-fluxi-server for tasks on the "payment" queue.
-
-Required environment variables:
-  REDIS_HOST / REDIS_PORT / REDIS_PASSWORD / REDIS_DB  — payment-db connection
-  FLUXI_REDIS_URL                                       — fluxi engine Redis
-"""
-
 from __future__ import annotations
 
 import asyncio
-import os
 
-import redis
-from msgspec import Struct, msgpack
-
-from fluxi_sdk import activity
-from fluxi_sdk.client import WorkflowClient
-from fluxi_sdk.client import EngineConnectionConfig
-from fluxi_sdk.examples.checkout import PaymentDeclinedError, PaymentReceipt
+from fluxi_sdk.client import EngineConnectionConfig, WorkflowClient
 from fluxi_sdk.worker import Worker
 
-
-class UserValue(Struct):
-    credit: int
-
-
-_db = redis.Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
+from payment.app.dependencies import (
+    build_payment_container,
+    close_payment_container,
 )
-
-
-@activity.defn(name="charge_payment")
-def charge_payment(user_id: str, amount: int) -> PaymentReceipt:
-    raw = _db.get(user_id)
-    if raw is None:
-        raise PaymentDeclinedError(f"User {user_id!r} not found")
-    entry: UserValue = msgpack.decode(raw, type=UserValue)
-    if entry.credit < amount:
-        raise PaymentDeclinedError(
-            f"User {user_id!r} insufficient credit: need {amount}, have {entry.credit}"
-        )
-    entry.credit -= amount
-    _db.set(user_id, msgpack.encode(entry))
-    return PaymentReceipt(
-        payment_id=f"payment:{user_id}:{amount}",
-        user_id=user_id,
-        amount=amount,
-    )
+from payment.app.services.payment_service import create_payment_activities
 
 
 async def main() -> None:
+    container = await build_payment_container()
     engine = EngineConnectionConfig.from_env()
     client = WorkflowClient.connect(engine=engine)
+    activities = create_payment_activities(container.payment_service)
     worker = Worker(
         client,
         task_queue="payment",
-        activities=[charge_payment],
+        activities=activities,
     )
-    await worker.run()
+    try:
+        await worker.run()
+    finally:
+        await close_payment_container(container)
 
 
 if __name__ == "__main__":

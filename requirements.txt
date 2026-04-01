@@ -1,6 +1,7 @@
 requests==2.31.0
 Flask==3.0.2
 redis==5.0.3
+./packages/shop-common
 ./packages/fluxi-sdk
 fastapi==0.115.0
 uvicorn==0.30.6

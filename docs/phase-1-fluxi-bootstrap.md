@@ -109,7 +109,7 @@ The phase-1 fake runtime executes immediately in-process, but it still records w
 ## Reference code in this repo
 
 - SDK example: `packages/fluxi-sdk/src/fluxi_sdk/examples/checkout.py`
-- Order-service seam: `order/checkout_coordinator.py`
+- Order-service seam: `order/app/services/checkout_service.py`
 - SDK contract tests: `test/test_fluxi_sdk_fake_runtime.py`
 
 ## Intentionally missing until phase 2

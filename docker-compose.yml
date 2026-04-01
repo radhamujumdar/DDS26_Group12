@@ -17,14 +17,13 @@ services:
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
-      - ORDER_CHECKOUT_COORDINATOR=fluxi
       - FLUXI_SERVER_URL=http://fluxi-server:8001
       - FLUXI_REDIS_MODE=sentinel
       - FLUXI_REDIS_URL=redis://:redis@fluxi-redis-master:6379/0
       - FLUXI_SENTINEL_ENDPOINTS=fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
       - FLUXI_SENTINEL_SERVICE_NAME=fluxi-master
       - FLUXI_SENTINEL_MIN_OTHER_SENTINELS=1
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info order.app.main:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -40,7 +39,7 @@ services:
       context: .
       dockerfile: stock/Dockerfile
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info stock.app.main:app
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -55,7 +54,7 @@ services:
       context: .
       dockerfile: payment/Dockerfile
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info payment.app.main:app
     env_file:
       - env/payment_redis.env
     depends_on:
@@ -224,7 +223,7 @@ services:
       context: .
       dockerfile: order/Dockerfile
     image: order:latest
-    command: python workers/checkout_worker.py
+    command: python -m order.workers.checkout_worker
     environment:
       - FLUXI_SERVER_URL=http://fluxi-server:8001
       - FLUXI_REDIS_MODE=sentinel
@@ -243,7 +242,7 @@ services:
       context: .
       dockerfile: stock/Dockerfile
     image: stock:latest
-    command: python workers/stock_worker.py
+    command: python -m stock.workers.stock_worker
     environment:
       - FLUXI_SERVER_URL=http://fluxi-server:8001
       - FLUXI_REDIS_MODE=sentinel
@@ -262,7 +261,7 @@ services:
       context: .
       dockerfile: payment/Dockerfile
     image: user:latest
-    command: python workers/payment_worker.py
+    command: python -m payment.workers.payment_worker
     environment:
       - FLUXI_SERVER_URL=http://fluxi-server:8001
       - FLUXI_REDIS_MODE=sentinel
