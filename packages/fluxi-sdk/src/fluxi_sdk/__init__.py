@@ -1,7 +1,7 @@
 """Public package exports for the Fluxi SDK."""
 
 from . import activity, client, errors, testing, types, worker, workflow
-from .activity import ActivityRegistration, ActivityRegistry
+from .activity import ActivityExecutionInfo, ActivityRegistration, ActivityRegistry
 from .client import EngineConnectionConfig, WorkflowClient
 from .testing import (
     ActivityExecutionRecord,
@@ -16,6 +16,7 @@ __all__ = [
     "__version__",
     "ActivityRegistration",
     "ActivityRegistry",
+    "ActivityExecutionInfo",
     "ActivityExecutionRecord",
     "ActivityOptions",
     "EngineConnectionConfig",

@@ -26,7 +26,12 @@ class ActivityExecutionRecord:
     """Recorded metadata and outcome for one activity execution."""
 
     sequence: int
+    activity_execution_id: str
     activity_name: str
+    workflow_id: str
+    run_id: str
+    task_queue: str
+    attempt_no: int
     args: tuple[Any, ...]
     options: ActivityOptions
     status: str = "running"
@@ -247,9 +252,18 @@ class FakeFluxiRuntime:
         args: tuple[Any, ...],
         options: ActivityOptions,
     ) -> Any:
+        activity_execution_id = (
+            f"{workflow_record.run_id}:act:{len(workflow_record.activity_executions) + 1}"
+        )
+        task_queue = options.task_queue or workflow_record.task_queue
         execution = ActivityExecutionRecord(
             sequence=len(workflow_record.activity_executions) + 1,
+            activity_execution_id=activity_execution_id,
             activity_name=activity_name,
+            workflow_id=workflow_record.workflow_id,
+            run_id=workflow_record.run_id,
+            task_queue=task_queue,
+            attempt_no=1,
             args=args,
             options=options,
         )
@@ -258,11 +272,21 @@ class FakeFluxiRuntime:
         try:
             registration = self._get_activity_registration_for_task_queue(
                 activity_name,
-                task_queue=options.task_queue,
+                task_queue=task_queue,
             )
-            result = registration.fn(*args)
-            if inspect.isawaitable(result):
-                result = await result
+            with activity._activate_execution_context(
+                activity.ActivityExecutionInfo(
+                    activity_execution_id=activity_execution_id,
+                    attempt_no=1,
+                    activity_name=activity_name,
+                    task_queue=task_queue,
+                    workflow_id=workflow_record.workflow_id,
+                    run_id=workflow_record.run_id,
+                )
+            ):
+                result = registration.fn(*args)
+                if inspect.isawaitable(result):
+                    result = await result
         except BaseException as exc:
             execution.status = "failed"
             execution.error = exc

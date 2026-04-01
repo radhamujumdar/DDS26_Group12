@@ -494,10 +494,20 @@ class _EngineWorkerBinding:
             return outcome in _ACTIVITY_ACK_OUTCOMES
 
         try:
-            args = decode_args_payload(task_payload.get("input_payload"), registration.fn)
-            result = registration.fn(*args)
-            if inspect.isawaitable(result):
-                result = await result
+            with activity._activate_execution_context(
+                activity.ActivityExecutionInfo(
+                    activity_execution_id=activity_execution_id,
+                    attempt_no=attempt_no,
+                    activity_name=str(task_payload["activity_name"]),
+                    task_queue=str(task_payload["task_queue"]),
+                    workflow_id=str(task_payload["workflow_id"]),
+                    run_id=str(task_payload["run_id"]),
+                )
+            ):
+                args = decode_args_payload(task_payload.get("input_payload"), registration.fn)
+                result = registration.fn(*args)
+                if inspect.isawaitable(result):
+                    result = await result
         except BaseException as exc:
             payload = _safe_failure_payload(exc)
             status = "failed"

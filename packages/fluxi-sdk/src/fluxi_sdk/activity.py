@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 import inspect
-from typing import Any, Callable, TypeVar, overload
+from typing import Any, Callable, Iterator, TypeVar, overload
 
 from .errors import (
+    ActivityContextUnavailableError,
     DuplicateActivityRegistrationError,
     InvalidActivityDefinitionError,
     UnknownActivityError,
@@ -28,6 +31,24 @@ class ActivityRegistration:
 
     name: str
     fn: Callable[..., Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ActivityExecutionInfo:
+    """Execution metadata exposed to running activities."""
+
+    activity_execution_id: str
+    attempt_no: int
+    activity_name: str
+    task_queue: str
+    workflow_id: str
+    run_id: str
+
+
+_CURRENT_ACTIVITY_CONTEXT: ContextVar[ActivityExecutionInfo | None] = ContextVar(
+    "fluxi_current_activity_context",
+    default=None,
+)
 
 
 @overload
@@ -131,4 +152,30 @@ class ActivityRegistry:
         return tuple(self._by_name.values())
 
 
-__all__ = ["ActivityRegistration", "ActivityRegistry", "defn"]
+@contextmanager
+def _activate_execution_context(info: ActivityExecutionInfo) -> Iterator[None]:
+    token = _CURRENT_ACTIVITY_CONTEXT.set(info)
+    try:
+        yield
+    finally:
+        _CURRENT_ACTIVITY_CONTEXT.reset(token)
+
+
+def info() -> ActivityExecutionInfo:
+    """Return execution metadata for the currently running activity."""
+
+    context = _CURRENT_ACTIVITY_CONTEXT.get()
+    if context is None:
+        raise ActivityContextUnavailableError(
+            "activity.info() requires an active activity execution context."
+        )
+    return context
+
+
+__all__ = [
+    "ActivityExecutionInfo",
+    "ActivityRegistration",
+    "ActivityRegistry",
+    "defn",
+    "info",
+]

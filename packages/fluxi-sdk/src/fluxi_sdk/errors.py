@@ -45,6 +45,14 @@ class WorkflowContextUnavailableError(WorkflowContextError):
     """Raised when workflow execution context is not available."""
 
 
+class ActivityContextError(FluxiError):
+    """Raised when activity-only APIs are used from the wrong context."""
+
+
+class ActivityContextUnavailableError(ActivityContextError):
+    """Raised when activity execution context is not available."""
+
+
 class WorkflowAlreadyStartedError(FluxiError):
     """Raised when a workflow key collides with a start policy."""
 
