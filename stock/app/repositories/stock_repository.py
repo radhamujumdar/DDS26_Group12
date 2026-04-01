@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 
 from msgspec import msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, WatchError
 
-from shop_common.checkout import StockReservation
+from shop_common.checkout import CheckoutItem, StockReservation
 from shop_common.errors import DatabaseError
 from shop_common.redis import (
     activity_dedupe_key,
@@ -150,6 +151,78 @@ class StockRepository:
             except RedisError as exc:
                 raise DatabaseError("DB error") from exc
 
+    async def reserve_stock_batch_idempotent(
+        self,
+        items: Sequence[CheckoutItem],
+        *,
+        activity_execution_id: str,
+    ) -> tuple[StockReservation, ...]:
+        if not items:
+            return ()
+
+        dedupe_key = activity_dedupe_key(activity_execution_id)
+        item_ids = [item.item_id for item in items]
+
+        while True:
+            try:
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    await pipe.watch(dedupe_key, *item_ids)
+                    existing = await pipe.get(dedupe_key)
+                    if existing is not None:
+                        return self._materialize_reservation_batch_record(existing)
+
+                    raws = await pipe.mget(item_ids)
+                    values: list[StockValue] = []
+                    for checkout_item, raw in zip(items, raws, strict=True):
+                        if raw is None:
+                            message = f"Item {checkout_item.item_id!r} not found"
+                            pipe.multi()
+                            pipe.set(
+                                dedupe_key,
+                                encode_error_record("item_not_found", message),
+                            )
+                            await pipe.execute()
+                            raise StockItemNotFoundError(message)
+                        item = msgpack.decode(raw, type=StockValue)
+                        if item.stock < checkout_item.quantity:
+                            message = (
+                                f"Item {checkout_item.item_id!r} insufficient stock: "
+                                f"need {checkout_item.quantity}, have {item.stock}"
+                            )
+                            pipe.multi()
+                            pipe.set(
+                                dedupe_key,
+                                encode_error_record("insufficient_stock", message),
+                            )
+                            await pipe.execute()
+                            raise StockInsufficientError(message)
+                        values.append(item)
+
+                    result: list[dict[str, object]] = []
+                    pipe.multi()
+                    for checkout_item, item in zip(items, values, strict=True):
+                        item.stock -= checkout_item.quantity
+                        pipe.set(checkout_item.item_id, msgpack.encode(item))
+                        result.append(
+                            {
+                                "item_id": checkout_item.item_id,
+                                "quantity": checkout_item.quantity,
+                            }
+                        )
+                    pipe.set(dedupe_key, encode_success_record(result))
+                    await pipe.execute()
+                    return tuple(
+                        StockReservation(
+                            item_id=entry["item_id"],
+                            quantity=entry["quantity"],
+                        )
+                        for entry in result
+                    )
+            except WatchError:
+                continue
+            except RedisError as exc:
+                raise DatabaseError("DB error") from exc
+
     async def release_stock_idempotent(
         self,
         item_id: str,
@@ -191,6 +264,65 @@ class StockRepository:
             except RedisError as exc:
                 raise DatabaseError("DB error") from exc
 
+    async def release_stock_batch_idempotent(
+        self,
+        reservations: Sequence[StockReservation],
+        *,
+        activity_execution_id: str,
+    ) -> tuple[StockReservation, ...]:
+        if not reservations:
+            return ()
+
+        dedupe_key = activity_dedupe_key(activity_execution_id)
+        item_ids = [reservation.item_id for reservation in reservations]
+
+        while True:
+            try:
+                async with self._redis.pipeline(transaction=True) as pipe:
+                    await pipe.watch(dedupe_key, *item_ids)
+                    existing = await pipe.get(dedupe_key)
+                    if existing is not None:
+                        return self._materialize_reservation_batch_record(existing)
+
+                    raws = await pipe.mget(item_ids)
+                    values: list[StockValue] = []
+                    for reservation, raw in zip(reservations, raws, strict=True):
+                        if raw is None:
+                            message = f"Item {reservation.item_id!r} not found"
+                            pipe.multi()
+                            pipe.set(
+                                dedupe_key,
+                                encode_error_record("item_not_found", message),
+                            )
+                            await pipe.execute()
+                            raise StockItemNotFoundError(message)
+                        values.append(msgpack.decode(raw, type=StockValue))
+
+                    result: list[dict[str, object]] = []
+                    pipe.multi()
+                    for reservation, item in zip(reservations, values, strict=True):
+                        item.stock += reservation.quantity
+                        pipe.set(reservation.item_id, msgpack.encode(item))
+                        result.append(
+                            {
+                                "item_id": reservation.item_id,
+                                "quantity": reservation.quantity,
+                            }
+                        )
+                    pipe.set(dedupe_key, encode_success_record(result))
+                    await pipe.execute()
+                    return tuple(
+                        StockReservation(
+                            item_id=entry["item_id"],
+                            quantity=entry["quantity"],
+                        )
+                        for entry in result
+                    )
+            except WatchError:
+                continue
+            except RedisError as exc:
+                raise DatabaseError("DB error") from exc
+
     @staticmethod
     def _materialize_reservation_record(raw: bytes) -> StockReservation:
         record = decode_dedupe_record(raw)
@@ -208,6 +340,30 @@ class StockRepository:
             raise TypeError("Expected reservation error payload to be a dict.")
         code = str(error.get("code", "stock_error"))
         message = str(error.get("message", "Stock operation failed"))
+        if code == "item_not_found":
+            raise StockItemNotFoundError(message)
+        raise StockInsufficientError(message)
+
+    @staticmethod
+    def _materialize_reservation_batch_record(raw: bytes) -> tuple[StockReservation, ...]:
+        record = decode_dedupe_record(raw)
+        if record.get("status") == "success":
+            payload = record.get("result")
+            if not isinstance(payload, list):
+                raise TypeError("Expected reservation batch result payload to be a list.")
+            return tuple(
+                StockReservation(
+                    item_id=str(entry["item_id"]),
+                    quantity=int(entry["quantity"]),
+                )
+                for entry in payload
+            )
+
+        error = record.get("error")
+        if not isinstance(error, dict):
+            raise TypeError("Expected reservation batch error payload to be a dict.")
+        code = str(error.get("code", "stock_error"))
+        message = str(error.get("message", "Stock batch operation failed"))
         if code == "item_not_found":
             raise StockItemNotFoundError(message)
         raise StockInsufficientError(message)

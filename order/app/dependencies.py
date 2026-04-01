@@ -43,7 +43,8 @@ async def build_order_api_container() -> OrderApiContainer:
     stock_client = StockGatewayClient(gateway_client)
     order_service = OrderService(repository, stock_client)
     checkout_service = CheckoutService(
-        WorkflowClient.connect(engine=EngineConnectionConfig.from_env())
+        WorkflowClient.connect(engine=EngineConnectionConfig.from_env()),
+        order_service,
     )
     return OrderApiContainer(
         redis=redis,

@@ -46,6 +46,10 @@ class EngineConnectionConfig:
     http_pool_timeout_seconds: float = 1.0
     http_max_connections: int = 32
     http_max_keepalive_connections: int = 16
+    http_control_max_connections: int = 128
+    http_control_max_keepalive_connections: int = 64
+    http_result_max_connections: int = 256
+    http_result_max_keepalive_connections: int = 128
 
     def __post_init__(self) -> None:
         mode = self.redis_mode.strip().lower()
@@ -93,6 +97,24 @@ class EngineConnectionConfig:
         if self.http_max_keepalive_connections > self.http_max_connections:
             raise ValueError(
                 "http_max_keepalive_connections cannot exceed http_max_connections."
+            )
+        if self.http_control_max_connections < 1:
+            raise ValueError("http_control_max_connections must be at least 1.")
+        if self.http_control_max_keepalive_connections < 1:
+            raise ValueError("http_control_max_keepalive_connections must be at least 1.")
+        if self.http_control_max_keepalive_connections > self.http_control_max_connections:
+            raise ValueError(
+                "http_control_max_keepalive_connections cannot exceed "
+                "http_control_max_connections."
+            )
+        if self.http_result_max_connections < 1:
+            raise ValueError("http_result_max_connections must be at least 1.")
+        if self.http_result_max_keepalive_connections < 1:
+            raise ValueError("http_result_max_keepalive_connections must be at least 1.")
+        if self.http_result_max_keepalive_connections > self.http_result_max_connections:
+            raise ValueError(
+                "http_result_max_keepalive_connections cannot exceed "
+                "http_result_max_connections."
             )
 
         if mode == "sentinel":
@@ -180,6 +202,30 @@ class EngineConnectionConfig:
                 _env(
                     "FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS",
                     str(defaults.http_max_keepalive_connections),
+                )
+            ),
+            http_control_max_connections=int(
+                _env(
+                    "FLUXI_HTTP_CONTROL_MAX_CONNECTIONS",
+                    str(defaults.http_control_max_connections),
+                )
+            ),
+            http_control_max_keepalive_connections=int(
+                _env(
+                    "FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS",
+                    str(defaults.http_control_max_keepalive_connections),
+                )
+            ),
+            http_result_max_connections=int(
+                _env(
+                    "FLUXI_HTTP_RESULT_MAX_CONNECTIONS",
+                    str(defaults.http_result_max_connections),
+                )
+            ),
+            http_result_max_keepalive_connections=int(
+                _env(
+                    "FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS",
+                    str(defaults.http_result_max_keepalive_connections),
                 )
             ),
         )

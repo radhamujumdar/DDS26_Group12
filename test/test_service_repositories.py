@@ -13,6 +13,7 @@ from order.app.repositories.order_repository import OrderRepository
 from payment.app.domain.errors import InsufficientCreditError
 from payment.app.domain.models import UserValue
 from payment.app.repositories.payment_repository import PaymentRepository
+from shop_common.checkout import CheckoutItem, StockReservation
 from stock.app.domain.errors import StockInsufficientError
 from stock.app.domain.models import StockValue
 from stock.app.repositories.stock_repository import StockRepository
@@ -113,6 +114,73 @@ class TestServiceRepositories(RepositoryRedisAsyncTestCase):
         self.assertEqual(first, second)
         item = await repository.get_item("item-1")
         self.assertEqual(item.stock, 3)
+
+    async def test_stock_batch_reserve_and_release_are_idempotent(self) -> None:
+        repository = StockRepository(self.redis)
+        await self.redis.mset(
+            {
+                "item-a": msgpack.encode(StockValue(stock=5, price=10)),
+                "item-b": msgpack.encode(StockValue(stock=7, price=12)),
+            }
+        )
+        items = (
+            CheckoutItem(item_id="item-a", quantity=2),
+            CheckoutItem(item_id="item-b", quantity=3),
+        )
+
+        first_reserve = await repository.reserve_stock_batch_idempotent(
+            items,
+            activity_execution_id="act-stock-batch-reserve",
+        )
+        second_reserve = await repository.reserve_stock_batch_idempotent(
+            items,
+            activity_execution_id="act-stock-batch-reserve",
+        )
+
+        self.assertEqual(first_reserve, second_reserve)
+        self.assertEqual(
+            first_reserve,
+            (
+                StockReservation(item_id="item-a", quantity=2),
+                StockReservation(item_id="item-b", quantity=3),
+            ),
+        )
+        self.assertEqual((await repository.get_item("item-a")).stock, 3)
+        self.assertEqual((await repository.get_item("item-b")).stock, 4)
+
+        first_release = await repository.release_stock_batch_idempotent(
+            first_reserve,
+            activity_execution_id="act-stock-batch-release",
+        )
+        second_release = await repository.release_stock_batch_idempotent(
+            first_reserve,
+            activity_execution_id="act-stock-batch-release",
+        )
+
+        self.assertEqual(first_release, second_release)
+        self.assertEqual((await repository.get_item("item-a")).stock, 5)
+        self.assertEqual((await repository.get_item("item-b")).stock, 7)
+
+    async def test_stock_batch_reserve_is_atomic_on_insufficient_stock(self) -> None:
+        repository = StockRepository(self.redis)
+        await self.redis.mset(
+            {
+                "item-a": msgpack.encode(StockValue(stock=5, price=10)),
+                "item-b": msgpack.encode(StockValue(stock=1, price=12)),
+            }
+        )
+
+        with self.assertRaises(StockInsufficientError):
+            await repository.reserve_stock_batch_idempotent(
+                (
+                    CheckoutItem(item_id="item-a", quantity=2),
+                    CheckoutItem(item_id="item-b", quantity=3),
+                ),
+                activity_execution_id="act-stock-batch-fail",
+            )
+
+        self.assertEqual((await repository.get_item("item-a")).stock, 5)
+        self.assertEqual((await repository.get_item("item-b")).stock, 1)
 
     async def test_stock_reserve_replays_same_failure_after_state_changes(self) -> None:
         repository = StockRepository(self.redis)

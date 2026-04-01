@@ -2,23 +2,22 @@ from __future__ import annotations
 
 from fluxi_sdk.client import WorkflowClient
 from fluxi_sdk.types import StartPolicy
-from shop_common.checkout import (
-    CheckoutWorkflowResult,
-    PaymentDeclinedError,
-    StockUnavailableError,
-)
+from shop_common.checkout import CheckoutWorkflowResult, PaymentDeclinedError, StockUnavailableError
 
+from .order_service import OrderService
 from ..workflows.checkout import OrderCheckoutWorkflow
 
 
 class CheckoutService:
-    def __init__(self, client: WorkflowClient) -> None:
+    def __init__(self, client: WorkflowClient, order_service: OrderService) -> None:
         self._client = client
+        self._order_service = order_service
 
     async def checkout(self, order_id: str) -> CheckoutWorkflowResult:
+        order = await self._order_service.load_checkout_order(order_id)
         result: CheckoutWorkflowResult = await self._client.execute_workflow(
             OrderCheckoutWorkflow.run,
-            order_id,
+            order,
             id=f"order-checkout:{order_id}",
             task_queue="orders",
             start_policy=StartPolicy.ALLOW_DUPLICATE,

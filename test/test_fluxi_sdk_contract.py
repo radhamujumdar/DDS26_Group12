@@ -123,6 +123,10 @@ class TestFluxiSdkContract(unittest.TestCase):
         self.assertEqual(config.http_pool_timeout_seconds, 1.0)
         self.assertEqual(config.http_max_connections, 32)
         self.assertEqual(config.http_max_keepalive_connections, 16)
+        self.assertEqual(config.http_control_max_connections, 128)
+        self.assertEqual(config.http_control_max_keepalive_connections, 64)
+        self.assertEqual(config.http_result_max_connections, 256)
+        self.assertEqual(config.http_result_max_keepalive_connections, 128)
 
     def test_connect_requires_explicit_backend_selection(self):
         with self.assertRaises(TypeError):
@@ -188,10 +192,17 @@ class TestFluxiSdkEngineHttpClient(unittest.IsolatedAsyncioTestCase):
         )
         backend = EngineWorkflowBackend(config)
         created_clients: list[_FakeAsyncClient] = []
+        build_calls: list[tuple[int, int]] = []
 
-        def _factory(_: EngineConnectionConfig) -> _FakeAsyncClient:
+        def _factory(
+            _: EngineConnectionConfig,
+            *,
+            max_connections: int | None = None,
+            max_keepalive_connections: int | None = None,
+        ) -> _FakeAsyncClient:
             client = _FakeAsyncClient()
             created_clients.append(client)
+            build_calls.append((max_connections or -1, max_keepalive_connections or -1))
             return client
 
         with mock.patch("fluxi_sdk._engine_backend._build_http_client", side_effect=_factory):
@@ -203,6 +214,19 @@ class TestFluxiSdkEngineHttpClient(unittest.IsolatedAsyncioTestCase):
             self.assertIs(result_first, result_second)
             self.assertIsNot(control_first, result_first)
             self.assertEqual(len(created_clients), 2)
+            self.assertEqual(
+                build_calls,
+                [
+                    (
+                        config.http_control_max_connections,
+                        config.http_control_max_keepalive_connections,
+                    ),
+                    (
+                        config.http_result_max_connections,
+                        config.http_result_max_keepalive_connections,
+                    ),
+                ],
+            )
             await backend.aclose()
             self.assertTrue(control_first.is_closed)
             self.assertTrue(result_first.is_closed)

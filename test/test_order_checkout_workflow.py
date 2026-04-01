@@ -21,27 +21,29 @@ class TestOrderCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
     async def test_happy_path_marks_order_paid(self) -> None:
         runtime = FakeFluxiRuntime()
         client = WorkflowClient.connect(runtime=runtime)
+        order = CheckoutOrder(
+            order_id="order-1",
+            user_id="user-1",
+            total_cost=20,
+            items=(CheckoutItem(item_id="item-1", quantity=2),),
+        )
         state = {
-            "orders": {
-                "order-1": CheckoutOrder(
-                    order_id="order-1",
-                    user_id="user-1",
-                    total_cost=20,
-                    items=(CheckoutItem(item_id="item-1", quantity=2),),
-                )
-            },
+            "orders": {"order-1": order},
             "stock": {"item-1": 5},
             "credit": {"user-1": 25},
         }
 
-        @activity.defn(name="load_order")
-        async def load_order(order_id: str) -> CheckoutOrder:
-            return state["orders"][order_id]
-
-        @activity.defn(name="reserve_stock")
-        async def reserve_stock(item_id: str, quantity: int) -> StockReservation:
-            state["stock"][item_id] -= quantity
-            return StockReservation(item_id=item_id, quantity=quantity)
+        @activity.defn(name="reserve_stock_batch")
+        async def reserve_stock_batch(
+            items: tuple[CheckoutItem, ...],
+        ) -> tuple[StockReservation, ...]:
+            reservations: list[StockReservation] = []
+            for item in items:
+                state["stock"][item.item_id] -= item.quantity
+                reservations.append(
+                    StockReservation(item_id=item.item_id, quantity=item.quantity)
+                )
+            return tuple(reservations)
 
         @activity.defn(name="charge_payment")
         async def charge_payment(user_id: str, amount: int) -> PaymentReceipt:
@@ -57,27 +59,27 @@ class TestOrderCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
             state["orders"][order_id].paid = True
             return state["orders"][order_id]
 
-        @activity.defn(name="release_stock")
-        async def release_stock(item_id: str, quantity: int) -> StockReservation:
-            state["stock"][item_id] += quantity
-            return StockReservation(item_id=item_id, quantity=quantity)
+        @activity.defn(name="release_stock_batch")
+        async def release_stock_batch(
+            reservations: tuple[StockReservation, ...],
+        ) -> tuple[StockReservation, ...]:
+            for reservation in reservations:
+                state["stock"][reservation.item_id] += reservation.quantity
+            return reservations
 
         worker = Worker(
             client,
             task_queue="orders",
             workflows=[OrderCheckoutWorkflow],
             activities=[
-                load_order,
-                reserve_stock,
                 charge_payment,
                 mark_order_paid,
-                release_stock,
             ],
         )
         stock_worker = Worker(
             client,
             task_queue="stock",
-            activities=[reserve_stock, release_stock],
+            activities=[reserve_stock_batch, release_stock_batch],
         )
         payment_worker = Worker(
             client,
@@ -88,7 +90,7 @@ class TestOrderCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
         async with worker, stock_worker, payment_worker:
             result = await client.execute_workflow(
                 OrderCheckoutWorkflow.run,
-                "order-1",
+                order,
                 id="checkout:order-1",
                 task_queue="orders",
             )
@@ -101,26 +103,28 @@ class TestOrderCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
     async def test_payment_failure_compensates_stock(self) -> None:
         runtime = FakeFluxiRuntime()
         client = WorkflowClient.connect(runtime=runtime)
+        order = CheckoutOrder(
+            order_id="order-2",
+            user_id="user-2",
+            total_cost=20,
+            items=(CheckoutItem(item_id="item-2", quantity=2),),
+        )
         state = {
-            "orders": {
-                "order-2": CheckoutOrder(
-                    order_id="order-2",
-                    user_id="user-2",
-                    total_cost=20,
-                    items=(CheckoutItem(item_id="item-2", quantity=2),),
-                )
-            },
+            "orders": {"order-2": order},
             "stock": {"item-2": 4},
         }
 
-        @activity.defn(name="load_order")
-        async def load_order(order_id: str) -> CheckoutOrder:
-            return state["orders"][order_id]
-
-        @activity.defn(name="reserve_stock")
-        async def reserve_stock(item_id: str, quantity: int) -> StockReservation:
-            state["stock"][item_id] -= quantity
-            return StockReservation(item_id=item_id, quantity=quantity)
+        @activity.defn(name="reserve_stock_batch")
+        async def reserve_stock_batch(
+            items: tuple[CheckoutItem, ...],
+        ) -> tuple[StockReservation, ...]:
+            reservations: list[StockReservation] = []
+            for item in items:
+                state["stock"][item.item_id] -= item.quantity
+                reservations.append(
+                    StockReservation(item_id=item.item_id, quantity=item.quantity)
+                )
+            return tuple(reservations)
 
         @activity.defn(name="charge_payment")
         async def charge_payment(user_id: str, amount: int) -> PaymentReceipt:
@@ -132,21 +136,24 @@ class TestOrderCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
         async def mark_order_paid(order_id: str) -> CheckoutOrder:
             raise AssertionError("mark_order_paid should not run after payment failure")
 
-        @activity.defn(name="release_stock")
-        async def release_stock(item_id: str, quantity: int) -> StockReservation:
-            state["stock"][item_id] += quantity
-            return StockReservation(item_id=item_id, quantity=quantity)
+        @activity.defn(name="release_stock_batch")
+        async def release_stock_batch(
+            reservations: tuple[StockReservation, ...],
+        ) -> tuple[StockReservation, ...]:
+            for reservation in reservations:
+                state["stock"][reservation.item_id] += reservation.quantity
+            return reservations
 
         worker = Worker(
             client,
             task_queue="orders",
             workflows=[OrderCheckoutWorkflow],
-            activities=[load_order, mark_order_paid],
+            activities=[mark_order_paid],
         )
         stock_worker = Worker(
             client,
             task_queue="stock",
-            activities=[reserve_stock, release_stock],
+            activities=[reserve_stock_batch, release_stock_batch],
         )
         payment_worker = Worker(
             client,
@@ -157,7 +164,7 @@ class TestOrderCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
         async with worker, stock_worker, payment_worker:
             result = await client.execute_workflow(
                 OrderCheckoutWorkflow.run,
-                "order-2",
+                order,
                 id="checkout:order-2",
                 task_queue="orders",
             )

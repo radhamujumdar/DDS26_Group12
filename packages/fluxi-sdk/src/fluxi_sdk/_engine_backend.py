@@ -150,7 +150,11 @@ class EngineWorkflowBackend:
             client = self._control_http_client
             if client is not None and not client.is_closed:
                 return client
-            client = _build_http_client(self._config)
+            client = _build_http_client(
+                self._config,
+                max_connections=self._config.http_control_max_connections,
+                max_keepalive_connections=self._config.http_control_max_keepalive_connections,
+            )
             self._control_http_client = client
             return client
 
@@ -164,7 +168,11 @@ class EngineWorkflowBackend:
             client = self._result_http_client
             if client is not None and not client.is_closed:
                 return client
-            client = _build_http_client(self._config)
+            client = _build_http_client(
+                self._config,
+                max_connections=self._config.http_result_max_connections,
+                max_keepalive_connections=self._config.http_result_max_keepalive_connections,
+            )
             self._result_http_client = client
             return client
 
@@ -1130,7 +1138,12 @@ def _is_missing_stream_group_error(exc: ResponseError) -> bool:
     return "NOGROUP" in str(exc).upper()
 
 
-def _build_http_client(config: EngineConnectionConfig) -> httpx.AsyncClient:
+def _build_http_client(
+    config: EngineConnectionConfig,
+    *,
+    max_connections: int | None = None,
+    max_keepalive_connections: int | None = None,
+) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=config.server_url.rstrip("/"),
         timeout=httpx.Timeout(
@@ -1140,7 +1153,9 @@ def _build_http_client(config: EngineConnectionConfig) -> httpx.AsyncClient:
             pool=config.http_pool_timeout_seconds,
         ),
         limits=httpx.Limits(
-            max_connections=config.http_max_connections,
-            max_keepalive_connections=config.http_max_keepalive_connections,
+            max_connections=max_connections or config.http_max_connections,
+            max_keepalive_connections=(
+                max_keepalive_connections or config.http_max_keepalive_connections
+            ),
         ),
     )

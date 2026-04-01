@@ -4,7 +4,7 @@ from collections.abc import Callable
 from typing import Any
 
 from fluxi_sdk import activity
-from shop_common.checkout import StockReservation, StockUnavailableError
+from shop_common.checkout import CheckoutItem, StockReservation, StockUnavailableError
 
 from ..domain.errors import StockInsufficientError, StockItemNotFoundError
 from ..repositories.stock_repository import StockRepository
@@ -68,10 +68,38 @@ class StockService:
         except StockItemNotFoundError as exc:
             raise StockUnavailableError(str(exc)) from exc
 
+    async def reserve_stock_batch(
+        self,
+        items: tuple[CheckoutItem, ...],
+        *,
+        activity_execution_id: str,
+    ) -> tuple[StockReservation, ...]:
+        try:
+            return await self._repository.reserve_stock_batch_idempotent(
+                items,
+                activity_execution_id=activity_execution_id,
+            )
+        except (StockItemNotFoundError, StockInsufficientError) as exc:
+            raise StockUnavailableError(str(exc)) from exc
+
+    async def release_stock_batch(
+        self,
+        reservations: tuple[StockReservation, ...],
+        *,
+        activity_execution_id: str,
+    ) -> tuple[StockReservation, ...]:
+        try:
+            return await self._repository.release_stock_batch_idempotent(
+                reservations,
+                activity_execution_id=activity_execution_id,
+            )
+        except StockItemNotFoundError as exc:
+            raise StockUnavailableError(str(exc)) from exc
+
 
 def create_stock_activities(
     stock_service: StockService,
-) -> tuple[Callable[..., Any], Callable[..., Any]]:
+) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
     @activity.defn(name="reserve_stock")
     async def reserve_stock(item_id: str, quantity: int) -> StockReservation:
         return await stock_service.reserve_stock(
@@ -88,4 +116,22 @@ def create_stock_activities(
             activity_execution_id=activity.info().activity_execution_id,
         )
 
-    return reserve_stock, release_stock
+    @activity.defn(name="reserve_stock_batch")
+    async def reserve_stock_batch(
+        items: tuple[CheckoutItem, ...],
+    ) -> tuple[StockReservation, ...]:
+        return await stock_service.reserve_stock_batch(
+            items,
+            activity_execution_id=activity.info().activity_execution_id,
+        )
+
+    @activity.defn(name="release_stock_batch")
+    async def release_stock_batch(
+        reservations: tuple[StockReservation, ...],
+    ) -> tuple[StockReservation, ...]:
+        return await stock_service.release_stock_batch(
+            reservations,
+            activity_execution_id=activity.info().activity_execution_id,
+        )
+
+    return reserve_stock, release_stock, reserve_stock_batch, release_stock_batch

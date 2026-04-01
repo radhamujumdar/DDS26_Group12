@@ -6,10 +6,10 @@ from typing import Any
 
 from fluxi_sdk import activity, workflow
 from shop_common.checkout import (
+    CheckoutOrder,
     CheckoutWorkflowResult,
     PaymentDeclinedError,
     StockReservation,
-    StockUnavailableError,
 )
 
 from ..services.order_service import OrderService
@@ -18,29 +18,15 @@ from ..services.order_service import OrderService
 @workflow.defn(name="OrderCheckoutWorkflow")
 class OrderCheckoutWorkflow:
     @workflow.run
-    async def run(self, order_id: str) -> CheckoutWorkflowResult:
-        order = await workflow.execute_activity("load_order", order_id)
-        reservations: list[StockReservation] = []
-
-        try:
-            for item in order.items:
-                reservation = await workflow.execute_activity(
-                    "reserve_stock",
-                    item.item_id,
-                    item.quantity,
-                    task_queue="stock",
-                    schedule_to_close_timeout=timedelta(seconds=30),
-                )
-                reservations.append(reservation)
-        except StockUnavailableError:
-            for reservation in reversed(reservations):
-                await workflow.execute_activity(
-                    "release_stock",
-                    reservation.item_id,
-                    reservation.quantity,
-                    task_queue="stock",
-                )
-            raise
+    async def run(self, order: CheckoutOrder) -> CheckoutWorkflowResult:
+        reservations: tuple[StockReservation, ...] = ()
+        if order.items:
+            reservations = await workflow.execute_activity(
+                "reserve_stock_batch",
+                order.items,
+                task_queue="stock",
+                schedule_to_close_timeout=timedelta(seconds=30),
+            )
 
         try:
             payment = await workflow.execute_activity(
@@ -51,19 +37,17 @@ class OrderCheckoutWorkflow:
                 schedule_to_close_timeout=timedelta(seconds=30),
             )
         except PaymentDeclinedError as exc:
-            released: list[StockReservation] = []
-            for reservation in reversed(reservations):
-                released_item = await workflow.execute_activity(
-                    "release_stock",
-                    reservation.item_id,
-                    reservation.quantity,
+            released: tuple[StockReservation, ...] = ()
+            if reservations:
+                released = await workflow.execute_activity(
+                    "release_stock_batch",
+                    reservations,
                     task_queue="stock",
                 )
-                released.append(released_item)
             return CheckoutWorkflowResult(
                 order_id=order.order_id,
                 status="compensated",
-                released_items=tuple(released),
+                released_items=released,
                 failure_reason=str(exc),
             )
 
@@ -77,11 +61,7 @@ class OrderCheckoutWorkflow:
 
 def create_order_activities(
     order_service: OrderService,
-) -> tuple[Callable[..., Any], Callable[..., Any]]:
-    @activity.defn(name="load_order")
-    async def load_order(order_id: str):
-        return await order_service.load_checkout_order(order_id)
-
+) -> tuple[Callable[..., Any]]:
     @activity.defn(name="mark_order_paid")
     async def mark_order_paid(order_id: str):
         return await order_service.mark_order_paid(
@@ -89,4 +69,4 @@ def create_order_activities(
             activity_execution_id=activity.info().activity_execution_id,
         )
 
-    return load_order, mark_order_paid
+    return (mark_order_paid,)
