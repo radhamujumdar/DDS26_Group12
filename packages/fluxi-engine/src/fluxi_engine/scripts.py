@@ -124,6 +124,7 @@ local history_key = KEYS[3]
 local activity_key_prefix = KEYS[4]
 local activity_queue_key = KEYS[5]
 local timers_key = KEYS[6]
+local workflow_result_channel_key = KEYS[7]
 
 local now_ms = tonumber(ARGV[1])
 local workflow_task_id = ARGV[2]
@@ -277,6 +278,7 @@ if command_kind == 'complete_workflow' then
         'error_payload', '',
         'updated_at_ms', tostring(now_ms)
     )
+    redis.call('PUBLISH', workflow_result_channel_key, 'completed')
     return {'completed', run_id, ''}
 end
 
@@ -310,6 +312,7 @@ redis.call(
     'result_payload', '',
     'updated_at_ms', tostring(now_ms)
 )
+redis.call('PUBLISH', workflow_result_channel_key, 'failed')
 return {'failed', run_id, ''}
 """
 

@@ -114,10 +114,24 @@ class TestFluxiSdkContract(unittest.TestCase):
         )
         self.assertEqual(config.server_url, "http://localhost:8000")
         self.assertEqual(config.redis_url, "redis://localhost:6379/0")
+        self.assertEqual(config.result_wait_timeout_ms, 5000)
 
     def test_connect_requires_explicit_backend_selection(self):
         with self.assertRaises(TypeError):
             WorkflowClient.connect()
+
+    def test_worker_supports_concurrency_configuration(self):
+        runtime = FakeFluxiRuntime()
+        client_facade = WorkflowClient.connect(runtime=runtime)
+        worker_facade = Worker(
+            client_facade,
+            task_queue="orders",
+            max_concurrent_workflow_tasks=2,
+            max_concurrent_activity_tasks=3,
+        )
+
+        self.assertEqual(worker_facade.max_concurrent_workflow_tasks, 2)
+        self.assertEqual(worker_facade.max_concurrent_activity_tasks, 3)
 
     def test_workflow_decorator_no_longer_declares_task_queue(self):
         @workflow.defn

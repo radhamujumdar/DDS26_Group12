@@ -154,7 +154,7 @@ class EngineWorkflowBackend:
             try:
                 result_response = await client.get(
                     f"/workflows/{workflow_id}/result",
-                    params={"wait_ms": self._config.result_poll_interval_ms},
+                    params={"wait_ms": self._config.result_wait_timeout_ms},
                 )
                 if result_response.status_code == 404 and _should_retry_start_request(
                     start_policy,
@@ -189,6 +189,8 @@ class EngineWorkflowBackend:
         task_queue: str,
         workflows: Sequence[type[Any]],
         activities: Sequence[Callable[..., Any]],
+        max_concurrent_workflow_tasks: int,
+        max_concurrent_activity_tasks: int,
     ) -> _EngineWorkerBinding:
         workflow_registrations = _register_workflows(workflows)
         activity_registrations = _register_activities(activities)
@@ -197,6 +199,8 @@ class EngineWorkflowBackend:
             task_queue=task_queue,
             workflows=workflow_registrations,
             activities=activity_registrations,
+            max_concurrent_workflow_tasks=max_concurrent_workflow_tasks,
+            max_concurrent_activity_tasks=max_concurrent_activity_tasks,
         )
 
 
@@ -206,15 +210,21 @@ class _EngineWorkerBinding:
     task_queue: str
     workflows: tuple[WorkflowRegistration, ...]
     activities: tuple[ActivityRegistration, ...]
+    max_concurrent_workflow_tasks: int
+    max_concurrent_activity_tasks: int
     _settings: FluxiSettings = field(init=False, repr=False)
     _workflow_by_name: dict[str, WorkflowRegistration] = field(init=False, repr=False)
     _activity_by_name: dict[str, ActivityRegistration] = field(init=False, repr=False)
     _consumer_name: str = field(init=False, repr=False)
     _stop_event: asyncio.Event = field(init=False, repr=False)
     _stopped_event: asyncio.Event = field(init=False, repr=False)
+    _workflow_capacity_event: asyncio.Event = field(init=False, repr=False)
+    _activity_capacity_event: asyncio.Event = field(init=False, repr=False)
     _redis_store: FluxiRedisStore | None = field(init=False, default=None, repr=False)
     _http_client: httpx.AsyncClient | None = field(init=False, default=None, repr=False)
-    _tasks: list[asyncio.Task[None]] = field(init=False, default_factory=list, repr=False)
+    _poller_tasks: list[asyncio.Task[None]] = field(init=False, default_factory=list, repr=False)
+    _workflow_inflight: set[asyncio.Task[None]] = field(init=False, default_factory=set, repr=False)
+    _activity_inflight: set[asyncio.Task[None]] = field(init=False, default_factory=set, repr=False)
     _running: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -229,6 +239,7 @@ class _EngineWorkerBinding:
             key_prefix=self.config.key_prefix,
             workflow_consumer_group=self.config.workflow_consumer_group,
             activity_consumer_group=self.config.activity_consumer_group,
+            result_wait_timeout_ms=self.config.result_wait_timeout_ms,
             result_poll_interval_ms=self.config.result_poll_interval_ms,
         )
         self._workflow_by_name = {registration.name: registration for registration in self.workflows}
@@ -239,9 +250,15 @@ class _EngineWorkerBinding:
         self._stop_event = asyncio.Event()
         self._stopped_event = asyncio.Event()
         self._stopped_event.set()
+        self._workflow_capacity_event = asyncio.Event()
+        self._workflow_capacity_event.set()
+        self._activity_capacity_event = asyncio.Event()
+        self._activity_capacity_event.set()
         self._redis_store: FluxiRedisStore | None = None
         self._http_client: httpx.AsyncClient | None = None
-        self._tasks: list[asyncio.Task[None]] = []
+        self._poller_tasks = []
+        self._workflow_inflight = set()
+        self._activity_inflight = set()
         self._running = False
 
     async def start(self) -> None:
@@ -250,13 +267,20 @@ class _EngineWorkerBinding:
 
         self._stop_event = asyncio.Event()
         self._stopped_event = asyncio.Event()
+        self._workflow_capacity_event = asyncio.Event()
+        self._workflow_capacity_event.set()
+        self._activity_capacity_event = asyncio.Event()
+        self._activity_capacity_event.set()
+        self._poller_tasks = []
+        self._workflow_inflight = set()
+        self._activity_inflight = set()
         redis = create_redis_client(self._settings)
         self._redis_store = FluxiRedisStore(redis, self._settings)
         self._http_client = httpx.AsyncClient(base_url=self.config.server_url.rstrip("/"))
 
         if self.workflows:
             await self._redis_store.ensure_workflow_queue(self.task_queue)
-            self._tasks.append(
+            self._poller_tasks.append(
                 asyncio.create_task(
                     self._workflow_loop(),
                     name=f"fluxi-sdk:workflow:{self.task_queue}:{self._consumer_name}",
@@ -264,7 +288,7 @@ class _EngineWorkerBinding:
             )
         if self.activities:
             await self._redis_store.ensure_activity_queue(self.task_queue)
-            self._tasks.append(
+            self._poller_tasks.append(
                 asyncio.create_task(
                     self._activity_loop(),
                     name=f"fluxi-sdk:activity:{self.task_queue}:{self._consumer_name}",
@@ -280,11 +304,12 @@ class _EngineWorkerBinding:
         if not self._running:
             return
         self._stop_event.set()
-        tasks, self._tasks = self._tasks, []
+        tasks, self._poller_tasks = self._poller_tasks, []
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        await self._drain_inflight_tasks()
         if self._http_client is not None:
             await self._http_client.aclose()
         if self._redis_store is not None:
@@ -300,21 +325,42 @@ class _EngineWorkerBinding:
         try:
             while not self._stop_event.is_set():
                 try:
-                    payload = await _read_stream_payload(
+                    await self._wait_for_capacity(
+                        self._workflow_inflight,
+                        self.max_concurrent_workflow_tasks,
+                        self._workflow_capacity_event,
+                    )
+                    if self._stop_event.is_set():
+                        continue
+                    available = self.max_concurrent_workflow_tasks - len(
+                        self._workflow_inflight
+                    )
+                    if available <= 0:
+                        continue
+                    payloads = await _read_stream_payloads(
                         self._redis_store,
                         stream_key=stream_key,
                         group_name=self._settings.workflow_consumer_group,
                         consumer_name=self._consumer_name,
+                        count=available,
                     )
-                    if payload is None:
+                    if not payloads:
                         continue
-                    message_id, task_payload = payload
-                    should_ack = await self._process_workflow_task(task_payload)
-                    if should_ack:
-                        await self._redis_store.redis.xack(
-                            stream_key,
-                            self._settings.workflow_consumer_group,
-                            message_id,
+                    for message_id, task_payload in payloads:
+                        self._track_task(
+                            asyncio.create_task(
+                                self._handle_workflow_message(
+                                    stream_key=stream_key,
+                                    message_id=message_id,
+                                    task_payload=task_payload,
+                                ),
+                                name=(
+                                    f"fluxi-sdk:workflow-task:"
+                                    f"{self.task_queue}:{task_payload.get('workflow_task_id')}"
+                                ),
+                            ),
+                            self._workflow_inflight,
+                            self._workflow_capacity_event,
                         )
                 except _REDIS_RECOVERABLE_ERRORS as exc:
                     logger.warning(
@@ -355,21 +401,42 @@ class _EngineWorkerBinding:
         try:
             while not self._stop_event.is_set():
                 try:
-                    payload = await _read_stream_payload(
+                    await self._wait_for_capacity(
+                        self._activity_inflight,
+                        self.max_concurrent_activity_tasks,
+                        self._activity_capacity_event,
+                    )
+                    if self._stop_event.is_set():
+                        continue
+                    available = self.max_concurrent_activity_tasks - len(
+                        self._activity_inflight
+                    )
+                    if available <= 0:
+                        continue
+                    payloads = await _read_stream_payloads(
                         self._redis_store,
                         stream_key=stream_key,
                         group_name=self._settings.activity_consumer_group,
                         consumer_name=self._consumer_name,
+                        count=available,
                     )
-                    if payload is None:
+                    if not payloads:
                         continue
-                    message_id, task_payload = payload
-                    should_ack = await self._process_activity_task(task_payload)
-                    if should_ack:
-                        await self._redis_store.redis.xack(
-                            stream_key,
-                            self._settings.activity_consumer_group,
-                            message_id,
+                    for message_id, task_payload in payloads:
+                        self._track_task(
+                            asyncio.create_task(
+                                self._handle_activity_message(
+                                    stream_key=stream_key,
+                                    message_id=message_id,
+                                    task_payload=task_payload,
+                                ),
+                                name=(
+                                    f"fluxi-sdk:activity-task:"
+                                    f"{self.task_queue}:{task_payload.get('activity_execution_id')}"
+                                ),
+                            ),
+                            self._activity_inflight,
+                            self._activity_capacity_event,
                         )
                 except _REDIS_RECOVERABLE_ERRORS as exc:
                     logger.warning(
@@ -417,6 +484,134 @@ class _EngineWorkerBinding:
     async def _ensure_activity_group(self) -> None:
         assert self._redis_store is not None
         await self._redis_store.ensure_activity_queue(self.task_queue)
+
+    async def _handle_workflow_message(
+        self,
+        *,
+        stream_key: str,
+        message_id: str,
+        task_payload: dict[str, Any],
+    ) -> None:
+        try:
+            should_ack = await self._process_workflow_task(task_payload)
+            if should_ack:
+                assert self._redis_store is not None
+                await self._redis_store.redis.xack(
+                    stream_key,
+                    self._settings.workflow_consumer_group,
+                    message_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except _REDIS_RECOVERABLE_ERRORS as exc:
+            logger.warning(
+                "Transient Redis/Sentinel error while processing workflow task %s on %s: %s",
+                task_payload.get("workflow_task_id"),
+                self.task_queue,
+                exc,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Transient HTTP error while processing workflow task %s on %s: %s",
+                task_payload.get("workflow_task_id"),
+                self.task_queue,
+                exc,
+            )
+        except Exception:
+            logger.exception(
+                "Unexpected error while processing workflow task %s on %s.",
+                task_payload.get("workflow_task_id"),
+                self.task_queue,
+            )
+
+    async def _handle_activity_message(
+        self,
+        *,
+        stream_key: str,
+        message_id: str,
+        task_payload: dict[str, Any],
+    ) -> None:
+        try:
+            should_ack = await self._process_activity_task(task_payload)
+            if should_ack:
+                assert self._redis_store is not None
+                await self._redis_store.redis.xack(
+                    stream_key,
+                    self._settings.activity_consumer_group,
+                    message_id,
+                )
+        except asyncio.CancelledError:
+            raise
+        except _REDIS_RECOVERABLE_ERRORS as exc:
+            logger.warning(
+                "Transient Redis/Sentinel error while processing activity %s on %s: %s",
+                task_payload.get("activity_execution_id"),
+                self.task_queue,
+                exc,
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "Transient HTTP error while processing activity %s on %s: %s",
+                task_payload.get("activity_execution_id"),
+                self.task_queue,
+                exc,
+            )
+        except Exception:
+            logger.exception(
+                "Unexpected error while processing activity %s on %s.",
+                task_payload.get("activity_execution_id"),
+                self.task_queue,
+            )
+
+    async def _drain_inflight_tasks(self, grace_seconds: float = 5.0) -> None:
+        inflight = [*self._workflow_inflight, *self._activity_inflight]
+        if not inflight:
+            return
+        done, pending = await asyncio.wait(inflight, timeout=grace_seconds)
+        if pending:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+
+    async def _wait_for_capacity(
+        self,
+        inflight: set[asyncio.Task[None]],
+        max_concurrency: int,
+        capacity_event: asyncio.Event,
+    ) -> None:
+        while len(inflight) >= max_concurrency and not self._stop_event.is_set():
+            capacity_event.clear()
+            if len(inflight) < max_concurrency:
+                capacity_event.set()
+                return
+            stop_wait = asyncio.create_task(self._stop_event.wait())
+            release_wait = asyncio.create_task(capacity_event.wait())
+            done, pending = await asyncio.wait(
+                {stop_wait, release_wait},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            for task in done:
+                await asyncio.gather(task, return_exceptions=True)
+
+    def _track_task(
+        self,
+        task: asyncio.Task[None],
+        inflight: set[asyncio.Task[None]],
+        capacity_event: asyncio.Event,
+    ) -> None:
+        inflight.add(task)
+
+        def _done(completed: asyncio.Task[None]) -> None:
+            inflight.discard(completed)
+            capacity_event.set()
+
+        task.add_done_callback(_done)
 
     async def _process_workflow_task(self, task_payload: dict[str, Any]) -> bool:
         registration = self._workflow_by_name.get(str(task_payload["workflow_name"]))
@@ -751,29 +946,36 @@ class _WorkflowReplayController:
             )
 
 
-async def _read_stream_payload(
+async def _read_stream_payloads(
     store: FluxiRedisStore,
     *,
     stream_key: str,
     group_name: str,
     consumer_name: str,
-) -> tuple[str, dict[str, Any]] | None:
+    count: int,
+) -> list[tuple[str, dict[str, Any]]]:
     messages = await store.redis.xreadgroup(
         group_name,
         consumer_name,
         {stream_key: ">"},
-        count=1,
+        count=count,
         block=250,
     )
     if not messages:
-        return None
+        return []
     _, stream_messages = messages[0]
     if not stream_messages:
-        return None
-    message_id, values = stream_messages[0]
-    payload = values[b"payload"] if b"payload" in values else values["payload"]
-    decoded_id = message_id.decode("utf-8") if isinstance(message_id, bytes) else message_id
-    return decoded_id, unpackb(payload)
+        return []
+    decoded_messages: list[tuple[str, dict[str, Any]]] = []
+    for message_id, values in stream_messages:
+        payload = values[b"payload"] if b"payload" in values else values["payload"]
+        decoded_id = (
+            message_id.decode("utf-8")
+            if isinstance(message_id, bytes)
+            else message_id
+        )
+        decoded_messages.append((decoded_id, unpackb(payload)))
+    return decoded_messages
 
 
 def _register_workflows(

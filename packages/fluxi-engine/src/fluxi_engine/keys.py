@@ -19,6 +19,10 @@ def workflow_queue(prefix: str, task_queue: str) -> str:
     return f"{prefix}:queue:workflow:{task_queue}"
 
 
+def workflow_result_channel(prefix: str, workflow_id: str) -> str:
+    return f"{prefix}:workflow:{workflow_id}:result"
+
+
 def activity_queue(prefix: str, task_queue: str) -> str:
     return f"{prefix}:queue:activity:{task_queue}"
 

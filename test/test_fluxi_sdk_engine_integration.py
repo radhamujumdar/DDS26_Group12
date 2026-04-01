@@ -168,6 +168,119 @@ class FluxiSdkEngineAsyncTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFluxiSdkEngineIntegration(FluxiSdkEngineAsyncTestCase):
+    async def test_workflow_worker_processes_multiple_workflows_concurrently(self) -> None:
+        started_count = 0
+        started_lock = asyncio.Lock()
+        both_started = asyncio.Event()
+        release = asyncio.Event()
+
+        @workflow.defn(name="BlockingWorkflow")
+        class BlockingWorkflow:
+
+            @workflow.run
+            async def run(self, label: str) -> str:
+                nonlocal started_count
+                async with started_lock:
+                    started_count += 1
+                    if started_count == 2:
+                        both_started.set()
+                await release.wait()
+                return label
+
+        client = WorkflowClient.connect(engine=self.engine)
+        worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[BlockingWorkflow],
+            max_concurrent_workflow_tasks=2,
+        )
+
+        async with worker:
+            first = asyncio.create_task(
+                client.execute_workflow(
+                    BlockingWorkflow.run,
+                    "one",
+                    id="blocking:1",
+                    task_queue="orders",
+                )
+            )
+            second = asyncio.create_task(
+                client.execute_workflow(
+                    BlockingWorkflow.run,
+                    "two",
+                    id="blocking:2",
+                    task_queue="orders",
+                )
+            )
+            await asyncio.wait_for(both_started.wait(), timeout=10)
+            release.set()
+            results = await asyncio.gather(first, second)
+
+        self.assertCountEqual(results, ["one", "two"])
+
+    async def test_activity_worker_processes_multiple_activities_concurrently(self) -> None:
+        started_count = 0
+        started_lock = asyncio.Lock()
+        both_started = asyncio.Event()
+        release = asyncio.Event()
+
+        @activity.defn(name="blocking_activity")
+        async def blocking_activity(label: str) -> str:
+            nonlocal started_count
+            async with started_lock:
+                started_count += 1
+                if started_count == 2:
+                    both_started.set()
+            await release.wait()
+            return label
+
+        @workflow.defn(name="BlockingActivityWorkflow")
+        class BlockingActivityWorkflow:
+
+            @workflow.run
+            async def run(self, label: str) -> str:
+                return await workflow.execute_activity(
+                    "blocking_activity",
+                    label,
+                    task_queue="payment",
+                )
+
+        client = WorkflowClient.connect(engine=self.engine)
+        workflow_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[BlockingActivityWorkflow],
+            max_concurrent_workflow_tasks=2,
+        )
+        activity_worker = Worker(
+            client,
+            task_queue="payment",
+            activities=[blocking_activity],
+            max_concurrent_activity_tasks=2,
+        )
+
+        async with workflow_worker, activity_worker:
+            first = asyncio.create_task(
+                client.execute_workflow(
+                    BlockingActivityWorkflow.run,
+                    "one",
+                    id="activity:1",
+                    task_queue="orders",
+                )
+            )
+            second = asyncio.create_task(
+                client.execute_workflow(
+                    BlockingActivityWorkflow.run,
+                    "two",
+                    id="activity:2",
+                    task_queue="orders",
+                )
+            )
+            await asyncio.wait_for(both_started.wait(), timeout=10)
+            release.set()
+            results = await asyncio.gather(first, second)
+
+        self.assertCountEqual(results, ["one", "two"])
 
     async def test_reference_checkout_happy_path(self) -> None:
         state = ReferenceCheckoutState(

@@ -38,6 +38,7 @@ class EngineConnectionConfig:
     key_prefix: str = "fluxi"
     workflow_consumer_group: str = "fluxi-workflow-workers"
     activity_consumer_group: str = "fluxi-activity-workers"
+    result_wait_timeout_ms: int = 5000
     result_poll_interval_ms: int = 100
 
     def __post_init__(self) -> None:
@@ -69,6 +70,8 @@ class EngineConnectionConfig:
 
         if self.sentinel_min_other_sentinels < 0:
             raise ValueError("sentinel_min_other_sentinels must be at least 0.")
+        if self.result_wait_timeout_ms < 0:
+            raise ValueError("result_wait_timeout_ms must be at least 0.")
 
         if mode == "sentinel":
             if not sentinel_service_name:
@@ -109,6 +112,12 @@ class EngineConnectionConfig:
                 "FLUXI_ACTIVITY_CONSUMER_GROUP",
                 defaults.activity_consumer_group,
             ),
+            result_wait_timeout_ms=int(
+                _env(
+                    "FLUXI_RESULT_WAIT_TIMEOUT_MS",
+                    str(defaults.result_wait_timeout_ms),
+                )
+            ),
             result_poll_interval_ms=int(
                 _env(
                     "FLUXI_RESULT_POLL_INTERVAL_MS",
@@ -143,6 +152,8 @@ class _WorkflowClientBackend(Protocol):
         task_queue: str,
         workflows: Sequence[type[Any]],
         activities: Sequence[Callable[..., Any]],
+        max_concurrent_workflow_tasks: int,
+        max_concurrent_activity_tasks: int,
     ) -> _WorkerBindingBackend: ...
 
 
@@ -202,11 +213,15 @@ class WorkflowClient:
         task_queue: str,
         workflows: Sequence[type[Any]],
         activities: Sequence[Callable[..., Any]],
+        max_concurrent_workflow_tasks: int,
+        max_concurrent_activity_tasks: int,
     ) -> _WorkerBindingBackend:
         return self._backend._create_worker_binding(
             task_queue=task_queue,
             workflows=workflows,
             activities=activities,
+            max_concurrent_workflow_tasks=max_concurrent_workflow_tasks,
+            max_concurrent_activity_tasks=max_concurrent_activity_tasks,
         )
 
     def _resolve_workflow_name(

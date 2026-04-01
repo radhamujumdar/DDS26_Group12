@@ -39,6 +39,7 @@ class FluxiSettings:
     workflow_consumer_group: str = "fluxi-workflow-workers"
     activity_consumer_group: str = "fluxi-activity-workers"
     workflow_task_timeout_ms: int = 30_000
+    result_wait_timeout_ms: int = 5_000
     result_poll_interval_ms: int = 100
     timer_poll_interval_ms: int = 250
     pending_idle_threshold_ms: int = 30_000
@@ -67,6 +68,8 @@ class FluxiSettings:
 
         if self.sentinel_min_other_sentinels < 0:
             raise ValueError("sentinel_min_other_sentinels must be at least 0.")
+        if self.result_wait_timeout_ms < 0:
+            raise ValueError("result_wait_timeout_ms must be at least 0.")
 
         if mode == "sentinel":
             if not sentinel_service_name:
@@ -110,6 +113,12 @@ class FluxiSettings:
                 _env(
                     "FLUXI_WORKFLOW_TASK_TIMEOUT_MS",
                     str(defaults.workflow_task_timeout_ms),
+                )
+            ),
+            result_wait_timeout_ms=int(
+                _env(
+                    "FLUXI_RESULT_WAIT_TIMEOUT_MS",
+                    str(defaults.result_wait_timeout_ms),
                 )
             ),
             result_poll_interval_ms=int(

@@ -7,6 +7,50 @@ from fluxi_engine.scheduler import FluxiScheduler
 
 
 class TestFluxiEngineIntegration(FluxiEngineAsyncTestCase):
+    async def test_wait_for_workflow_result_wakes_on_terminal_notification(self) -> None:
+        started = await self.start_workflow()
+        run_id = started["run_id"]
+        self.assertIsNotNone(run_id)
+
+        _, workflow_task = await self.latest_stream_payload(self.workflow_stream_key())
+        waiter = asyncio.create_task(
+            self.store.wait_for_workflow_result("checkout:1", timeout_ms=1_000)
+        )
+        await asyncio.sleep(0.05)
+        self.assertFalse(waiter.done())
+
+        completion_response = await self.client.post(
+            "/workflow-tasks/complete",
+            json={
+                "run_id": run_id,
+                "workflow_task_id": workflow_task["workflow_task_id"],
+                "attempt_no": workflow_task["attempt_no"],
+                "command": {
+                    "kind": "complete_workflow",
+                    "result_payload_b64": self.payload_b64({"status": "paid"}),
+                },
+            },
+        )
+        completion_response.raise_for_status()
+        snapshot = await asyncio.wait_for(waiter, timeout=1.0)
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.status, "completed")
+
+    async def test_wait_for_workflow_result_times_out_with_running_snapshot(self) -> None:
+        started = await self.start_workflow()
+        self.assertEqual(started["decision"], "started")
+
+        snapshot = await self.store.wait_for_workflow_result(
+            "checkout:1",
+            timeout_ms=50,
+        )
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.status, "running")
+
     async def test_happy_path_vertical_slice(self) -> None:
         started = await self.start_workflow()
         self.assertEqual(started["decision"], "started")

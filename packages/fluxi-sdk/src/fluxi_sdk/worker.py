@@ -18,18 +18,28 @@ class Worker:
         task_queue: str,
         workflows: Sequence[type[Any]] | None = None,
         activities: Sequence[Callable[..., Any]] | None = None,
+        max_concurrent_workflow_tasks: int = 1,
+        max_concurrent_activity_tasks: int = 1,
     ) -> None:
         if not task_queue.strip():
             raise ValueError("task_queue must be a non-empty string.")
+        if max_concurrent_workflow_tasks < 1:
+            raise ValueError("max_concurrent_workflow_tasks must be at least 1.")
+        if max_concurrent_activity_tasks < 1:
+            raise ValueError("max_concurrent_activity_tasks must be at least 1.")
 
         self._client = client
         self.task_queue = task_queue
         self.workflows = tuple(workflows or ())
         self.activities = tuple(activities or ())
+        self.max_concurrent_workflow_tasks = max_concurrent_workflow_tasks
+        self.max_concurrent_activity_tasks = max_concurrent_activity_tasks
         self._binding = client._create_worker_binding(
             task_queue=task_queue,
             workflows=self.workflows,
             activities=self.activities,
+            max_concurrent_workflow_tasks=max_concurrent_workflow_tasks,
+            max_concurrent_activity_tasks=max_concurrent_activity_tasks,
         )
         self._running = False
 

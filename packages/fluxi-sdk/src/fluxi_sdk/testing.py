@@ -302,6 +302,8 @@ class FakeFluxiRuntime:
         task_queue: str,
         workflows: tuple[type[Any], ...] | list[type[Any]],
         activities: tuple[Any, ...] | list[Any],
+        max_concurrent_workflow_tasks: int,
+        max_concurrent_activity_tasks: int,
     ) -> _WorkerBinding:
         workflow_registrations = tuple(
             self._ensure_workflow_registered(workflow_ref)

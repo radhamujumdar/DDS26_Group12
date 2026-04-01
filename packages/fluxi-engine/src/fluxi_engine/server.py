@@ -204,11 +204,17 @@ def create_app(
     @app.get("/workflows/{workflow_id}/result", response_model=WorkflowResultResponse)
     async def get_workflow_result(
         workflow_id: str,
-        wait_ms: int = Query(default=0, ge=0, le=60_000),
+        wait_ms: int | None = Query(default=None, ge=0, le=60_000),
     ) -> WorkflowResultResponse:
+        effective_wait_ms = (
+            settings.result_wait_timeout_ms if wait_ms is None else wait_ms
+        )
         snapshot = (
-            await get_store().wait_for_workflow_result(workflow_id, timeout_ms=wait_ms)
-            if wait_ms > 0
+            await get_store().wait_for_workflow_result(
+                workflow_id,
+                timeout_ms=effective_wait_ms,
+            )
+            if effective_wait_ms > 0
             else await get_store().get_workflow_result(workflow_id)
         )
         if snapshot is None:

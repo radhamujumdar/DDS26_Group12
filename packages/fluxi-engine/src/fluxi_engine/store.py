@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Iterable
 import time
 from typing import Any
@@ -21,6 +20,7 @@ from .keys import (
     workflow_control,
     workflow_history,
     workflow_queue,
+    workflow_result_channel,
     workflow_state,
     workflow_task_queues,
 )
@@ -189,16 +189,40 @@ class FluxiRedisStore:
         *,
         timeout_ms: int,
     ) -> WorkflowResultSnapshot | None:
-        deadline = _now_ms() + timeout_ms
-        while True:
+        snapshot = await self.get_workflow_result(workflow_id)
+        if snapshot is None:
+            return None
+        if snapshot.status in {"completed", "failed"} or timeout_ms <= 0:
+            return snapshot
+
+        channel = workflow_result_channel(self.settings.key_prefix, workflow_id)
+        pubsub = self.redis.pubsub()
+        try:
+            await pubsub.subscribe(channel)
             snapshot = await self.get_workflow_result(workflow_id)
             if snapshot is None:
                 return None
             if snapshot.status in {"completed", "failed"}:
                 return snapshot
-            if _now_ms() >= deadline:
-                return snapshot
-            await asyncio.sleep(self.settings.result_poll_interval_ms / 1000)
+            deadline = time.monotonic() + (timeout_ms / 1000)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                message = await pubsub.get_message(
+                    ignore_subscribe_messages=True,
+                    timeout=min(remaining, 0.25),
+                )
+                if message is not None:
+                    snapshot = await self.get_workflow_result(workflow_id)
+                    if snapshot is not None:
+                        return snapshot
+            return await self.get_workflow_result(workflow_id)
+        finally:
+            try:
+                await pubsub.unsubscribe(channel)
+            finally:
+                await pubsub.aclose()
 
     async def complete_workflow_task(
         self,
@@ -225,13 +249,14 @@ class FluxiRedisStore:
             retry_policy = command.retry_policy or RetryPolicyConfig(max_attempts=1)
             raw = await self.redis.eval(
                 APPLY_WORKFLOW_TASK_COMPLETION,
-                6,
+                7,
                 workflow_control(self.settings.key_prefix, workflow_id),
                 run_state_key,
                 history_key,
                 f"{self.settings.key_prefix}:activity:",
                 activity_queue(self.settings.key_prefix, command.activity_task_queue),
                 timers(self.settings.key_prefix),
+                workflow_result_channel(self.settings.key_prefix, workflow_id),
                 _now_ms(),
                 workflow_task_id,
                 attempt_no,
@@ -251,13 +276,14 @@ class FluxiRedisStore:
             terminal_payload = command.result_payload if command.kind == "complete_workflow" else command.error_payload
             raw = await self.redis.eval(
                 APPLY_WORKFLOW_TASK_COMPLETION,
-                6,
+                7,
                 workflow_control(self.settings.key_prefix, workflow_id),
                 run_state_key,
                 history_key,
                 activity_state(self.settings.key_prefix, "__unused__"),
                 activity_queue(self.settings.key_prefix, "__unused__"),
                 timers(self.settings.key_prefix),
+                workflow_result_channel(self.settings.key_prefix, workflow_id),
                 _now_ms(),
                 workflow_task_id,
                 attempt_no,
