@@ -7,7 +7,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SDK_SRC = REPO_ROOT / "packages" / "fluxi-sdk" / "src"
 ENGINE_SRC = REPO_ROOT / "packages" / "fluxi-engine" / "src"
-ORDER_DIR = REPO_ROOT / "order"
+SHOP_COMMON_SRC = REPO_ROOT / "packages" / "shop-common" / "src"
 
 
 def _purge_preloaded_modules(prefix: str) -> None:
@@ -17,9 +17,9 @@ def _purge_preloaded_modules(prefix: str) -> None:
 
 
 def ensure_repo_paths() -> None:
-    for module_prefix in ("fluxi_sdk", "fluxi_engine"):
+    for module_prefix in ("fluxi_sdk", "fluxi_engine", "shop_common"):
         _purge_preloaded_modules(module_prefix)
-    for path in reversed((SDK_SRC, ENGINE_SRC, ORDER_DIR)):
+    for path in reversed((SDK_SRC, ENGINE_SRC, SHOP_COMMON_SRC, REPO_ROOT)):
         resolved = str(path)
         if resolved in sys.path:
             sys.path.remove(resolved)

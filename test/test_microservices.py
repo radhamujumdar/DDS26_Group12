@@ -1,9 +1,96 @@
 import unittest
+from pathlib import Path
+import os
+import shutil
+import socket
+import subprocess
+import time
+
+import requests
 
 import utils as tu
 
 
 class TestMicroservices(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        docker = shutil.which("docker")
+        if docker is None:
+            raise unittest.SkipTest("Docker is not available for microservice tests.")
+
+        try:
+            subprocess.run(
+                [docker, "info"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except Exception as exc:
+            raise unittest.SkipTest(
+                f"Docker is unavailable for microservice tests: {exc}"
+            ) from exc
+
+        cls._compose_env = os.environ.copy()
+        cls._compose_env["DDS_GATEWAY_PORT"] = str(cls._find_free_port())
+        cls._compose_env["DDS_FLUXI_SERVER_PORT"] = str(cls._find_free_port())
+        cls._compose_env["DDS_GATEWAY_URL"] = (
+            f"http://127.0.0.1:{cls._compose_env['DDS_GATEWAY_PORT']}"
+        )
+        os.environ["DDS_GATEWAY_URL"] = cls._compose_env["DDS_GATEWAY_URL"]
+
+        cls._repo_root = Path(__file__).resolve().parents[1]
+        subprocess.run(
+            [docker, "compose", "up", "-d", "--build"],
+            cwd=cls._repo_root,
+            env=cls._compose_env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        cls._wait_until_gateway_ready()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        docker = shutil.which("docker")
+        if docker is not None:
+            subprocess.run(
+                [docker, "compose", "down", "-v", "--remove-orphans"],
+                cwd=getattr(cls, "_repo_root", Path(__file__).resolve().parents[1]),
+                env=getattr(cls, "_compose_env", os.environ.copy()),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        super().tearDownClass()
+
+    @classmethod
+    def _find_free_port(cls) -> int:
+        sock = socket.socket()
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        return port
+
+    @classmethod
+    def _wait_until_gateway_ready(cls) -> None:
+        deadline = time.time() + 120
+        gateway_url = cls._compose_env["DDS_GATEWAY_URL"]
+        last_error: Exception | None = None
+        while time.time() < deadline:
+            try:
+                response = requests.get(gateway_url, timeout=2)
+                if response.status_code in {200, 404}:
+                    return
+            except Exception as exc:
+                last_error = exc
+            time.sleep(1)
+        raise TimeoutError(
+            f"Timed out waiting for gateway to become ready: {last_error}"
+        )
 
     def test_stock(self):
         # Test /stock/item/create/<price>
