@@ -33,6 +33,7 @@ services:
       - FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS:-64}
       - FLUXI_HTTP_RESULT_MAX_CONNECTIONS=${FLUXI_HTTP_RESULT_MAX_CONNECTIONS:-256}
       - FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS:-128}
+      - FLUXI_RESULT_WAIT_TIMEOUT_MS=${FLUXI_RESULT_WAIT_TIMEOUT_MS:-30000}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w ${ORDER_API_WORKERS:-4} --timeout 30 --log-level=info order.app.main:app
     env_file:
       - env/order_redis.env
@@ -85,7 +86,7 @@ services:
       - FLUXI_SENTINEL_ENDPOINTS=fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
       - FLUXI_SENTINEL_SERVICE_NAME=fluxi-master
       - FLUXI_SENTINEL_MIN_OTHER_SENTINELS=1
-      - FLUXI_RESULT_WAIT_TIMEOUT_MS=5000
+      - FLUXI_RESULT_WAIT_TIMEOUT_MS=${FLUXI_RESULT_WAIT_TIMEOUT_MS:-30000}
     command: uvicorn app:app --host 0.0.0.0 --port 8001 --workers ${FLUXI_SERVER_WORKERS:-4}
     depends_on:
       - fluxi-redis-master
