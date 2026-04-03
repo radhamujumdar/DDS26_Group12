@@ -99,6 +99,12 @@ class TestOrderCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(state["orders"]["order-1"].paid)
         self.assertEqual(state["stock"]["item-1"], 3)
         self.assertEqual(state["credit"]["user-1"], 5)
+        self.assertEqual(len(runtime.workflow_runs[0].activity_executions), 3)
+        self.assertTrue(runtime.workflow_runs[0].activity_executions[2].is_local)
+        self.assertEqual(
+            runtime.workflow_runs[0].activity_executions[2].activity_name,
+            "mark_order_paid",
+        )
 
     async def test_payment_failure_compensates_stock(self) -> None:
         runtime = FakeFluxiRuntime()

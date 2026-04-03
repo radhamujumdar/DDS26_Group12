@@ -22,6 +22,7 @@ from redis.exceptions import ConnectionError, ReadOnlyError, ResponseError, Time
 from fluxi_engine.codecs import from_base64, to_base64, unpackb
 from fluxi_engine.config import FluxiSettings, create_redis_client
 from fluxi_engine.keys import activity_queue, workflow_queue
+from fluxi_engine.models import RetryPolicyConfig, WorkflowTaskCommand
 from fluxi_engine.observability import (
     elapsed_ms,
     redis_stream_message_age_ms,
@@ -49,6 +50,7 @@ from .errors import (
 )
 from .types import ActivityOptions, RetryPolicy, StartPolicy, WorkflowReference
 from .workflow import WorkflowRegistration, _get_workflow_name, _get_workflow_run_callable
+from ._workflow_session import WorkflowSession, build_session_from_history
 
 _WORKFLOW_ACK_OUTCOMES = {"scheduled_activity", "waiting", "completed", "stale", "conflict", "missing"}
 _ACTIVITY_ACK_OUTCOMES = {"accepted", "stale", "conflict", "missing"}
@@ -322,6 +324,12 @@ class EngineWorkflowBackend:
 
 
 @dataclass(slots=True)
+class _WorkflowSessionCacheEntry:
+    session: WorkflowSession
+    updated_at_monotonic: float
+
+
+@dataclass(slots=True)
 class _EngineWorkerBinding:
     config: EngineConnectionConfig
     task_queue: str
@@ -339,18 +347,12 @@ class _EngineWorkerBinding:
     _activity_capacity_event: asyncio.Event = field(init=False, repr=False)
     _sticky_task_queue: str = field(init=False, repr=False)
     _redis_store: FluxiRedisStore | None = field(init=False, default=None, repr=False)
-    _http_client: httpx.AsyncClient | None = field(init=False, default=None, repr=False)
     _poller_tasks: list[asyncio.Task[None]] = field(init=False, default_factory=list, repr=False)
     _workflow_inflight: set[asyncio.Task[None]] = field(init=False, default_factory=set, repr=False)
     _activity_inflight: set[asyncio.Task[None]] = field(init=False, default_factory=set, repr=False)
-    _history_cache: OrderedDict[str, _HistoryCacheEntry] = field(
+    _workflow_sessions: OrderedDict[str, _WorkflowSessionCacheEntry] = field(
         init=False,
         default_factory=OrderedDict,
-        repr=False,
-    )
-    _history_fetch_locks: dict[str, asyncio.Lock] = field(
-        init=False,
-        default_factory=dict,
         repr=False,
     )
     _running: bool = field(init=False, default=False, repr=False)
@@ -387,12 +389,10 @@ class _EngineWorkerBinding:
         self._activity_capacity_event = asyncio.Event()
         self._activity_capacity_event.set()
         self._redis_store: FluxiRedisStore | None = None
-        self._http_client: httpx.AsyncClient | None = None
         self._poller_tasks = []
         self._workflow_inflight = set()
         self._activity_inflight = set()
-        self._history_cache = OrderedDict()
-        self._history_fetch_locks = {}
+        self._workflow_sessions = OrderedDict()
         self._running = False
 
     async def start(self) -> None:
@@ -408,11 +408,9 @@ class _EngineWorkerBinding:
         self._poller_tasks = []
         self._workflow_inflight = set()
         self._activity_inflight = set()
-        self._history_cache = OrderedDict()
-        self._history_fetch_locks = {}
+        self._workflow_sessions = OrderedDict()
         redis = create_redis_client(self._settings)
         self._redis_store = FluxiRedisStore(redis, self._settings)
-        self._http_client = _build_http_client(self.config)
 
         if self.workflows:
             await self._redis_store.ensure_workflow_queue(self.task_queue)
@@ -455,11 +453,9 @@ class _EngineWorkerBinding:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await self._drain_inflight_tasks()
-        if self._http_client is not None:
-            await self._http_client.aclose()
+        await self._clear_workflow_sessions()
         if self._redis_store is not None:
             await self._redis_store.aclose()
-        self._http_client = None
         self._redis_store = None
         self._running = False
         self._stopped_event.set()
@@ -818,11 +814,11 @@ class _EngineWorkerBinding:
                 )
             )
             submit_start = time.perf_counter()
-            outcome = await self._submit_workflow_commands(
+            completion = await self._submit_workflow_commands(
                 run_id=run_id,
                 workflow_task_id=workflow_task_id,
                 attempt_no=attempt_no,
-                commands=[{"kind": "fail_workflow", "error_payload_b64": to_base64(failure_payload)}],
+                commands=[{"kind": "fail_workflow", "error_payload": failure_payload}],
             )
             if TRACE_LOGGING_ENABLED:
                 logger.info(
@@ -833,104 +829,212 @@ class _EngineWorkerBinding:
                     workflow_name,
                     elapsed_ms(submit_start),
                     elapsed_ms(processing_start),
-                    outcome,
+                    completion.outcome,
                 )
-            self._history_cache.pop(run_id, None)
-            return outcome in _WORKFLOW_ACK_OUTCOMES
+            return completion.outcome in _WORKFLOW_ACK_OUTCOMES
 
-        history_fetch_start = time.perf_counter()
-        history = await self._fetch_run_history(run_id)
-        history_fetch_ms = elapsed_ms(history_fetch_start)
-        if TRACE_LOGGING_ENABLED:
-            logger.info(
-                "workflow.task.history_loaded task_queue=%s run_id=%s workflow_task_id=%s history_events=%d duration_ms=%.2f",
-                self.task_queue,
+        if attempt_no > 1:
+            await self._evict_workflow_session(
                 run_id,
-                workflow_task_id,
-                len(history),
-                history_fetch_ms,
+                reason="workflow_task_retry",
             )
-        controller = _WorkflowReplayController(history, task_queue=self.task_queue)
-        workflow_instance = registration.workflow()
-        run_method = getattr(workflow_instance, registration.run_method_name)
-        args = decode_args_payload(controller.workflow_input_payload, run_method)
+
+        session = None
+        cache_hit = False
+        history_event_count = 0
+        history_fetch_ms = 0.0
+        history_apply_ms = 0.0
+        rebuild_reason = "cache_miss"
 
         try:
-            replay_start = time.perf_counter()
-            with workflow._activate_execution_context(
-                registration,
-                self.task_queue,
-                controller.start_activity,
-            ):
-                result = await run_method(*args)
-            controller.assert_fully_replayed()
-            result_payload = encode_payload(result)
-            replay_ms = elapsed_ms(replay_start)
-        except _WorkflowSuspended:
-            replay_ms = elapsed_ms(replay_start)
-            submit_start = time.perf_counter()
-            outcome = await self._submit_workflow_commands(
-                run_id=run_id,
-                workflow_task_id=workflow_task_id,
-                attempt_no=attempt_no,
-                commands=_serialize_workflow_commands(controller.pending_commands),
-            )
+            session_lookup_start = time.perf_counter()
+            session = await self._get_cached_workflow_session(run_id)
+            if session is None:
+                history_fetch_start = time.perf_counter()
+                history, history_index = await self._fetch_history_events(run_id)
+                history_fetch_ms = elapsed_ms(history_fetch_start)
+                history_event_count = len(history)
+                rebuild_start = time.perf_counter()
+                session = build_session_from_history(
+                    run_id=run_id,
+                    workflow_id=str(task_payload["workflow_id"]),
+                    task_queue=self.task_queue,
+                    history=history,
+                    history_index=history_index,
+                    registration=registration,
+                    activity_by_name=self._activity_by_name,
+                )
+                history_apply_ms = elapsed_ms(rebuild_start)
+                await self._remember_workflow_session(run_id, session)
+            else:
+                cache_hit = True
+                rebuild_reason = "cache_hit"
+                history_fetch_start = time.perf_counter()
+                history, history_index = await self._fetch_history_events(
+                    run_id,
+                    after_index=session.last_history_index,
+                )
+                history_fetch_ms = elapsed_ms(history_fetch_start)
+                history_event_count = len(history)
+                apply_start = time.perf_counter()
+                session.apply_history_events(history, next_index=history_index)
+                history_apply_ms = elapsed_ms(apply_start)
+                await self._remember_workflow_session(run_id, session)
             if TRACE_LOGGING_ENABLED:
                 logger.info(
-                    "workflow.task.suspended task_queue=%s run_id=%s workflow_task_id=%s pending_commands=%d replay_ms=%.2f submit_ms=%.2f total_ms=%.2f outcome=%s",
+                    "workflow.session.%s task_queue=%s run_id=%s workflow_task_id=%s history_events=%d history_fetch_ms=%.2f history_apply_ms=%.2f lookup_ms=%.2f",
+                    "hit" if cache_hit else "rebuild",
                     self.task_queue,
                     run_id,
                     workflow_task_id,
-                    len(controller.pending_commands),
-                    replay_ms,
-                    elapsed_ms(submit_start),
-                    elapsed_ms(processing_start),
-                    outcome,
+                    history_event_count,
+                    history_fetch_ms,
+                    history_apply_ms,
+                    elapsed_ms(session_lookup_start),
                 )
-            return outcome in _WORKFLOW_ACK_OUTCOMES
+
+            drive_start = time.perf_counter()
+            drive_result = await session.drive()
+            drive_ms = elapsed_ms(drive_start)
+            if (
+                drive_result.status == "suspended"
+                and not drive_result.commands
+                and drive_result.waiting_remote_execution_id is not None
+            ):
+                for _ in range(2):
+                    refresh_start = time.perf_counter()
+                    refresh_events, refresh_index = await self._fetch_history_events(
+                        run_id,
+                        after_index=session.last_history_index,
+                    )
+                    refresh_fetch_ms = elapsed_ms(refresh_start)
+                    if not refresh_events:
+                        break
+                    session.apply_history_events(refresh_events, next_index=refresh_index)
+                    retry_drive_start = time.perf_counter()
+                    drive_result = await session.drive()
+                    drive_ms += elapsed_ms(retry_drive_start)
+                    if TRACE_LOGGING_ENABLED:
+                        logger.info(
+                            "workflow.session.refresh task_queue=%s run_id=%s workflow_task_id=%s history_events=%d history_fetch_ms=%.2f waiting_activity=%s",
+                            self.task_queue,
+                            run_id,
+                            workflow_task_id,
+                            len(refresh_events),
+                            refresh_fetch_ms,
+                            drive_result.waiting_remote_execution_id,
+                        )
+                    if (
+                        drive_result.status != "suspended"
+                        or drive_result.commands
+                        or drive_result.waiting_remote_execution_id is None
+                    ):
+                        break
+
+            commands = list(drive_result.commands)
+            if drive_result.status == "completed":
+                commands.append(
+                    {
+                        "kind": "complete_workflow",
+                        "result_payload": drive_result.result_payload,
+                    }
+                )
+            elif drive_result.status == "failed":
+                commands.append(
+                    {
+                        "kind": "fail_workflow",
+                        "error_payload": drive_result.failure_payload,
+                    }
+                )
+
+            submit_start = time.perf_counter()
+            completion = await self._submit_workflow_commands(
+                run_id=run_id,
+                workflow_task_id=workflow_task_id,
+                attempt_no=attempt_no,
+                commands=commands,
+            )
+            submit_ms = elapsed_ms(submit_start)
+
+            expected_execution_ids = tuple(
+                str(command["activity_execution_id"])
+                for command in commands
+                if command["kind"] == "schedule_activity"
+            )
+            if expected_execution_ids and completion.activity_execution_ids:
+                actual_execution_ids = tuple(completion.activity_execution_ids)
+                if expected_execution_ids != actual_execution_ids:
+                    logger.warning(
+                        "workflow.task.execution_id_mismatch task_queue=%s run_id=%s workflow_task_id=%s expected=%s actual=%s",
+                        self.task_queue,
+                        run_id,
+                        workflow_task_id,
+                        expected_execution_ids,
+                        actual_execution_ids,
+                    )
+                    await self._evict_workflow_session(
+                        run_id,
+                        reason="activity_execution_id_mismatch",
+                    )
+
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "workflow.task.%s task_queue=%s run_id=%s workflow_task_id=%s pending_commands=%d cache_hit=%s rebuild_reason=%s waiting_activity=%s drive_ms=%.2f submit_ms=%.2f total_ms=%.2f outcome=%s",
+                    drive_result.status,
+                    self.task_queue,
+                    run_id,
+                    workflow_task_id,
+                    len(commands),
+                    cache_hit,
+                    rebuild_reason,
+                    drive_result.waiting_remote_execution_id,
+                    drive_ms,
+                    submit_ms,
+                    elapsed_ms(processing_start),
+                    completion.outcome,
+                )
+
+            if drive_result.status in {"completed", "failed"} or completion.outcome in {
+                "stale",
+                "conflict",
+                "missing",
+            }:
+                await self._evict_workflow_session(
+                    run_id,
+                    reason=drive_result.status,
+                )
+            elif completion.outcome in _WORKFLOW_ACK_OUTCOMES:
+                await self._remember_workflow_session(run_id, session)
+            else:
+                await self._evict_workflow_session(
+                    run_id,
+                    reason=f"submit_outcome:{completion.outcome}",
+                )
+            return completion.outcome in _WORKFLOW_ACK_OUTCOMES
         except BaseException as exc:
             failure_payload = _safe_failure_payload(exc)
             submit_start = time.perf_counter()
-            outcome = await self._submit_workflow_commands(
+            completion = await self._submit_workflow_commands(
                 run_id=run_id,
                 workflow_task_id=workflow_task_id,
                 attempt_no=attempt_no,
-                commands=[{"kind": "fail_workflow", "error_payload_b64": to_base64(failure_payload)}],
+                commands=[{"kind": "fail_workflow", "error_payload": failure_payload}],
             )
             if TRACE_LOGGING_ENABLED:
                 logger.info(
-                    "workflow.task.failed task_queue=%s run_id=%s workflow_task_id=%s error_type=%s submit_ms=%.2f total_ms=%.2f outcome=%s",
+                    "workflow.task.failed task_queue=%s run_id=%s workflow_task_id=%s cache_hit=%s history_events=%d error_type=%s submit_ms=%.2f total_ms=%.2f outcome=%s",
                     self.task_queue,
                     run_id,
                     workflow_task_id,
+                    cache_hit,
+                    history_event_count,
                     exc.__class__.__name__,
                     elapsed_ms(submit_start),
                     elapsed_ms(processing_start),
-                    outcome,
+                    completion.outcome,
                 )
-            self._history_cache.pop(run_id, None)
-            return outcome in _WORKFLOW_ACK_OUTCOMES
-
-        submit_start = time.perf_counter()
-        outcome = await self._submit_workflow_commands(
-            run_id=run_id,
-            workflow_task_id=workflow_task_id,
-            attempt_no=attempt_no,
-            commands=[{"kind": "complete_workflow", "result_payload_b64": to_base64(result_payload)}],
-        )
-        if TRACE_LOGGING_ENABLED:
-            logger.info(
-                "workflow.task.completed task_queue=%s run_id=%s workflow_task_id=%s replay_ms=%.2f submit_ms=%.2f total_ms=%.2f outcome=%s",
-                self.task_queue,
-                run_id,
-                workflow_task_id,
-                replay_ms,
-                elapsed_ms(submit_start),
-                elapsed_ms(processing_start),
-                outcome,
-            )
-        self._history_cache.pop(run_id, None)
-        return outcome in _WORKFLOW_ACK_OUTCOMES
+            await self._evict_workflow_session(run_id, reason="workflow_failure")
+            return completion.outcome in _WORKFLOW_ACK_OUTCOMES
 
     async def _process_activity_task(self, task_payload: dict[str, Any]) -> bool:
         activity_name = str(task_payload["activity_name"])
@@ -993,7 +1097,7 @@ class _EngineWorkerBinding:
             error_type = ""
 
         submit_start = time.perf_counter()
-        outcome = await self._submit_activity_completion(
+        completion = await self._submit_activity_completion(
             activity_execution_id=activity_execution_id,
             attempt_no=attempt_no,
             status=status,
@@ -1012,79 +1116,67 @@ class _EngineWorkerBinding:
                 elapsed_ms(submit_start),
                 elapsed_ms(processing_start),
                 len(payload),
-                outcome,
+                completion.outcome,
             )
-        return outcome in _ACTIVITY_ACK_OUTCOMES
+        return completion.outcome in _ACTIVITY_ACK_OUTCOMES
 
-    async def _fetch_run_history(self, run_id: str) -> list[dict[str, Any]]:
-        assert self._http_client is not None
-        history_lock = self._history_fetch_locks.get(run_id)
-        if history_lock is None:
-            history_lock = asyncio.Lock()
-            self._history_fetch_locks[run_id] = history_lock
+    async def _get_cached_workflow_session(self, run_id: str) -> WorkflowSession | None:
+        cache_entry = self._workflow_sessions.get(run_id)
+        if cache_entry is None:
+            return None
+        age_ms = (time.monotonic() - cache_entry.updated_at_monotonic) * 1000
+        if age_ms > self._settings.sticky_cache_ttl_ms:
+            await self._evict_workflow_session(run_id, reason="ttl_expired")
+            return None
+        self._workflow_sessions.move_to_end(run_id)
+        return cache_entry.session
 
-        try:
-            async with history_lock:
-                while True:
-                    cache_entry = self._history_cache.get(run_id)
-                    after_index: int | None = None
-                    if cache_entry is not None:
-                        if (
-                            (time.monotonic() - cache_entry.updated_at_monotonic) * 1000
-                            > self._settings.sticky_cache_ttl_ms
-                        ):
-                            self._history_cache.pop(run_id, None)
-                            cache_entry = None
-                        else:
-                            after_index = cache_entry.next_index
-                            self._history_cache.move_to_end(run_id)
+    async def _remember_workflow_session(
+        self,
+        run_id: str,
+        session: WorkflowSession,
+    ) -> None:
+        self._workflow_sessions[run_id] = _WorkflowSessionCacheEntry(
+            session=session,
+            updated_at_monotonic=time.monotonic(),
+        )
+        self._workflow_sessions.move_to_end(run_id)
+        while len(self._workflow_sessions) > self._settings.sticky_cache_max_runs:
+            expired_run_id, expired_entry = self._workflow_sessions.popitem(last=False)
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "workflow.session.evict task_queue=%s run_id=%s reason=lru_evict",
+                    self.task_queue,
+                    expired_run_id,
+                )
+            await expired_entry.session.cancel()
 
-                    response = await self._http_client.get(
-                        f"/runs/{run_id}/history",
-                        params={"after_index": after_index} if after_index is not None else None,
-                    )
-                    response.raise_for_status()
-                    body = response.json()
-                    events = [_restore_history_event(event) for event in body["events"]]
-                    next_index = int(body.get("next_index", len(events) - 1))
+    async def _evict_workflow_session(self, run_id: str, *, reason: str) -> None:
+        cache_entry = self._workflow_sessions.pop(run_id, None)
+        if cache_entry is None:
+            return
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "workflow.session.evict task_queue=%s run_id=%s reason=%s",
+                self.task_queue,
+                run_id,
+                reason,
+            )
+        await cache_entry.session.cancel()
 
-                    if cache_entry is None:
-                        cache_entry = _HistoryCacheEntry(
-                            history=events,
-                            next_index=next_index,
-                            updated_at_monotonic=time.monotonic(),
-                        )
-                        self._history_cache[run_id] = cache_entry
-                    else:
-                        if next_index < cache_entry.next_index:
-                            self._history_cache.pop(run_id, None)
-                            continue
+    async def _clear_workflow_sessions(self) -> None:
+        run_ids = list(self._workflow_sessions.keys())
+        for run_id in run_ids:
+            await self._evict_workflow_session(run_id, reason="worker_shutdown")
 
-                        events_to_append = events
-                        if after_index is not None:
-                            response_start = after_index + 1
-                            overlap = cache_entry.next_index - response_start + 1
-                            if overlap > 0:
-                                overlap = min(overlap, len(events))
-                                existing_slice = cache_entry.history[
-                                    response_start : response_start + overlap
-                                ]
-                                if existing_slice != events[:overlap]:
-                                    self._history_cache.pop(run_id, None)
-                                    continue
-                                events_to_append = events[overlap:]
-
-                        cache_entry.history.extend(events_to_append)
-                        cache_entry.next_index = max(cache_entry.next_index, next_index)
-                        cache_entry.updated_at_monotonic = time.monotonic()
-
-                    while len(self._history_cache) > self._settings.sticky_cache_max_runs:
-                        self._history_cache.popitem(last=False)
-                    return list(cache_entry.history)
-        finally:
-            waiters = getattr(history_lock, "_waiters", None)
-            if not history_lock.locked() and not waiters:
-                self._history_fetch_locks.pop(run_id, None)
+    async def _fetch_history_events(
+        self,
+        run_id: str,
+        *,
+        after_index: int | None = None,
+    ) -> tuple[list[dict[str, Any]], int]:
+        assert self._redis_store is not None
+        return await self._redis_store.get_history_page(run_id, after_index=after_index)
 
     async def _submit_workflow_commands(
         self,
@@ -1093,23 +1185,18 @@ class _EngineWorkerBinding:
         workflow_task_id: str,
         attempt_no: int,
         commands: list[dict[str, Any]],
-    ) -> str:
-        assert self._http_client is not None
+    ):
+        assert self._redis_store is not None
         sticky_expires_at_ms = int(time.time() * 1000) + self._settings.sticky_schedule_to_start_timeout_ms
-        response = await self._http_client.post(
-            "/workflow-tasks/complete",
-            json={
-                "run_id": run_id,
-                "workflow_task_id": workflow_task_id,
-                "attempt_no": attempt_no,
-                "sticky_task_queue": self._sticky_task_queue,
-                "sticky_owner_id": self._consumer_name,
-                "sticky_expires_at_ms": sticky_expires_at_ms,
-                "commands": commands,
-            },
+        return await self._redis_store.complete_workflow_task(
+            run_id=run_id,
+            workflow_task_id=workflow_task_id,
+            attempt_no=attempt_no,
+            sticky_task_queue=self._sticky_task_queue,
+            sticky_owner_id=self._consumer_name,
+            sticky_expires_at_ms=sticky_expires_at_ms,
+            commands=[_to_store_workflow_command(command) for command in commands],
         )
-        response.raise_for_status()
-        return response.json()["outcome"]
 
     async def _submit_activity_completion(
         self,
@@ -1118,20 +1205,14 @@ class _EngineWorkerBinding:
         attempt_no: int,
         status: str,
         payload: bytes,
-    ) -> str:
-        assert self._http_client is not None
-        response = await self._http_client.post(
-            "/activity-tasks/complete",
-            json={
-                "activity_execution_id": activity_execution_id,
-                "attempt_no": attempt_no,
-                "status": status,
-                "result_payload_b64": to_base64(payload) if status == "completed" else None,
-                "error_payload_b64": to_base64(payload) if status == "failed" else None,
-            },
+    ):
+        assert self._redis_store is not None
+        return await self._redis_store.complete_activity_task(
+            activity_execution_id=activity_execution_id,
+            attempt_no=attempt_no,
+            status=status,
+            payload=payload,
         )
-        response.raise_for_status()
-        return response.json()["outcome"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -1408,6 +1489,38 @@ def _retry_policy_payload(retry_policy: RetryPolicy | None) -> dict[str, Any] | 
             else None
         ),
     }
+
+
+def _to_store_workflow_command(command: dict[str, Any]) -> WorkflowTaskCommand:
+    retry_policy = command.get("retry_policy")
+    retry_policy_config = None
+    if retry_policy is not None:
+        retry_policy_config = RetryPolicyConfig(
+            max_attempts=retry_policy.max_attempts,
+            initial_interval_ms=(
+                int(retry_policy.initial_interval_seconds * 1000)
+                if retry_policy.initial_interval_seconds is not None
+                else None
+            ),
+            backoff_coefficient=retry_policy.backoff_coefficient,
+            max_interval_ms=(
+                int(retry_policy.max_interval_seconds * 1000)
+                if retry_policy.max_interval_seconds is not None
+                else None
+            ),
+        )
+    return WorkflowTaskCommand(
+        kind=command["kind"],
+        activity_execution_id=command.get("activity_execution_id"),
+        activity_name=command.get("activity_name"),
+        activity_task_queue=command.get("activity_task_queue"),
+        activity_status=command.get("activity_status"),
+        input_payload=command.get("input_payload"),
+        retry_policy=retry_policy_config,
+        schedule_to_close_timeout_ms=command.get("schedule_to_close_timeout_ms"),
+        result_payload=command.get("result_payload"),
+        error_payload=command.get("error_payload"),
+    )
 
 
 def _safe_failure_payload(exc: BaseException) -> bytes:

@@ -188,21 +188,25 @@ end
 local offset = 9
 for _ = 1, command_count do
     local kind = ARGV[offset]
-    local activity_name = ARGV[offset + 1]
-    local activity_task_queue = ARGV[offset + 2]
-    local activity_queue_key = ARGV[offset + 3]
-    local input_payload = ARGV[offset + 4]
-    local schedule_to_close_timeout_ms = tonumber(ARGV[offset + 5] or '0')
-    local max_attempts = tonumber(ARGV[offset + 6] or '1')
-    local initial_interval_ms = tonumber(ARGV[offset + 7] or '0')
-    local backoff_coefficient = tonumber(ARGV[offset + 8] or '0')
-    local max_interval_ms = tonumber(ARGV[offset + 9] or '0')
-    local result_payload = ARGV[offset + 10]
-    local error_payload = ARGV[offset + 11]
-    offset = offset + 12
+    local activity_execution_id = ARGV[offset + 1]
+    local activity_name = ARGV[offset + 2]
+    local activity_task_queue = ARGV[offset + 3]
+    local activity_queue_key = ARGV[offset + 4]
+    local activity_status = ARGV[offset + 5]
+    local input_payload = ARGV[offset + 6]
+    local schedule_to_close_timeout_ms = tonumber(ARGV[offset + 7] or '0')
+    local max_attempts = tonumber(ARGV[offset + 8] or '1')
+    local initial_interval_ms = tonumber(ARGV[offset + 9] or '0')
+    local backoff_coefficient = tonumber(ARGV[offset + 10] or '0')
+    local max_interval_ms = tonumber(ARGV[offset + 11] or '0')
+    local result_payload = ARGV[offset + 12]
+    local error_payload = ARGV[offset + 13]
+    offset = offset + 14
 
     if kind == 'schedule_activity' then
-        local activity_execution_id = run_id .. ':act:' .. tostring(activity_sequence)
+        if activity_execution_id == nil or activity_execution_id == '' then
+            activity_execution_id = run_id .. ':act:' .. tostring(activity_sequence)
+        end
         local activity_key = activity_key_prefix .. activity_execution_id
         local activity_event = pack({
             event_id = next_event_id,
@@ -271,6 +275,29 @@ for _ = 1, command_count do
         redis.call('RPUSH', history_key, activity_event)
         redis.call('XADD', activity_queue_key, '*', 'payload', activity_task)
 
+        next_event_id = next_event_id + 1
+        activity_sequence = activity_sequence + 1
+    elseif kind == 'record_local_activity' then
+        local local_activity_event = pack({
+            event_id = next_event_id,
+            event_type = 'LocalActivityRecorded',
+            timestamp_ms = now_ms,
+            run_id = run_id,
+            workflow_id = workflow_id,
+            activity_execution_id = activity_execution_id,
+            activity_name = activity_name,
+            input_payload = input_payload,
+            schedule_to_close_timeout_ms = schedule_to_close_timeout_ms,
+            max_attempts = max_attempts,
+            initial_interval_ms = initial_interval_ms,
+            backoff_coefficient = backoff_coefficient,
+            max_interval_ms = max_interval_ms,
+            status = activity_status,
+            result_payload = result_payload,
+            error_payload = error_payload,
+        })
+
+        redis.call('RPUSH', history_key, local_activity_event)
         next_event_id = next_event_id + 1
         activity_sequence = activity_sequence + 1
     elseif kind == 'complete_workflow' then

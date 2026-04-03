@@ -133,6 +133,7 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
             registration,
             "orders",
             execute_activity,
+            execute_activity,
         ):
             result = await workflow.execute_activity(
                 reserve_stock,
@@ -168,6 +169,7 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
             registration,
             "orders",
             execute_activity,
+            execute_activity,
         ):
             result = await workflow.execute_activity(
                 "charge_payment",
@@ -192,6 +194,7 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
             registration,
             "orders",
             schedule_activity,
+            schedule_activity,
         ):
             handle = workflow.start_activity(
                 "charge_payment",
@@ -204,6 +207,29 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured["name"], "charge_payment")
         self.assertEqual(captured["args"], ("user-1",))
         self.assertEqual(captured["options"].task_queue, "payment")
+
+    async def test_execute_local_activity_uses_workflow_task_queue(self):
+        registration = self._workflow_registration()
+        captured: dict[str, object] = {}
+
+        async def schedule_local_activity(name, args, options):
+            captured["name"] = name
+            captured["args"] = args
+            captured["options"] = options
+            return f"local:{name}"
+
+        with workflow._activate_execution_context(
+            registration,
+            "orders",
+            schedule_local_activity,
+            schedule_local_activity,
+        ):
+            result = await workflow.execute_local_activity("mark_order_paid", "order-1")
+
+        self.assertEqual(result, "local:mark_order_paid")
+        self.assertEqual(captured["name"], "mark_order_paid")
+        self.assertEqual(captured["args"], ("order-1",))
+        self.assertIsNone(captured["options"].task_queue)
 
 
 if __name__ == "__main__":

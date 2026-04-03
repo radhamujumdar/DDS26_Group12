@@ -403,6 +403,59 @@ class TestFluxiSdkEngineIntegration(FluxiSdkEngineAsyncTestCase):
 
         self.assertEqual(result, ("alpha", "beta", "gamma"))
 
+    async def test_remote_then_local_activity_completes_in_same_followup_workflow_task(self) -> None:
+        @activity.defn(name="remote_step")
+        async def remote_step() -> str:
+            await asyncio.sleep(0)
+            return "remote"
+
+        @activity.defn(name="local_step")
+        def local_step() -> str:
+            info = activity.info()
+            return f"local:{info.activity_execution_id}"
+
+        @workflow.defn(name="RemoteThenLocalWorkflow")
+        class RemoteThenLocalWorkflow:
+
+            @workflow.run
+            async def run(self) -> tuple[str, str]:
+                remote_result = await workflow.execute_activity(
+                    "remote_step",
+                    task_queue="orders",
+                )
+                local_result = await workflow.execute_local_activity("local_step")
+                return remote_result, local_result
+
+        client = WorkflowClient.connect(engine=self.engine)
+        worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[RemoteThenLocalWorkflow],
+            activities=[remote_step, local_step],
+        )
+
+        async with worker:
+            result = await client.execute_workflow(
+                RemoteThenLocalWorkflow.run,
+                id="remote-local:1",
+                task_queue="orders",
+            )
+
+        self.assertEqual(result[0], "remote")
+        self.assertTrue(result[1].startswith("local:run-"))
+        run_id = await self._wait_for_run_id("remote-local:1")
+        history = await self.assertion_store.get_history(run_id)
+        self.assertEqual(
+            [event["event_type"] for event in history],
+            [
+                "WorkflowStarted",
+                "ActivityScheduled",
+                "ActivityCompleted",
+                "LocalActivityRecorded",
+                "WorkflowCompleted",
+            ],
+        )
+
     async def test_reference_checkout_happy_path(self) -> None:
         state = ReferenceCheckoutState(
             orders={
@@ -551,8 +604,9 @@ class TestFluxiSdkEngineIntegration(FluxiSdkEngineAsyncTestCase):
         mode = {"use_second": False}
 
         @activity.defn(name="first_step")
-        def first_step() -> str:
+        async def first_step() -> str:
             mode["use_second"] = True
+            await asyncio.sleep(0.05)
             return "first"
 
         @activity.defn(name="second_step")
@@ -570,7 +624,16 @@ class TestFluxiSdkEngineIntegration(FluxiSdkEngineAsyncTestCase):
                     await workflow.execute_activity("first_step", task_queue="orders")
                 return "done"
 
-        client = WorkflowClient.connect(engine=self.engine)
+        engine = EngineConnectionConfig(
+            server_url=self.engine.server_url,
+            redis_url=self.engine.redis_url,
+            key_prefix=self.engine.key_prefix,
+            workflow_consumer_group=self.engine.workflow_consumer_group,
+            activity_consumer_group=self.engine.activity_consumer_group,
+            result_poll_interval_ms=self.engine.result_poll_interval_ms,
+            sticky_cache_ttl_ms=1,
+        )
+        client = WorkflowClient.connect(engine=engine)
         worker = Worker(
             client,
             task_queue="orders",

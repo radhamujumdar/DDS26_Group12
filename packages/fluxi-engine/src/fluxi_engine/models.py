@@ -8,7 +8,12 @@ from typing import Literal
 
 TerminalStatus = Literal["completed", "failed"]
 StartDecision = Literal["started", "attached", "existing_terminal", "duplicate_rejected"]
-WorkflowCommandKind = Literal["schedule_activity", "complete_workflow", "fail_workflow"]
+WorkflowCommandKind = Literal[
+    "schedule_activity",
+    "record_local_activity",
+    "complete_workflow",
+    "fail_workflow",
+]
 ActivityCompletionStatus = Literal["completed", "failed"]
 
 
@@ -43,8 +48,10 @@ class WorkflowResultSnapshot:
 @dataclass(frozen=True, slots=True)
 class WorkflowTaskCommand:
     kind: WorkflowCommandKind
+    activity_execution_id: str | None = None
     activity_name: str | None = None
     activity_task_queue: str | None = None
+    activity_status: ActivityCompletionStatus | None = None
     input_payload: bytes | None = None
     retry_policy: RetryPolicyConfig | None = None
     schedule_to_close_timeout_ms: int | None = None

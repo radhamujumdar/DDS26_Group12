@@ -313,12 +313,14 @@ class FluxiRedisStore:
                 eval_args.extend(
                     [
                         command.kind,
+                        command.activity_execution_id or "",
                         command.activity_name,
                         command.activity_task_queue,
                         activity_queue(
                             self.settings.key_prefix,
                             command.activity_task_queue,
                         ),
+                        "",
                         command.input_payload or b"",
                         command.schedule_to_close_timeout_ms or 0,
                         retry_policy.max_attempts or 1,
@@ -329,10 +331,40 @@ class FluxiRedisStore:
                         b"",
                     ]
                 )
+            elif command.kind == "record_local_activity":
+                if (
+                    command.activity_execution_id is None
+                    or command.activity_name is None
+                    or command.activity_status is None
+                ):
+                    raise ValueError(
+                        "record_local_activity requires execution id, activity name and activity status."
+                    )
+                retry_policy = command.retry_policy or RetryPolicyConfig(max_attempts=1)
+                eval_args.extend(
+                    [
+                        command.kind,
+                        command.activity_execution_id,
+                        command.activity_name,
+                        "",
+                        "",
+                        command.activity_status,
+                        command.input_payload or b"",
+                        command.schedule_to_close_timeout_ms or 0,
+                        retry_policy.max_attempts or 1,
+                        retry_policy.initial_interval_ms or 0,
+                        retry_policy.backoff_coefficient or 0,
+                        retry_policy.max_interval_ms or 0,
+                        command.result_payload or b"",
+                        command.error_payload or b"",
+                    ]
+                )
             elif command.kind == "complete_workflow":
                 eval_args.extend(
                     [
                         command.kind,
+                        "",
+                        "",
                         "",
                         "",
                         "",
@@ -350,6 +382,8 @@ class FluxiRedisStore:
                 eval_args.extend(
                     [
                         command.kind,
+                        "",
+                        "",
                         "",
                         "",
                         "",

@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import time
 from datetime import timedelta
 import unittest
 from unittest import mock
@@ -16,7 +17,11 @@ from fluxi_sdk import (
     WorkflowClient,
 )
 from fluxi_sdk import activity, client, errors, testing, types, worker, workflow
-from fluxi_sdk._engine_backend import EngineWorkflowBackend, _EngineWorkerBinding
+from fluxi_sdk._engine_backend import (
+    EngineWorkflowBackend,
+    _EngineWorkerBinding,
+    _WorkflowSessionCacheEntry,
+)
 
 
 class TestFluxiSdkContract(unittest.TestCase):
@@ -72,6 +77,38 @@ class TestFluxiSdkContract(unittest.TestCase):
             ],
         )
         self.assertFalse(inspect.iscoroutinefunction(workflow.start_activity))
+
+    def test_execute_local_activity_signature(self):
+        signature = inspect.signature(workflow.execute_local_activity)
+
+        self.assertEqual(
+            list(signature.parameters),
+            [
+                "activity",
+                "activity_args",
+                "retry_policy",
+                "schedule_to_close_timeout",
+                "args",
+                "timeout_seconds",
+            ],
+        )
+        self.assertTrue(inspect.iscoroutinefunction(workflow.execute_local_activity))
+
+    def test_start_local_activity_signature(self):
+        signature = inspect.signature(workflow.start_local_activity)
+
+        self.assertEqual(
+            list(signature.parameters),
+            [
+                "activity",
+                "activity_args",
+                "retry_policy",
+                "schedule_to_close_timeout",
+                "args",
+                "timeout_seconds",
+            ],
+        )
+        self.assertFalse(inspect.iscoroutinefunction(workflow.start_local_activity))
 
     def test_client_execute_workflow_signature(self):
         signature = inspect.signature(WorkflowClient.execute_workflow)
@@ -254,7 +291,7 @@ class TestFluxiSdkEngineHttpClient(unittest.IsolatedAsyncioTestCase):
 
 
 class TestFluxiSdkEngineHistoryCache(unittest.IsolatedAsyncioTestCase):
-    async def test_worker_history_fetch_uses_after_index_on_cache_hit(self):
+    async def test_worker_history_fetch_uses_store_after_index(self):
         config = EngineConnectionConfig(
             server_url="http://localhost:8000",
             redis_url="redis://localhost:6379/0",
@@ -267,50 +304,48 @@ class TestFluxiSdkEngineHistoryCache(unittest.IsolatedAsyncioTestCase):
             max_concurrent_workflow_tasks=1,
             max_concurrent_activity_tasks=1,
         )
-        fake_client = _HistoryClient(
+        fake_store = _HistoryStore(
             [
-                _HistoryResponse(
-                    {
-                        "events": [
-                            {"event_type": "WorkflowStarted", "input_payload": None},
-                            {"event_type": "ActivityScheduled", "input_payload": None},
-                        ],
-                        "next_index": 1,
-                    }
+                (
+                    [
+                        {"event_type": "WorkflowStarted", "input_payload": None},
+                        {"event_type": "ActivityScheduled", "input_payload": None},
+                    ],
+                    1,
                 ),
-                _HistoryResponse(
-                    {
-                        "events": [
-                            {
-                                "event_type": "ActivityCompleted",
-                                "result_payload": None,
-                                "activity_execution_id": "run-1:act:1",
-                            }
-                        ],
-                        "next_index": 2,
-                    }
+                (
+                    [
+                        {
+                            "event_type": "ActivityCompleted",
+                            "result_payload": None,
+                            "activity_execution_id": "run-1:act:1",
+                        }
+                    ],
+                    2,
                 ),
             ]
         )
-        binding._http_client = fake_client
+        binding._redis_store = fake_store
 
-        first = await binding._fetch_run_history("run-1")
-        second = await binding._fetch_run_history("run-1")
+        first, first_index = await binding._fetch_history_events("run-1")
+        second, second_index = await binding._fetch_history_events("run-1", after_index=1)
 
-        self.assertEqual([event["event_type"] for event in first], ["WorkflowStarted", "ActivityScheduled"])
         self.assertEqual(
-            [event["event_type"] for event in second],
-            ["WorkflowStarted", "ActivityScheduled", "ActivityCompleted"],
+            [event["event_type"] for event in first],
+            ["WorkflowStarted", "ActivityScheduled"],
         )
+        self.assertEqual([event["event_type"] for event in second], ["ActivityCompleted"])
+        self.assertEqual(first_index, 1)
+        self.assertEqual(second_index, 2)
         self.assertEqual(
-            fake_client.calls,
+            fake_store.calls,
             [
-                ("/runs/run-1/history", None),
-                ("/runs/run-1/history", {"after_index": 1}),
+                ("run-1", None),
+                ("run-1", 1),
             ],
         )
 
-    async def test_worker_history_fetch_serializes_same_run_tail_requests(self):
+    async def test_worker_session_cache_evicts_expired_entries(self):
         config = EngineConnectionConfig(
             server_url="http://localhost:8000",
             redis_url="redis://localhost:6379/0",
@@ -323,56 +358,26 @@ class TestFluxiSdkEngineHistoryCache(unittest.IsolatedAsyncioTestCase):
             max_concurrent_workflow_tasks=1,
             max_concurrent_activity_tasks=1,
         )
-        fake_client = _HistoryClient(
-            [
-                _HistoryResponse(
-                    {
-                        "events": [
-                            {"event_type": "WorkflowStarted", "input_payload": None},
-                            {"event_type": "ActivityScheduled", "input_payload": None},
-                        ],
-                        "next_index": 1,
-                    }
-                ),
-                _HistoryResponse(
-                    {
-                        "events": [
-                            {
-                                "event_type": "ActivityCompleted",
-                                "result_payload": None,
-                                "activity_execution_id": "run-1:act:1",
-                            }
-                        ],
-                        "next_index": 2,
-                    }
-                ),
-                _HistoryResponse({"events": [], "next_index": 2}),
-            ]
-        )
-        binding._http_client = fake_client
 
-        await binding._fetch_run_history("run-1")
-        second, third = await asyncio.gather(
-            binding._fetch_run_history("run-1"),
-            binding._fetch_run_history("run-1"),
+        class _SessionStub:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            async def cancel(self) -> None:
+                self.cancelled = True
+
+        session = _SessionStub()
+        binding._workflow_sessions["run-1"] = _WorkflowSessionCacheEntry(
+            session=session,  # type: ignore[arg-type]
+            updated_at_monotonic=time.monotonic()
+            - ((binding._settings.sticky_cache_ttl_ms + 1) / 1000),
         )
 
-        self.assertEqual(
-            [event["event_type"] for event in second],
-            ["WorkflowStarted", "ActivityScheduled", "ActivityCompleted"],
-        )
-        self.assertEqual(
-            [event["event_type"] for event in third],
-            ["WorkflowStarted", "ActivityScheduled", "ActivityCompleted"],
-        )
-        self.assertEqual(
-            fake_client.calls,
-            [
-                ("/runs/run-1/history", None),
-                ("/runs/run-1/history", {"after_index": 1}),
-                ("/runs/run-1/history", {"after_index": 2}),
-            ],
-        )
+        cached = await binding._get_cached_workflow_session("run-1")
+
+        self.assertIsNone(cached)
+        self.assertTrue(session.cancelled)
+        self.assertNotIn("run-1", binding._workflow_sessions)
 
 
 class _FakeAsyncClient:
@@ -383,24 +388,13 @@ class _FakeAsyncClient:
         self.is_closed = True
 
 
-class _HistoryResponse:
-    def __init__(self, body):
-        self._body = body
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def json(self):
-        return self._body
-
-
-class _HistoryClient:
+class _HistoryStore:
     def __init__(self, responses):
         self._responses = list(responses)
         self.calls = []
 
-    async def get(self, path, params=None):
-        self.calls.append((path, params))
+    async def get_history_page(self, run_id, *, after_index=None):
+        self.calls.append((run_id, after_index))
         return self._responses.pop(0)
 
 

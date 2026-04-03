@@ -51,6 +51,10 @@ class _WorkflowExecutionContext:
         [str, Sequence[Any], ActivityOptions],
         Any,
     ]
+    local_activity_scheduler: Callable[
+        [str, Sequence[Any], ActivityOptions],
+        Any,
+    ]
 
 
 class ActivityHandle(Awaitable[ActivityResultT], Generic[ActivityResultT]):
@@ -234,11 +238,16 @@ def _activate_execution_context(
         [str, Sequence[Any], ActivityOptions],
         Any,
     ],
+    local_activity_scheduler: Callable[
+        [str, Sequence[Any], ActivityOptions],
+        Any,
+    ],
 ) -> Iterator[None]:
     context = _WorkflowExecutionContext(
         registration=registration,
         task_queue=task_queue,
         activity_scheduler=activity_scheduler,
+        local_activity_scheduler=local_activity_scheduler,
     )
     token = _CURRENT_WORKFLOW_CONTEXT.set(context)
     try:
@@ -345,6 +354,61 @@ def start_activity(
     )
 
 
+async def execute_local_activity(
+    activity: ActivityReference,
+    *activity_args: Any,
+    retry_policy: RetryPolicy | None = None,
+    schedule_to_close_timeout: timedelta | None = None,
+    args: Sequence[Any] | None = None,
+    timeout_seconds: float | None = None,
+) -> Any:
+    """Execute a local activity from inside workflow code and await its result."""
+
+    if _CURRENT_WORKFLOW_CONTEXT.get() is None:
+        raise WorkflowContextUnavailableError(
+            "workflow.execute_local_activity() requires an active workflow execution context."
+        )
+
+    return await start_local_activity(
+        activity,
+        *activity_args,
+        retry_policy=retry_policy,
+        schedule_to_close_timeout=schedule_to_close_timeout,
+        args=args,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def start_local_activity(
+    activity: ActivityReference,
+    *activity_args: Any,
+    retry_policy: RetryPolicy | None = None,
+    schedule_to_close_timeout: timedelta | None = None,
+    args: Sequence[Any] | None = None,
+    timeout_seconds: float | None = None,
+) -> ActivityHandle[Any]:
+    """Start a local activity from inside workflow code and return its awaitable handle."""
+
+    context = _CURRENT_WORKFLOW_CONTEXT.get()
+    if context is None:
+        raise WorkflowContextUnavailableError(
+            "workflow.start_local_activity() requires an active workflow execution context."
+        )
+
+    activity_name = _get_activity_name(activity)
+    normalized_args = _normalize_activity_args(activity_args, args)
+    options = ActivityOptions(
+        retry_policy=retry_policy,
+        schedule_to_close_timeout=_coerce_schedule_to_close_timeout(
+            schedule_to_close_timeout,
+            timeout_seconds,
+        ),
+    )
+    return _coerce_activity_handle(
+        context.local_activity_scheduler(activity_name, normalized_args, options)
+    )
+
+
 class unsafe:
     """Compatibility helpers for Temporal-style workflow modules."""
 
@@ -360,7 +424,9 @@ __all__ = [
     "WorkflowRegistry",
     "defn",
     "execute_activity",
+    "execute_local_activity",
     "run",
     "start_activity",
+    "start_local_activity",
     "unsafe",
 ]

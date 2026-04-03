@@ -57,9 +57,16 @@ class WorkflowResultResponse(BaseModel):
 
 
 class WorkflowCommandModel(BaseModel):
-    kind: Literal["schedule_activity", "complete_workflow", "fail_workflow"]
+    kind: Literal[
+        "schedule_activity",
+        "record_local_activity",
+        "complete_workflow",
+        "fail_workflow",
+    ]
+    activity_execution_id: str | None = None
     activity_name: str | None = None
     activity_task_queue: str | None = None
+    activity_status: Literal["completed", "failed"] | None = None
     input_payload_b64: str | None = None
     retry_policy: RetryPolicyModel | None = None
     schedule_to_close_timeout_ms: int | None = Field(default=None, ge=1)
@@ -73,6 +80,19 @@ class WorkflowCommandModel(BaseModel):
                 raise ValueError(
                     "schedule_activity requires activity_name and activity_task_queue."
                 )
+        elif self.kind == "record_local_activity":
+            if (
+                self.activity_execution_id is None
+                or self.activity_name is None
+                or self.activity_status is None
+            ):
+                raise ValueError(
+                    "record_local_activity requires activity_execution_id, activity_name and activity_status."
+                )
+            if self.activity_status == "completed" and self.result_payload_b64 is None:
+                raise ValueError("Completed local activities require result_payload_b64.")
+            if self.activity_status == "failed" and self.error_payload_b64 is None:
+                raise ValueError("Failed local activities require error_payload_b64.")
         elif self.kind == "complete_workflow":
             if self.result_payload_b64 is None:
                 raise ValueError("complete_workflow requires result_payload_b64.")
@@ -84,8 +104,10 @@ class WorkflowCommandModel(BaseModel):
     def to_command(self) -> WorkflowTaskCommand:
         return WorkflowTaskCommand(
             kind=self.kind,
+            activity_execution_id=self.activity_execution_id,
             activity_name=self.activity_name,
             activity_task_queue=self.activity_task_queue,
+            activity_status=self.activity_status,
             input_payload=from_base64(self.input_payload_b64),
             retry_policy=self.retry_policy.to_config() if self.retry_policy else None,
             schedule_to_close_timeout_ms=self.schedule_to_close_timeout_ms,

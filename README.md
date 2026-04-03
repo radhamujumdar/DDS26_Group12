@@ -46,6 +46,12 @@ For Fluxi-heavy benchmark runs, the local Compose deployment is tuned with:
 - `stock-activity-worker` using `FLUXI_STOCK_ACTIVITY_CONCURRENCY` (default `16`)
 - `payment-activity-worker` using `FLUXI_PAYMENT_ACTIVITY_CONCURRENCY` (default `16`)
 
+Recent Fluxi runtime changes that matter for benchmark behavior:
+- workflow workers now read history and complete workflow/activity tasks directly against the Fluxi Redis store; `fluxi-server` remains the client-facing control plane for workflow start/result requests
+- sticky workflow routing now keeps a live in-memory workflow session on the owning worker and refreshes it with incremental history instead of replaying the workflow from scratch on every task
+- the SDK now supports `workflow.start_local_activity(...)` and `workflow.execute_local_activity(...)` for short same-worker steps that should be recorded in history without creating a queued activity task
+- the checkout example uses a local activity for `mark_order_paid`, so the successful happy path no longer consumes an `orders` activity slot
+
 You can scale the hot roles further during stress tests, for example:
 
 ```bash

@@ -136,7 +136,7 @@ class ReferenceCheckoutWorkflow:
                 failure_reason=str(exc),
             )
 
-        await workflow.execute_activity("mark_order_paid", order.order_id)
+        await workflow.execute_local_activity("mark_order_paid", order.order_id)
         return CheckoutWorkflowResult(
             order_id=order.order_id,
             status="paid",

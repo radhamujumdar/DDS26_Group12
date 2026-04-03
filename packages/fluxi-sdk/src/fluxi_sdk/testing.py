@@ -34,6 +34,7 @@ class ActivityExecutionRecord:
     attempt_no: int
     args: tuple[Any, ...]
     options: ActivityOptions
+    is_local: bool = False
     status: str = "running"
     result: Any = None
     error: BaseException | None = None
@@ -243,6 +244,12 @@ class FakeFluxiRuntime:
                     args,
                     options,
                 ),
+                lambda name, args, options: self._start_local_activity(
+                    record,
+                    name,
+                    args,
+                    options,
+                ),
             ):
                 result = await run_method(*record.args)
         except BaseException as exc:
@@ -284,6 +291,41 @@ class FakeFluxiRuntime:
             ),
             name=(
                 f"fluxi:activity:{activity_name}:"
+                f"{workflow_record.workflow_id}:{activity_execution_id}"
+            ),
+        )
+        return _FakeActivityHandle(task)
+
+    def _start_local_activity(
+        self,
+        workflow_record: WorkflowExecutionRecord,
+        activity_name: str,
+        args: tuple[Any, ...],
+        options: ActivityOptions,
+    ) -> workflow.ActivityHandle[Any]:
+        activity_execution_id = (
+            f"{workflow_record.run_id}:act:{len(workflow_record.activity_executions) + 1}"
+        )
+        execution = ActivityExecutionRecord(
+            sequence=len(workflow_record.activity_executions) + 1,
+            activity_execution_id=activity_execution_id,
+            activity_name=activity_name,
+            workflow_id=workflow_record.workflow_id,
+            run_id=workflow_record.run_id,
+            task_queue=workflow_record.task_queue,
+            attempt_no=1,
+            args=args,
+            options=options,
+            is_local=True,
+        )
+        workflow_record.activity_executions.append(execution)
+        task = asyncio.create_task(
+            self._run_activity_execution(
+                workflow_record=workflow_record,
+                execution=execution,
+            ),
+            name=(
+                f"fluxi:local-activity:{activity_name}:"
                 f"{workflow_record.workflow_id}:{activity_execution_id}"
             ),
         )

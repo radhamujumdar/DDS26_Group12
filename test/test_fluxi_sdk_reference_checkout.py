@@ -60,8 +60,9 @@ class TestReferenceCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [execution.options.task_queue for execution in runtime.workflow_runs[0].activity_executions],
-            ["orders", "stock", "payment", "orders"],
+            ["orders", "stock", "payment", None],
         )
+        self.assertTrue(runtime.workflow_runs[0].activity_executions[3].is_local)
 
     async def test_reference_checkout_compensates_after_payment_failure(self):
         state = ReferenceCheckoutState(

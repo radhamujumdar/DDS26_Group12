@@ -12,6 +12,94 @@ from fluxi_engine.scheduler import FluxiScheduler
 
 
 class TestFluxiEngineIntegration(FluxiEngineAsyncTestCase):
+    async def test_workflow_task_completion_records_local_activity_without_queueing_task(self) -> None:
+        started = await self.start_workflow()
+        run_id = started["run_id"]
+        self.assertIsNotNone(run_id)
+
+        _, workflow_task = await self.latest_stream_payload(self.workflow_stream_key())
+        activity_execution_id = f"{run_id}:act:1"
+        response = await self.client.post(
+            "/workflow-tasks/complete",
+            json={
+                "run_id": run_id,
+                "workflow_task_id": workflow_task["workflow_task_id"],
+                "attempt_no": workflow_task["attempt_no"],
+                "commands": [
+                    {
+                        "kind": "record_local_activity",
+                        "activity_execution_id": activity_execution_id,
+                        "activity_name": "mark_order_paid",
+                        "activity_status": "completed",
+                        "input_payload_b64": self.payload_b64({"order_id": "checkout:1"}),
+                        "retry_policy": {"max_attempts": 1},
+                        "result_payload_b64": self.payload_b64({"paid": True}),
+                    },
+                    {
+                        "kind": "complete_workflow",
+                        "result_payload_b64": self.payload_b64({"status": "paid"}),
+                    },
+                ],
+            },
+        )
+        response.raise_for_status()
+        self.assertEqual(response.json()["outcome"], "completed")
+        self.assertEqual(await self.store.redis.xlen(self.activity_stream_key("orders")), 0)
+
+        history = await self.store.get_history(run_id)
+        self.assertEqual(
+            [event["event_type"] for event in history],
+            ["WorkflowStarted", "LocalActivityRecorded", "WorkflowCompleted"],
+        )
+        self.assertEqual(history[1]["activity_execution_id"], activity_execution_id)
+        self.assertEqual(history[1]["status"], "completed")
+
+    async def test_workflow_task_completion_preserves_activity_sequence_after_local_activity(self) -> None:
+        started = await self.start_workflow()
+        run_id = started["run_id"]
+        self.assertIsNotNone(run_id)
+
+        _, workflow_task = await self.latest_stream_payload(self.workflow_stream_key())
+        response = await self.client.post(
+            "/workflow-tasks/complete",
+            json={
+                "run_id": run_id,
+                "workflow_task_id": workflow_task["workflow_task_id"],
+                "attempt_no": workflow_task["attempt_no"],
+                "commands": [
+                    {
+                        "kind": "record_local_activity",
+                        "activity_execution_id": f"{run_id}:act:1",
+                        "activity_name": "mark_order_paid",
+                        "activity_status": "completed",
+                        "input_payload_b64": self.payload_b64({"order_id": "checkout:1"}),
+                        "retry_policy": {"max_attempts": 1},
+                        "result_payload_b64": self.payload_b64({"paid": True}),
+                    },
+                    {
+                        "kind": "schedule_activity",
+                        "activity_execution_id": f"{run_id}:act:2",
+                        "activity_name": "reserve_stock",
+                        "activity_task_queue": "stock",
+                        "input_payload_b64": self.payload_b64({"item_id": "item-1"}),
+                        "retry_policy": {"max_attempts": 1},
+                    },
+                ],
+            },
+        )
+        response.raise_for_status()
+        body = response.json()
+
+        self.assertEqual(body["outcome"], "scheduled_activity")
+        self.assertEqual(body["activity_execution_id"], f"{run_id}:act:2")
+        history = await self.store.get_history(run_id)
+        self.assertEqual(
+            [event["event_type"] for event in history],
+            ["WorkflowStarted", "LocalActivityRecorded", "ActivityScheduled"],
+        )
+        self.assertEqual(history[1]["activity_execution_id"], f"{run_id}:act:1")
+        self.assertEqual(history[2]["activity_execution_id"], f"{run_id}:act:2")
+
     async def test_workflow_task_completion_supports_multiple_schedule_commands(self) -> None:
         started = await self.start_workflow()
         run_id = started["run_id"]
