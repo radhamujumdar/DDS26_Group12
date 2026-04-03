@@ -1,4 +1,4 @@
 Daniel: name, surname, student id, TUD email and your contributions
 Radha: name, surname, student id, TUD email and your contributions
 Anik: name, surname, student id, TUD email and your contributions
-Elena: name, surname, student id, TUD email and your contributions
+Elena: Elena, Mihalache, 5244242, e.mihalache@student.tudelft.nl, did some shared infrastructure, some benchmarking scripts, some performance improvement (setup tweaking), sharding (Redis Cluster not used in the end, only application level sharding), Kubernetes/Minikube setup (not used in the final benchmarking)
