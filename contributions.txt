@@ -1,0 +1,4 @@
+Daniel: name, surname, student id, TUD email and your contributions
+Radha: name, surname, student id, TUD email and your contributions
+Anik: name, surname, student id, TUD email and your contributions
+Elena: name, surname, student id, TUD email and your contributions
