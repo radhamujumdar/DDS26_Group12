@@ -5,11 +5,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 
 from redis.asyncio.sentinel import MasterNotFoundError
 from redis.exceptions import ConnectionError, ReadOnlyError, TimeoutError
 
 from .config import FluxiSettings, create_redis_client
+from .observability import elapsed_ms, trace_logging_enabled
 from .store import FluxiRedisStore
 
 _REDIS_RECOVERABLE_ERRORS = (
@@ -20,6 +22,7 @@ _REDIS_RECOVERABLE_ERRORS = (
 )
 
 logger = logging.getLogger(__name__)
+TRACE_LOGGING_ENABLED = trace_logging_enabled()
 
 
 class FluxiScheduler:
@@ -41,16 +44,27 @@ class FluxiScheduler:
         return cls(FluxiRedisStore(redis, runtime_settings), runtime_settings)
 
     async def run_once(self) -> dict[str, object]:
+        operation_start = time.perf_counter()
         timer_member = await self.store.pop_due_timer()
         timer_result = None
         if timer_member is not None:
             timer_result = await self.store.apply_timer(timer_member)
         cleaned = await self.store.cleanup_stale_pending_entries()
-        return {
+        result = {
             "timer_member": timer_member,
             "timer_result": timer_result,
             "cleaned_pending_entries": cleaned,
         }
+        if TRACE_LOGGING_ENABLED and (
+            timer_member is not None or cleaned > 0 or elapsed_ms(operation_start) >= 50
+        ):
+            logger.info(
+                "fluxi.scheduler.run_once timer_member=%s cleaned_pending_entries=%d duration_ms=%.2f",
+                timer_member,
+                cleaned,
+                elapsed_ms(operation_start),
+            )
+        return result
 
     async def run_forever(self) -> None:
         while not self._stopped.is_set():

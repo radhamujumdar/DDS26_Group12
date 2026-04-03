@@ -3,9 +3,13 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fluxi_engine.observability import configure_logging
 
 from .controllers.orders import router
 from .dependencies import build_order_api_container, close_order_api_container
+
+
+configure_logging("order-service")
 
 
 @asynccontextmanager

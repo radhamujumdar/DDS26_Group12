@@ -5,6 +5,7 @@ import os
 
 from fluxi_sdk.client import EngineConnectionConfig, WorkflowClient
 from fluxi_sdk.worker import Worker
+from fluxi_engine.observability import configure_logging
 
 from order.app.dependencies import (
     build_order_worker_container,
@@ -24,6 +25,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 async def main() -> None:
+    configure_logging("order-checkout-worker")
     container = await build_order_worker_container()
     engine = EngineConnectionConfig.from_env()
     client = WorkflowClient.connect(engine=engine)

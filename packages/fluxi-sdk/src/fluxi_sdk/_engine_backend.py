@@ -22,6 +22,11 @@ from redis.exceptions import ConnectionError, ReadOnlyError, ResponseError, Time
 from fluxi_engine.codecs import from_base64, to_base64, unpackb
 from fluxi_engine.config import FluxiSettings, create_redis_client
 from fluxi_engine.keys import activity_queue, workflow_queue
+from fluxi_engine.observability import (
+    elapsed_ms,
+    redis_stream_message_age_ms,
+    trace_logging_enabled,
+)
 from fluxi_engine.store import FluxiRedisStore
 
 from . import activity, workflow
@@ -62,6 +67,7 @@ _REDIS_RECOVERABLE_ERRORS = (
 )
 
 logger = logging.getLogger(__name__)
+TRACE_LOGGING_ENABLED = trace_logging_enabled()
 
 
 class EngineWorkflowBackend:
@@ -84,6 +90,17 @@ class EngineWorkflowBackend:
         workflow_name = _get_workflow_name(workflow_ref)
         run_callable = _get_workflow_run_callable(workflow_ref)
         input_payload = encode_args_payload(args)
+        execute_start = time.perf_counter()
+
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "workflow.client.execute.start workflow_id=%s workflow_name=%s task_queue=%s start_policy=%s arg_count=%d",
+                workflow_id,
+                workflow_name,
+                task_queue,
+                start_policy.value,
+                len(args),
+            )
 
         control_client = await self._get_control_http_client()
         start_request = {
@@ -93,25 +110,49 @@ class EngineWorkflowBackend:
             "start_policy": start_policy.value,
             "input_payload_b64": to_base64(input_payload),
         }
+        start_or_attach_start = time.perf_counter()
         body = await self._start_or_attach(
             control_client,
             request=start_request,
             start_policy=start_policy,
         )
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "workflow.client.execute.start_response workflow_id=%s decision=%s status=%s run_id=%s run_no=%s duration_ms=%.2f",
+                workflow_id,
+                body.get("decision"),
+                body.get("status"),
+                body.get("run_id"),
+                body.get("run_no"),
+                elapsed_ms(start_or_attach_start),
+            )
         terminal = _resolve_terminal_start_response(
             body,
             workflow_id=workflow_id,
         )
         if terminal is not _PENDING_RESULT:
             if terminal["status"] == "completed":
+                if TRACE_LOGGING_ENABLED:
+                    logger.info(
+                        "workflow.client.execute.done workflow_id=%s status=completed duration_ms=%.2f",
+                        workflow_id,
+                        elapsed_ms(execute_start),
+                    )
                 return _decode_workflow_result(
                     terminal.get("result_payload_b64"),
                     run_callable,
                 )
             if terminal["status"] == "failed":
+                if TRACE_LOGGING_ENABLED:
+                    logger.info(
+                        "workflow.client.execute.done workflow_id=%s status=failed duration_ms=%.2f",
+                        workflow_id,
+                        elapsed_ms(execute_start),
+                    )
                 raise _decode_workflow_failure(terminal.get("error_payload_b64"))
 
         while True:
+            poll_start = time.perf_counter()
             snapshot = await self._poll_workflow_result(
                 await self._get_result_http_client(),
                 workflow_id=workflow_id,
@@ -120,13 +161,32 @@ class EngineWorkflowBackend:
                 control_client=control_client,
             )
             if snapshot is _PENDING_RESULT:
+                if TRACE_LOGGING_ENABLED:
+                    logger.info(
+                        "workflow.client.execute.pending workflow_id=%s wait_cycle_ms=%.2f total_duration_ms=%.2f",
+                        workflow_id,
+                        elapsed_ms(poll_start),
+                        elapsed_ms(execute_start),
+                    )
                 continue
             if snapshot["status"] == "completed":
+                if TRACE_LOGGING_ENABLED:
+                    logger.info(
+                        "workflow.client.execute.done workflow_id=%s status=completed duration_ms=%.2f",
+                        workflow_id,
+                        elapsed_ms(execute_start),
+                    )
                 return _decode_workflow_result(
                     snapshot.get("result_payload_b64"),
                     run_callable,
                 )
             if snapshot["status"] == "failed":
+                if TRACE_LOGGING_ENABLED:
+                    logger.info(
+                        "workflow.client.execute.done workflow_id=%s status=failed duration_ms=%.2f",
+                        workflow_id,
+                        elapsed_ms(execute_start),
+                    )
                 raise _decode_workflow_failure(snapshot.get("error_payload_b64"))
 
     async def aclose(self) -> None:
@@ -577,6 +637,20 @@ class _EngineWorkerBinding:
         message_id: str,
         task_payload: dict[str, Any],
     ) -> None:
+        handle_start = time.perf_counter()
+        workflow_task_id = str(task_payload.get("workflow_task_id"))
+        run_id = str(task_payload.get("run_id"))
+        queue_wait_ms = redis_stream_message_age_ms(message_id)
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "workflow.task.received task_queue=%s stream=%s run_id=%s workflow_task_id=%s attempt_no=%s queue_wait_ms=%s",
+                self.task_queue,
+                stream_key,
+                run_id,
+                workflow_task_id,
+                task_payload.get("attempt_no"),
+                queue_wait_ms,
+            )
         try:
             should_ack = await self._process_workflow_task(task_payload)
             if should_ack:
@@ -585,6 +659,15 @@ class _EngineWorkerBinding:
                     stream_key,
                     self._settings.workflow_consumer_group,
                     message_id,
+                )
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "workflow.task.handled task_queue=%s run_id=%s workflow_task_id=%s should_ack=%s total_handle_ms=%.2f",
+                    self.task_queue,
+                    run_id,
+                    workflow_task_id,
+                    should_ack,
+                    elapsed_ms(handle_start),
                 )
         except asyncio.CancelledError:
             raise
@@ -616,6 +699,20 @@ class _EngineWorkerBinding:
         message_id: str,
         task_payload: dict[str, Any],
     ) -> None:
+        handle_start = time.perf_counter()
+        activity_execution_id = str(task_payload.get("activity_execution_id"))
+        run_id = str(task_payload.get("run_id"))
+        queue_wait_ms = redis_stream_message_age_ms(message_id)
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "activity.task.received task_queue=%s stream=%s run_id=%s activity_execution_id=%s attempt_no=%s queue_wait_ms=%s",
+                self.task_queue,
+                stream_key,
+                run_id,
+                activity_execution_id,
+                task_payload.get("attempt_no"),
+                queue_wait_ms,
+            )
         try:
             should_ack = await self._process_activity_task(task_payload)
             if should_ack:
@@ -624,6 +721,15 @@ class _EngineWorkerBinding:
                     stream_key,
                     self._settings.activity_consumer_group,
                     message_id,
+                )
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "activity.task.handled task_queue=%s run_id=%s activity_execution_id=%s should_ack=%s total_handle_ms=%.2f",
+                    self.task_queue,
+                    run_id,
+                    activity_execution_id,
+                    should_ack,
+                    elapsed_ms(handle_start),
                 )
         except asyncio.CancelledError:
             raise
@@ -699,29 +805,58 @@ class _EngineWorkerBinding:
         task.add_done_callback(_done)
 
     async def _process_workflow_task(self, task_payload: dict[str, Any]) -> bool:
-        registration = self._workflow_by_name.get(str(task_payload["workflow_name"]))
+        run_id = str(task_payload["run_id"])
+        workflow_name = str(task_payload["workflow_name"])
+        workflow_task_id = str(task_payload["workflow_task_id"])
+        attempt_no = int(task_payload["attempt_no"])
+        processing_start = time.perf_counter()
+        registration = self._workflow_by_name.get(workflow_name)
         if registration is None:
             failure_payload = _safe_failure_payload(
                 RemoteWorkflowError(
                     f"Worker for task queue {self.task_queue!r} cannot execute workflow {task_payload['workflow_name']!r}."
                 )
             )
+            submit_start = time.perf_counter()
             outcome = await self._submit_workflow_commands(
-                run_id=str(task_payload["run_id"]),
-                workflow_task_id=str(task_payload["workflow_task_id"]),
-                attempt_no=int(task_payload["attempt_no"]),
+                run_id=run_id,
+                workflow_task_id=workflow_task_id,
+                attempt_no=attempt_no,
                 commands=[{"kind": "fail_workflow", "error_payload_b64": to_base64(failure_payload)}],
             )
-            self._history_cache.pop(str(task_payload["run_id"]), None)
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "workflow.task.registration_missing task_queue=%s run_id=%s workflow_task_id=%s workflow_name=%s submit_ms=%.2f total_ms=%.2f outcome=%s",
+                    self.task_queue,
+                    run_id,
+                    workflow_task_id,
+                    workflow_name,
+                    elapsed_ms(submit_start),
+                    elapsed_ms(processing_start),
+                    outcome,
+                )
+            self._history_cache.pop(run_id, None)
             return outcome in _WORKFLOW_ACK_OUTCOMES
 
-        history = await self._fetch_run_history(str(task_payload["run_id"]))
+        history_fetch_start = time.perf_counter()
+        history = await self._fetch_run_history(run_id)
+        history_fetch_ms = elapsed_ms(history_fetch_start)
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "workflow.task.history_loaded task_queue=%s run_id=%s workflow_task_id=%s history_events=%d duration_ms=%.2f",
+                self.task_queue,
+                run_id,
+                workflow_task_id,
+                len(history),
+                history_fetch_ms,
+            )
         controller = _WorkflowReplayController(history, task_queue=self.task_queue)
         workflow_instance = registration.workflow()
         run_method = getattr(workflow_instance, registration.run_method_name)
         args = decode_args_payload(controller.workflow_input_payload, run_method)
 
         try:
+            replay_start = time.perf_counter()
             with workflow._activate_execution_context(
                 registration,
                 self.task_queue,
@@ -730,80 +865,155 @@ class _EngineWorkerBinding:
                 result = await run_method(*args)
             controller.assert_fully_replayed()
             result_payload = encode_payload(result)
+            replay_ms = elapsed_ms(replay_start)
         except _WorkflowSuspended:
+            replay_ms = elapsed_ms(replay_start)
+            submit_start = time.perf_counter()
             outcome = await self._submit_workflow_commands(
-                run_id=str(task_payload["run_id"]),
-                workflow_task_id=str(task_payload["workflow_task_id"]),
-                attempt_no=int(task_payload["attempt_no"]),
+                run_id=run_id,
+                workflow_task_id=workflow_task_id,
+                attempt_no=attempt_no,
                 commands=_serialize_workflow_commands(controller.pending_commands),
             )
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "workflow.task.suspended task_queue=%s run_id=%s workflow_task_id=%s pending_commands=%d replay_ms=%.2f submit_ms=%.2f total_ms=%.2f outcome=%s",
+                    self.task_queue,
+                    run_id,
+                    workflow_task_id,
+                    len(controller.pending_commands),
+                    replay_ms,
+                    elapsed_ms(submit_start),
+                    elapsed_ms(processing_start),
+                    outcome,
+                )
             return outcome in _WORKFLOW_ACK_OUTCOMES
         except BaseException as exc:
             failure_payload = _safe_failure_payload(exc)
+            submit_start = time.perf_counter()
             outcome = await self._submit_workflow_commands(
-                run_id=str(task_payload["run_id"]),
-                workflow_task_id=str(task_payload["workflow_task_id"]),
-                attempt_no=int(task_payload["attempt_no"]),
+                run_id=run_id,
+                workflow_task_id=workflow_task_id,
+                attempt_no=attempt_no,
                 commands=[{"kind": "fail_workflow", "error_payload_b64": to_base64(failure_payload)}],
             )
-            self._history_cache.pop(str(task_payload["run_id"]), None)
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "workflow.task.failed task_queue=%s run_id=%s workflow_task_id=%s error_type=%s submit_ms=%.2f total_ms=%.2f outcome=%s",
+                    self.task_queue,
+                    run_id,
+                    workflow_task_id,
+                    exc.__class__.__name__,
+                    elapsed_ms(submit_start),
+                    elapsed_ms(processing_start),
+                    outcome,
+                )
+            self._history_cache.pop(run_id, None)
             return outcome in _WORKFLOW_ACK_OUTCOMES
 
+        submit_start = time.perf_counter()
         outcome = await self._submit_workflow_commands(
-            run_id=str(task_payload["run_id"]),
-            workflow_task_id=str(task_payload["workflow_task_id"]),
-            attempt_no=int(task_payload["attempt_no"]),
+            run_id=run_id,
+            workflow_task_id=workflow_task_id,
+            attempt_no=attempt_no,
             commands=[{"kind": "complete_workflow", "result_payload_b64": to_base64(result_payload)}],
         )
-        self._history_cache.pop(str(task_payload["run_id"]), None)
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "workflow.task.completed task_queue=%s run_id=%s workflow_task_id=%s replay_ms=%.2f submit_ms=%.2f total_ms=%.2f outcome=%s",
+                self.task_queue,
+                run_id,
+                workflow_task_id,
+                replay_ms,
+                elapsed_ms(submit_start),
+                elapsed_ms(processing_start),
+                outcome,
+            )
+        self._history_cache.pop(run_id, None)
         return outcome in _WORKFLOW_ACK_OUTCOMES
 
     async def _process_activity_task(self, task_payload: dict[str, Any]) -> bool:
-        registration = self._activity_by_name.get(str(task_payload["activity_name"]))
+        activity_name = str(task_payload["activity_name"])
         activity_execution_id = str(task_payload["activity_execution_id"])
         attempt_no = int(task_payload["attempt_no"])
+        run_id = str(task_payload["run_id"])
+        processing_start = time.perf_counter()
+        registration = self._activity_by_name.get(activity_name)
         if registration is None:
             payload = _safe_failure_payload(
                 RemoteActivityError(
                     f"Worker for task queue {self.task_queue!r} cannot execute activity {task_payload['activity_name']!r}."
                 )
             )
+            submit_start = time.perf_counter()
             outcome = await self._submit_activity_completion(
                 activity_execution_id=activity_execution_id,
                 attempt_no=attempt_no,
                 status="failed",
                 payload=payload,
             )
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "activity.task.registration_missing task_queue=%s run_id=%s activity_execution_id=%s activity_name=%s submit_ms=%.2f total_ms=%.2f outcome=%s",
+                    self.task_queue,
+                    run_id,
+                    activity_execution_id,
+                    activity_name,
+                    elapsed_ms(submit_start),
+                    elapsed_ms(processing_start),
+                    outcome,
+                )
             return outcome in _ACTIVITY_ACK_OUTCOMES
 
         try:
+            execution_start = time.perf_counter()
             with activity._activate_execution_context(
                 activity.ActivityExecutionInfo(
                     activity_execution_id=activity_execution_id,
                     attempt_no=attempt_no,
-                    activity_name=str(task_payload["activity_name"]),
+                    activity_name=activity_name,
                     task_queue=str(task_payload["task_queue"]),
                     workflow_id=str(task_payload["workflow_id"]),
-                    run_id=str(task_payload["run_id"]),
+                    run_id=run_id,
                 )
             ):
                 args = decode_args_payload(task_payload.get("input_payload"), registration.fn)
                 result = registration.fn(*args)
                 if inspect.isawaitable(result):
                     result = await result
+            execution_ms = elapsed_ms(execution_start)
         except BaseException as exc:
             payload = _safe_failure_payload(exc)
             status = "failed"
+            execution_ms = elapsed_ms(execution_start)
+            error_type = exc.__class__.__name__
         else:
             payload = encode_payload(result)
             status = "completed"
+            error_type = ""
 
+        submit_start = time.perf_counter()
         outcome = await self._submit_activity_completion(
             activity_execution_id=activity_execution_id,
             attempt_no=attempt_no,
             status=status,
             payload=payload,
         )
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "activity.task.finished task_queue=%s run_id=%s activity_execution_id=%s activity_name=%s status=%s error_type=%s execution_ms=%.2f submit_ms=%.2f total_ms=%.2f payload_bytes=%d outcome=%s",
+                self.task_queue,
+                run_id,
+                activity_execution_id,
+                activity_name,
+                status,
+                error_type,
+                execution_ms,
+                elapsed_ms(submit_start),
+                elapsed_ms(processing_start),
+                len(payload),
+                outcome,
+            )
         return outcome in _ACTIVITY_ACK_OUTCOMES
 
     async def _fetch_run_history(self, run_id: str) -> list[dict[str, Any]]:

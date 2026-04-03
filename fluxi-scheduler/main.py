@@ -1,6 +1,7 @@
 import asyncio
 
 from fluxi_engine.config import FluxiSettings
+from fluxi_engine.observability import configure_logging
 from fluxi_engine.scheduler import FluxiScheduler
 
 
@@ -14,4 +15,5 @@ async def _main() -> None:
 
 
 if __name__ == "__main__":
+    configure_logging("fluxi-scheduler")
     asyncio.run(_main())

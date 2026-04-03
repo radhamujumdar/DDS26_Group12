@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import logging
 import time
 from typing import Sequence
 from typing import Any
@@ -33,12 +34,17 @@ from .models import (
     WorkflowTaskCommand,
     WorkflowTaskCompletionResult,
 )
+from .observability import elapsed_ms, trace_logging_enabled
 from .scripts import (
     APPLY_ACTIVITY_COMPLETION,
     APPLY_TIMER,
     APPLY_WORKFLOW_TASK_COMPLETION,
     START_OR_ATTACH_WORKFLOW,
 )
+
+
+logger = logging.getLogger(__name__)
+TRACE_LOGGING_ENABLED = trace_logging_enabled()
 
 
 def _now_ms() -> int:
@@ -137,6 +143,7 @@ class FluxiRedisStore:
         start_policy: str,
         input_payload: bytes | None,
     ) -> StartWorkflowResult:
+        operation_start = time.perf_counter()
         await self.ensure_workflow_queue(task_queue)
 
         run_id = f"run-{uuid.uuid4().hex}"
@@ -166,6 +173,19 @@ class FluxiRedisStore:
             result_payload=_to_bytes(raw[4]),
             error_payload=_to_bytes(raw[5]),
         )
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "fluxi.store.start_or_attach workflow_id=%s workflow_name=%s task_queue=%s start_policy=%s decision=%s status=%s run_id=%s run_no=%s duration_ms=%.2f",
+                workflow_id,
+                workflow_name,
+                task_queue,
+                start_policy,
+                result.decision,
+                result.status,
+                result.run_id,
+                result.run_no,
+                elapsed_ms(operation_start),
+            )
         return result
 
     async def get_workflow_result(self, workflow_id: str) -> WorkflowResultSnapshot | None:
@@ -190,10 +210,26 @@ class FluxiRedisStore:
         *,
         timeout_ms: int,
     ) -> WorkflowResultSnapshot | None:
+        operation_start = time.perf_counter()
         snapshot = await self.get_workflow_result(workflow_id)
         if snapshot is None:
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "fluxi.store.wait_for_result workflow_id=%s status=missing timeout_ms=%d duration_ms=%.2f",
+                    workflow_id,
+                    timeout_ms,
+                    elapsed_ms(operation_start),
+                )
             return None
         if snapshot.status in {"completed", "failed"} or timeout_ms <= 0:
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "fluxi.store.wait_for_result workflow_id=%s status=%s timeout_ms=%d duration_ms=%.2f",
+                    workflow_id,
+                    snapshot.status,
+                    timeout_ms,
+                    elapsed_ms(operation_start),
+                )
             return snapshot
 
         channel = workflow_result_channel(self.settings.key_prefix, workflow_id)
@@ -217,8 +253,25 @@ class FluxiRedisStore:
                 if message is not None:
                     snapshot = await self.get_workflow_result(workflow_id)
                     if snapshot is not None:
+                        if TRACE_LOGGING_ENABLED:
+                            logger.info(
+                                "fluxi.store.wait_for_result workflow_id=%s status=%s timeout_ms=%d duration_ms=%.2f",
+                                workflow_id,
+                                snapshot.status,
+                                timeout_ms,
+                                elapsed_ms(operation_start),
+                            )
                         return snapshot
-            return await self.get_workflow_result(workflow_id)
+            snapshot = await self.get_workflow_result(workflow_id)
+            if TRACE_LOGGING_ENABLED and snapshot is not None:
+                logger.info(
+                    "fluxi.store.wait_for_result workflow_id=%s status=%s timeout_ms=%d duration_ms=%.2f",
+                    workflow_id,
+                    snapshot.status,
+                    timeout_ms,
+                    elapsed_ms(operation_start),
+                )
+            return snapshot
         finally:
             try:
                 await pubsub.unsubscribe(channel)
@@ -236,6 +289,7 @@ class FluxiRedisStore:
         sticky_owner_id: str | None = None,
         sticky_expires_at_ms: int | None = None,
     ) -> WorkflowTaskCompletionResult:
+        operation_start = time.perf_counter()
         workflow_id = await self._workflow_id_for_run(run_id)
         if workflow_id is None:
             return WorkflowTaskCompletionResult(outcome="missing")
@@ -332,7 +386,7 @@ class FluxiRedisStore:
         if not activity_execution_ids and first_activity_execution_id:
             activity_execution_ids = (first_activity_execution_id,)
 
-        return WorkflowTaskCompletionResult(
+        result = WorkflowTaskCompletionResult(
             outcome=_to_text(raw[0]) or "",
             run_id=_to_text(raw[1]) or None,
             activity_execution_id=first_activity_execution_id,
@@ -343,6 +397,19 @@ class FluxiRedisStore:
                 else ("failed" if commands and commands[-1].kind == "fail_workflow" else None)
             ),
         )
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "fluxi.store.complete_workflow_task run_id=%s workflow_id=%s workflow_task_id=%s attempt_no=%d command_count=%d outcome=%s activity_execution_ids=%d duration_ms=%.2f",
+                run_id,
+                workflow_id,
+                workflow_task_id,
+                attempt_no,
+                len(commands),
+                result.outcome,
+                len(result.activity_execution_ids),
+                elapsed_ms(operation_start),
+            )
+        return result
 
     async def complete_activity_task(
         self,
@@ -352,6 +419,7 @@ class FluxiRedisStore:
         status: str,
         payload: bytes | None,
     ) -> ActivityTaskCompletionResult:
+        operation_start = time.perf_counter()
         activity_key = activity_state(self.settings.key_prefix, activity_execution_id)
         mapping = await self.redis.hgetall(activity_key)
         if not mapping:
@@ -384,12 +452,24 @@ class FluxiRedisStore:
             f"{self.settings.key_prefix}:queue:workflow:",
             self.settings.sticky_schedule_to_start_timeout_ms,
         )
-        return ActivityTaskCompletionResult(
+        result = ActivityTaskCompletionResult(
             outcome=_to_text(raw[0]) or "",
             run_id=_to_text(raw[1]) or None,
             next_workflow_task_id=_to_text(raw[2]) or None,
             activity_execution_id=activity_execution_id,
         )
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "fluxi.store.complete_activity_task activity_execution_id=%s run_id=%s attempt_no=%d status=%s outcome=%s next_workflow_task_id=%s duration_ms=%.2f",
+                activity_execution_id,
+                result.run_id,
+                attempt_no,
+                status,
+                result.outcome,
+                result.next_workflow_task_id,
+                elapsed_ms(operation_start),
+            )
+        return result
 
     async def pop_due_timer(self) -> str | None:
         due = await self.redis.zrangebyscore(
@@ -463,6 +543,7 @@ class FluxiRedisStore:
         *,
         after_index: int | None = None,
     ) -> tuple[list[Any], int]:
+        operation_start = time.perf_counter()
         start = 0 if after_index is None or after_index < 0 else after_index + 1
         entries = await self.redis.lrange(
             workflow_history(self.settings.key_prefix, run_id),
@@ -473,6 +554,15 @@ class FluxiRedisStore:
         next_index = start + len(events) - 1
         if after_index is not None and after_index >= 0 and len(events) == 0:
             next_index = after_index
+        if TRACE_LOGGING_ENABLED:
+            logger.info(
+                "fluxi.store.get_history_page run_id=%s after_index=%s event_count=%d next_index=%d duration_ms=%.2f",
+                run_id,
+                after_index,
+                len(events),
+                next_index,
+                elapsed_ms(operation_start),
+            )
         return events, next_index
 
     async def get_history(self, run_id: str) -> list[Any]:

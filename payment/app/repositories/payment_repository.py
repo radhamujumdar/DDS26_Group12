@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 
 from msgspec import msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, WatchError
 
+from fluxi_engine.observability import elapsed_ms, trace_logging_enabled
 from shop_common.checkout import PaymentReceipt
 from shop_common.errors import DatabaseError
 from shop_common.redis import (
@@ -17,6 +20,10 @@ from shop_common.redis import (
 
 from ..domain.errors import InsufficientCreditError, UserNotFoundError
 from ..domain.models import UserValue
+
+
+logger = logging.getLogger(__name__)
+TRACE_LOGGING_ENABLED = trace_logging_enabled()
 
 
 class PaymentRepository:
@@ -105,6 +112,8 @@ class PaymentRepository:
     ) -> PaymentReceipt:
         dedupe_key = activity_dedupe_key(activity_execution_id)
         internal_not_found = f"User {user_id!r} not found"
+        operation_start = time.perf_counter()
+        watch_retries = 0
 
         while True:
             try:
@@ -112,6 +121,15 @@ class PaymentRepository:
                     await pipe.watch(dedupe_key, user_id)
                     existing = await pipe.get(dedupe_key)
                     if existing is not None:
+                        if TRACE_LOGGING_ENABLED:
+                            logger.info(
+                                "payment.charge.dedupe_hit user_id=%s amount=%d activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
+                                user_id,
+                                amount,
+                                activity_execution_id,
+                                watch_retries,
+                                elapsed_ms(operation_start),
+                            )
                         return self._materialize_charge_record(existing)
 
                     raw = await pipe.get(user_id)
@@ -122,6 +140,15 @@ class PaymentRepository:
                             encode_error_record("user_not_found", internal_not_found),
                         )
                         await pipe.execute()
+                        if TRACE_LOGGING_ENABLED:
+                            logger.info(
+                                "payment.charge.user_not_found user_id=%s amount=%d activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
+                                user_id,
+                                amount,
+                                activity_execution_id,
+                                watch_retries,
+                                elapsed_ms(operation_start),
+                            )
                         raise UserNotFoundError(internal_not_found)
 
                     entry = msgpack.decode(raw, type=UserValue)
@@ -135,6 +162,16 @@ class PaymentRepository:
                             encode_error_record("insufficient_credit", message),
                         )
                         await pipe.execute()
+                        if TRACE_LOGGING_ENABLED:
+                            logger.info(
+                                "payment.charge.insufficient_credit user_id=%s amount=%d credit=%d activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
+                                user_id,
+                                amount,
+                                entry.credit,
+                                activity_execution_id,
+                                watch_retries,
+                                elapsed_ms(operation_start),
+                            )
                         raise InsufficientCreditError(message)
 
                     entry.credit -= amount
@@ -147,12 +184,23 @@ class PaymentRepository:
                     pipe.set(user_id, msgpack.encode(entry))
                     pipe.set(dedupe_key, encode_success_record(result))
                     await pipe.execute()
+                    if TRACE_LOGGING_ENABLED:
+                        logger.info(
+                            "payment.charge.success user_id=%s amount=%d activity_execution_id=%s remaining_credit=%d watch_retries=%d duration_ms=%.2f",
+                            user_id,
+                            amount,
+                            activity_execution_id,
+                            entry.credit,
+                            watch_retries,
+                            elapsed_ms(operation_start),
+                        )
                     return PaymentReceipt(
                         payment_id=str(result["payment_id"]),
                         user_id=user_id,
                         amount=amount,
                     )
             except WatchError:
+                watch_retries += 1
                 continue
             except RedisError as exc:
                 raise DatabaseError("DB error") from exc

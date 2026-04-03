@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 from collections.abc import Sequence
 
@@ -7,6 +9,7 @@ from msgspec import msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, WatchError
 
+from fluxi_engine.observability import elapsed_ms, trace_logging_enabled
 from shop_common.checkout import CheckoutItem, StockReservation
 from shop_common.errors import DatabaseError
 from shop_common.redis import (
@@ -18,6 +21,10 @@ from shop_common.redis import (
 
 from ..domain.errors import StockInsufficientError, StockItemNotFoundError
 from ..domain.models import StockValue
+
+
+logger = logging.getLogger(__name__)
+TRACE_LOGGING_ENABLED = trace_logging_enabled()
 
 
 class StockRepository:
@@ -162,6 +169,9 @@ class StockRepository:
 
         dedupe_key = activity_dedupe_key(activity_execution_id)
         item_ids = [item.item_id for item in items]
+        operation_start = time.perf_counter()
+        watch_retries = 0
+        total_quantity = sum(item.quantity for item in items)
 
         while True:
             try:
@@ -169,6 +179,15 @@ class StockRepository:
                     await pipe.watch(dedupe_key, *item_ids)
                     existing = await pipe.get(dedupe_key)
                     if existing is not None:
+                        if TRACE_LOGGING_ENABLED:
+                            logger.info(
+                                "stock.reserve_batch.dedupe_hit activity_execution_id=%s item_count=%d total_quantity=%d watch_retries=%d duration_ms=%.2f",
+                                activity_execution_id,
+                                len(items),
+                                total_quantity,
+                                watch_retries,
+                                elapsed_ms(operation_start),
+                            )
                         return self._materialize_reservation_batch_record(existing)
 
                     raws = await pipe.mget(item_ids)
@@ -182,6 +201,16 @@ class StockRepository:
                                 encode_error_record("item_not_found", message),
                             )
                             await pipe.execute()
+                            if TRACE_LOGGING_ENABLED:
+                                logger.info(
+                                    "stock.reserve_batch.item_not_found activity_execution_id=%s item_id=%s item_count=%d total_quantity=%d watch_retries=%d duration_ms=%.2f",
+                                    activity_execution_id,
+                                    checkout_item.item_id,
+                                    len(items),
+                                    total_quantity,
+                                    watch_retries,
+                                    elapsed_ms(operation_start),
+                                )
                             raise StockItemNotFoundError(message)
                         item = msgpack.decode(raw, type=StockValue)
                         if item.stock < checkout_item.quantity:
@@ -195,6 +224,18 @@ class StockRepository:
                                 encode_error_record("insufficient_stock", message),
                             )
                             await pipe.execute()
+                            if TRACE_LOGGING_ENABLED:
+                                logger.info(
+                                    "stock.reserve_batch.insufficient activity_execution_id=%s item_id=%s requested=%d available=%d item_count=%d total_quantity=%d watch_retries=%d duration_ms=%.2f",
+                                    activity_execution_id,
+                                    checkout_item.item_id,
+                                    checkout_item.quantity,
+                                    item.stock,
+                                    len(items),
+                                    total_quantity,
+                                    watch_retries,
+                                    elapsed_ms(operation_start),
+                                )
                             raise StockInsufficientError(message)
                         values.append(item)
 
@@ -211,6 +252,15 @@ class StockRepository:
                         )
                     pipe.set(dedupe_key, encode_success_record(result))
                     await pipe.execute()
+                    if TRACE_LOGGING_ENABLED:
+                        logger.info(
+                            "stock.reserve_batch.success activity_execution_id=%s item_count=%d total_quantity=%d watch_retries=%d duration_ms=%.2f",
+                            activity_execution_id,
+                            len(items),
+                            total_quantity,
+                            watch_retries,
+                            elapsed_ms(operation_start),
+                        )
                     return tuple(
                         StockReservation(
                             item_id=entry["item_id"],
@@ -219,6 +269,7 @@ class StockRepository:
                         for entry in result
                     )
             except WatchError:
+                watch_retries += 1
                 continue
             except RedisError as exc:
                 raise DatabaseError("DB error") from exc
@@ -275,6 +326,9 @@ class StockRepository:
 
         dedupe_key = activity_dedupe_key(activity_execution_id)
         item_ids = [reservation.item_id for reservation in reservations]
+        operation_start = time.perf_counter()
+        watch_retries = 0
+        total_quantity = sum(reservation.quantity for reservation in reservations)
 
         while True:
             try:
@@ -282,6 +336,15 @@ class StockRepository:
                     await pipe.watch(dedupe_key, *item_ids)
                     existing = await pipe.get(dedupe_key)
                     if existing is not None:
+                        if TRACE_LOGGING_ENABLED:
+                            logger.info(
+                                "stock.release_batch.dedupe_hit activity_execution_id=%s item_count=%d total_quantity=%d watch_retries=%d duration_ms=%.2f",
+                                activity_execution_id,
+                                len(reservations),
+                                total_quantity,
+                                watch_retries,
+                                elapsed_ms(operation_start),
+                            )
                         return self._materialize_reservation_batch_record(existing)
 
                     raws = await pipe.mget(item_ids)
@@ -295,6 +358,16 @@ class StockRepository:
                                 encode_error_record("item_not_found", message),
                             )
                             await pipe.execute()
+                            if TRACE_LOGGING_ENABLED:
+                                logger.info(
+                                    "stock.release_batch.item_not_found activity_execution_id=%s item_id=%s item_count=%d total_quantity=%d watch_retries=%d duration_ms=%.2f",
+                                    activity_execution_id,
+                                    reservation.item_id,
+                                    len(reservations),
+                                    total_quantity,
+                                    watch_retries,
+                                    elapsed_ms(operation_start),
+                                )
                             raise StockItemNotFoundError(message)
                         values.append(msgpack.decode(raw, type=StockValue))
 
@@ -311,6 +384,15 @@ class StockRepository:
                         )
                     pipe.set(dedupe_key, encode_success_record(result))
                     await pipe.execute()
+                    if TRACE_LOGGING_ENABLED:
+                        logger.info(
+                            "stock.release_batch.success activity_execution_id=%s item_count=%d total_quantity=%d watch_retries=%d duration_ms=%.2f",
+                            activity_execution_id,
+                            len(reservations),
+                            total_quantity,
+                            watch_retries,
+                            elapsed_ms(operation_start),
+                        )
                     return tuple(
                         StockReservation(
                             item_id=entry["item_id"],
@@ -319,6 +401,7 @@ class StockRepository:
                         for entry in result
                     )
             except WatchError:
+                watch_retries += 1
                 continue
             except RedisError as exc:
                 raise DatabaseError("DB error") from exc

@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import logging
 import random
+import time
 import uuid
 
 from msgspec import msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, WatchError
 
+from fluxi_engine.observability import elapsed_ms, trace_logging_enabled
 from shop_common.checkout import CheckoutOrder, OrderNotFoundError, coalesce_order_items
 from shop_common.errors import DatabaseError
 from shop_common.redis import (
@@ -17,6 +20,10 @@ from shop_common.redis import (
 )
 
 from ..domain.models import OrderValue
+
+
+logger = logging.getLogger(__name__)
+TRACE_LOGGING_ENABLED = trace_logging_enabled()
 
 
 class OrderRepository:
@@ -114,6 +121,8 @@ class OrderRepository:
         activity_execution_id: str,
     ) -> CheckoutOrder:
         dedupe_key = activity_dedupe_key(activity_execution_id)
+        operation_start = time.perf_counter()
+        watch_retries = 0
 
         while True:
             try:
@@ -121,6 +130,14 @@ class OrderRepository:
                     await pipe.watch(dedupe_key, order_id)
                     existing = await pipe.get(dedupe_key)
                     if existing is not None:
+                        if TRACE_LOGGING_ENABLED:
+                            logger.info(
+                                "order.mark_paid.dedupe_hit order_id=%s activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
+                                order_id,
+                                activity_execution_id,
+                                watch_retries,
+                                elapsed_ms(operation_start),
+                            )
                         return self._materialize_mark_paid_record(existing)
 
                     raw = await pipe.get(order_id)
@@ -132,6 +149,14 @@ class OrderRepository:
                         pipe.multi()
                         pipe.set(dedupe_key, record)
                         await pipe.execute()
+                        if TRACE_LOGGING_ENABLED:
+                            logger.info(
+                                "order.mark_paid.not_found order_id=%s activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
+                                order_id,
+                                activity_execution_id,
+                                watch_retries,
+                                elapsed_ms(operation_start),
+                            )
                         raise OrderNotFoundError(f"Order {order_id!r} not found")
 
                     entry = msgpack.decode(raw, type=OrderValue)
@@ -142,8 +167,17 @@ class OrderRepository:
                     pipe.set(order_id, msgpack.encode(entry))
                     pipe.set(dedupe_key, encode_success_record(result))
                     await pipe.execute()
+                    if TRACE_LOGGING_ENABLED:
+                        logger.info(
+                            "order.mark_paid.success order_id=%s activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
+                            order_id,
+                            activity_execution_id,
+                            watch_retries,
+                            elapsed_ms(operation_start),
+                        )
                     return self._decode_checkout_order_result(result)
             except WatchError:
+                watch_retries += 1
                 continue
             except RedisError as exc:
                 raise DatabaseError("DB error") from exc

@@ -3,9 +3,13 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fluxi_engine.observability import configure_logging
 
 from .controllers.payment import router
 from .dependencies import build_payment_container, close_payment_container
+
+
+configure_logging("payment-service")
 
 
 @asynccontextmanager

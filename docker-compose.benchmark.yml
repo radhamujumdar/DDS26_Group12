@@ -31,6 +31,8 @@ services:
       - FLUXI_HTTP_RESULT_MAX_CONNECTIONS=${FLUXI_HTTP_RESULT_MAX_CONNECTIONS:-192}
       - FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS:-96}
       - FLUXI_RESULT_WAIT_TIMEOUT_MS=${FLUXI_RESULT_WAIT_TIMEOUT_MS:-30000}
+      - DDS_TRACE_LOGGING=${DDS_TRACE_LOGGING:-0}
+      - DDS_LOG_LEVEL=${DDS_LOG_LEVEL:-INFO}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w ${ORDER_API_WORKERS:-4} --timeout 30 --log-level=info order.app.main:app
     env_file:
       - env/order_redis.env
@@ -47,6 +49,9 @@ services:
       context: .
       dockerfile: stock/Dockerfile
     image: stock:latest
+    environment:
+      - DDS_TRACE_LOGGING=${DDS_TRACE_LOGGING:-0}
+      - DDS_LOG_LEVEL=${DDS_LOG_LEVEL:-INFO}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w ${STOCK_API_WORKERS:-1} --timeout 30 --log-level=info stock.app.main:app
     env_file:
       - env/stock_redis.env
@@ -62,6 +67,9 @@ services:
       context: .
       dockerfile: payment/Dockerfile
     image: user:latest
+    environment:
+      - DDS_TRACE_LOGGING=${DDS_TRACE_LOGGING:-0}
+      - DDS_LOG_LEVEL=${DDS_LOG_LEVEL:-INFO}
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w ${PAYMENT_API_WORKERS:-1} --timeout 30 --log-level=info payment.app.main:app
     env_file:
       - env/payment_redis.env
@@ -98,6 +106,8 @@ services:
       - FLUXI_REDIS_MODE=direct
       - FLUXI_REDIS_URL=redis://:redis@fluxi-benchmark-redis:6379/0
       - FLUXI_RESULT_WAIT_TIMEOUT_MS=${FLUXI_RESULT_WAIT_TIMEOUT_MS:-30000}
+      - DDS_TRACE_LOGGING=${DDS_TRACE_LOGGING:-0}
+      - DDS_LOG_LEVEL=${DDS_LOG_LEVEL:-INFO}
     command: uvicorn app:app --host 0.0.0.0 --port 8001 --workers ${FLUXI_SERVER_WORKERS:-3}
     depends_on:
       - fluxi-benchmark-redis
@@ -112,6 +122,8 @@ services:
     environment:
       - FLUXI_REDIS_MODE=direct
       - FLUXI_REDIS_URL=redis://:redis@fluxi-benchmark-redis:6379/0
+      - DDS_TRACE_LOGGING=${DDS_TRACE_LOGGING:-0}
+      - DDS_LOG_LEVEL=${DDS_LOG_LEVEL:-INFO}
     depends_on:
       - fluxi-benchmark-redis
 
@@ -137,6 +149,8 @@ services:
       - FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS:-96}
       - FLUXI_MAX_CONCURRENT_WORKFLOW_TASKS=${FLUXI_ORDER_WORKFLOW_CONCURRENCY:-2}
       - FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS=${FLUXI_ORDER_ACTIVITY_CONCURRENCY:-1}
+      - DDS_TRACE_LOGGING=${DDS_TRACE_LOGGING:-0}
+      - DDS_LOG_LEVEL=${DDS_LOG_LEVEL:-INFO}
     env_file:
       - env/order_redis.env
     depends_on:
@@ -164,6 +178,8 @@ services:
       - FLUXI_HTTP_RESULT_MAX_CONNECTIONS=${FLUXI_HTTP_RESULT_MAX_CONNECTIONS:-192}
       - FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS:-96}
       - FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS=${FLUXI_STOCK_ACTIVITY_CONCURRENCY:-4}
+      - DDS_TRACE_LOGGING=${DDS_TRACE_LOGGING:-0}
+      - DDS_LOG_LEVEL=${DDS_LOG_LEVEL:-INFO}
     env_file:
       - env/stock_redis.env
     depends_on:
@@ -191,6 +207,8 @@ services:
       - FLUXI_HTTP_RESULT_MAX_CONNECTIONS=${FLUXI_HTTP_RESULT_MAX_CONNECTIONS:-192}
       - FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS=${FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS:-96}
       - FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS=${FLUXI_PAYMENT_ACTIVITY_CONCURRENCY:-4}
+      - DDS_TRACE_LOGGING=${DDS_TRACE_LOGGING:-0}
+      - DDS_LOG_LEVEL=${DDS_LOG_LEVEL:-INFO}
     env_file:
       - env/payment_redis.env
     depends_on:

@@ -5,6 +5,7 @@ import os
 
 from fluxi_sdk.client import EngineConnectionConfig, WorkflowClient
 from fluxi_sdk.worker import Worker
+from fluxi_engine.observability import configure_logging
 
 from payment.app.dependencies import (
     build_payment_container,
@@ -21,6 +22,7 @@ def _env_int(name: str, default: int) -> int:
 
 
 async def main() -> None:
+    configure_logging("payment-activity-worker")
     container = await build_payment_container()
     engine = EngineConnectionConfig.from_env()
     client = WorkflowClient.connect(engine=engine)
