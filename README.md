@@ -46,12 +46,6 @@ For Fluxi-heavy benchmark runs, the local Compose deployment is tuned with:
 - `stock-activity-worker` using `FLUXI_STOCK_ACTIVITY_CONCURRENCY` (default `16`)
 - `payment-activity-worker` using `FLUXI_PAYMENT_ACTIVITY_CONCURRENCY` (default `16`)
 
-Recent Fluxi runtime changes that matter for benchmark behavior:
-- workflow workers now read history and complete workflow/activity tasks directly against the Fluxi Redis store; `fluxi-server` remains the client-facing control plane for workflow start/result requests
-- sticky workflow routing now keeps a live in-memory workflow session on the owning worker and refreshes it with incremental history instead of replaying the workflow from scratch on every task
-- the SDK now supports `workflow.start_local_activity(...)` and `workflow.execute_local_activity(...)` for short same-worker steps that should be recorded in history without creating a queued activity task
-- the checkout example uses a local activity for `mark_order_paid`, so the successful happy path no longer consumes an `orders` activity slot
-
 You can scale the hot roles further during stress tests, for example:
 
 ```bash
@@ -73,6 +67,35 @@ That profile uses:
 - fewer API and Fluxi server worker processes
 - one replica of each business worker role by default
 - lower in-process worker concurrency tuned for an 8-core / 16 GB laptop
+
+For the course staff cluster, use the dedicated deployment profiles:
+
+- `docker-compose.small.yml` plus `scripts/up-small.sh`
+  - one instance of every service, database, and queue
+  - about `24` CPUs total
+- `docker-compose.medium.yml` plus `scripts/up-medium.sh`
+  - targets exactly `50` CPUs
+  - scales only the hot worker roles: `order-checkout-worker=3`, `stock-activity-worker=2`, `payment-activity-worker=2`
+- `docker-compose.large.yml` plus `scripts/up-large.sh`
+  - targets exactly `90` CPUs
+  - scales only the hot worker roles: `order-checkout-worker=4`, `stock-activity-worker=3`, `payment-activity-worker=3`
+
+The CPU split follows the checkout hot path:
+
+- roughly `60%` of worker CPU goes to order workflow execution, because each successful checkout still spends most of its orchestration work on the `orders` workflow queue
+- roughly `20%` goes to stock activities and `20%` to payment activities, because each successful checkout performs one stock reservation and one payment charge
+- the remaining fixed CPU budget is reserved for the synchronous API path, `fluxi-server`, the scheduler, ingress, and Redis
+
+The main tuning knobs in those profiles are:
+
+- `ORDER_API_WORKERS`: gunicorn workers for synchronous `/checkout` admission
+- `FLUXI_SERVER_WORKERS`: Uvicorn workers for workflow start/result traffic
+- `FLUXI_MAX_CONCURRENT_WORKFLOW_TASKS`: order workflow slots per checkout-worker container
+- `FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS`: activity slots per stock/payment worker container
+- `FLUXI_STICKY_CACHE_MAX_RUNS` and `FLUXI_STICKY_CACHE_TTL_MS`: size and lifetime of the sticky workflow session cache
+- `FLUXI_RESULT_WAIT_TIMEOUT_MS`: long-poll timeout for synchronous workflow completion
+
+All three cluster profiles use direct Fluxi Redis with persistent AOF-backed volumes and `restart: unless-stopped` to improve recovery after a container kill/restart test.
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 

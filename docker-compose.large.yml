@@ -1,0 +1,276 @@
+services:
+  gateway:
+    image: nginx:1.25-bookworm
+    restart: unless-stopped
+    cpus: 1.0
+    volumes:
+      - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "${DDS_GATEWAY_PORT:-8000}:80"
+    depends_on:
+      - order-service
+      - stock-service
+      - payment-service
+
+  order-service:
+    build:
+      context: .
+      dockerfile: order/Dockerfile
+    image: order:latest
+    restart: unless-stopped
+    cpus: 10.0
+    environment:
+      GATEWAY_URL: http://gateway:80
+      FLUXI_SERVER_URL: http://fluxi-server:8001
+      FLUXI_REDIS_MODE: direct
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
+      FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS: "2.0"
+      FLUXI_HTTP_READ_TIMEOUT_SECONDS: "30.0"
+      FLUXI_HTTP_WRITE_TIMEOUT_SECONDS: "30.0"
+      FLUXI_HTTP_POOL_TIMEOUT_SECONDS: "2.0"
+      FLUXI_HTTP_MAX_CONNECTIONS: "512"
+      FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS: "256"
+      FLUXI_HTTP_CONTROL_MAX_CONNECTIONS: "1024"
+      FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS: "512"
+      FLUXI_HTTP_RESULT_MAX_CONNECTIONS: "1024"
+      FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS: "512"
+      FLUXI_RESULT_WAIT_TIMEOUT_MS: "60000"
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 10 --timeout 60 --log-level=info order.app.main:app
+    env_file:
+      - env/order_redis.env
+    depends_on:
+      - order-db
+      - fluxi-server
+
+  order-db:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 1.0
+    command:
+      - redis-server
+      - --requirepass
+      - redis
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --maxmemory
+      - 8gb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - order-db-data:/data
+
+  stock-service:
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
+    image: stock:latest
+    restart: unless-stopped
+    cpus: 2.0
+    environment:
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 60 --log-level=info stock.app.main:app
+    env_file:
+      - env/stock_redis.env
+    depends_on:
+      - stock-db
+
+  stock-db:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 1.0
+    command:
+      - redis-server
+      - --requirepass
+      - redis
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --maxmemory
+      - 8gb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - stock-db-data:/data
+
+  payment-service:
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
+    image: user:latest
+    restart: unless-stopped
+    cpus: 2.0
+    environment:
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 60 --log-level=info payment.app.main:app
+    env_file:
+      - env/payment_redis.env
+    depends_on:
+      - payment-db
+
+  payment-db:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 1.0
+    command:
+      - redis-server
+      - --requirepass
+      - redis
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --maxmemory
+      - 8gb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - payment-db-data:/data
+
+  fluxi-redis:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 2.0
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --requirepass
+      - redis
+      - --maxmemory
+      - 16gb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - fluxi-redis-data:/data
+
+  fluxi-server:
+    build:
+      context: .
+      dockerfile: fluxi-server/Dockerfile
+    image: fluxi-server:latest
+    restart: unless-stopped
+    cpus: 8.0
+    environment:
+      FLUXI_REDIS_MODE: direct
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
+      FLUXI_RESULT_WAIT_TIMEOUT_MS: "60000"
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    command: uvicorn app:app --host 0.0.0.0 --port 8001 --workers 8
+    depends_on:
+      - fluxi-redis
+    ports:
+      - "${DDS_FLUXI_SERVER_PORT:-8001}:8001"
+
+  fluxi-scheduler:
+    build:
+      context: .
+      dockerfile: fluxi-scheduler/Dockerfile
+    image: fluxi-scheduler:latest
+    restart: unless-stopped
+    cpus: 2.0
+    environment:
+      FLUXI_REDIS_MODE: direct
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    depends_on:
+      - fluxi-redis
+
+  order-checkout-worker:
+    build:
+      context: .
+      dockerfile: order/Dockerfile
+    image: order:latest
+    restart: unless-stopped
+    cpus: 9.0
+    command: python -m order.workers.checkout_worker
+    environment:
+      FLUXI_SERVER_URL: http://fluxi-server:8001
+      FLUXI_REDIS_MODE: direct
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
+      FLUXI_MAX_CONCURRENT_WORKFLOW_TASKS: "16"
+      FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS: "2"
+      FLUXI_STICKY_SCHEDULE_TO_START_TIMEOUT_MS: "5000"
+      FLUXI_STICKY_CACHE_MAX_RUNS: "40000"
+      FLUXI_STICKY_CACHE_TTL_MS: "180000"
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    env_file:
+      - env/order_redis.env
+    depends_on:
+      - order-db
+      - fluxi-server
+
+  stock-activity-worker:
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
+    image: stock:latest
+    restart: unless-stopped
+    cpus: 4.0
+    command: python -m stock.workers.stock_worker
+    environment:
+      FLUXI_SERVER_URL: http://fluxi-server:8001
+      FLUXI_REDIS_MODE: direct
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
+      FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS: "12"
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    env_file:
+      - env/stock_redis.env
+    depends_on:
+      - stock-db
+      - fluxi-server
+
+  payment-activity-worker:
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
+    image: user:latest
+    restart: unless-stopped
+    cpus: 4.0
+    command: python -m payment.workers.payment_worker
+    environment:
+      FLUXI_SERVER_URL: http://fluxi-server:8001
+      FLUXI_REDIS_MODE: direct
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
+      FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS: "12"
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    env_file:
+      - env/payment_redis.env
+    depends_on:
+      - payment-db
+      - fluxi-server
+
+volumes:
+  fluxi-redis-data:
+  order-db-data:
+  stock-db-data:
+  payment-db-data:
