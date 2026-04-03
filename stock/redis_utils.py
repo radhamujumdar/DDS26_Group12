@@ -69,3 +69,35 @@ def create_redis_client(
         db=db,
         **COMMON_REDIS_KWARGS,
     )
+
+
+def create_sharded_redis(
+    shard_hosts: str | None,
+    host: str,
+    port: int,
+    password: str,
+    db: int,
+    sentinel_hosts: str | None = None,
+    master_name: str | None = None,
+):
+    """
+    Create a ShardedRedis from REDIS_SHARD_HOSTS (comma-separated host:port pairs).
+    Falls back to a single-shard wrapper around the legacy connection when not set.
+    """
+    from sharded_redis import ShardedRedis
+
+    if not shard_hosts:
+        single = create_redis_client(
+            host=host, port=port, password=password, db=db,
+            sentinel_hosts=sentinel_hosts, master_name=master_name,
+        )
+        return ShardedRedis([single])
+
+    shards: list[Redis] = []
+    for entry in shard_hosts.split(","):
+        entry = entry.strip()
+        h, p = entry.rsplit(":", 1)
+        shards.append(create_redis_client(
+            host=h, port=int(p), password=password, db=db,
+        ))
+    return ShardedRedis(shards)
