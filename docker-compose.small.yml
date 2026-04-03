@@ -25,13 +25,13 @@ services:
       FLUXI_REDIS_MODE: direct
       FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
       FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS: "2.0"
-      FLUXI_HTTP_READ_TIMEOUT_SECONDS: "30.0"
+      FLUXI_HTTP_READ_TIMEOUT_SECONDS: "40.0"
       FLUXI_HTTP_WRITE_TIMEOUT_SECONDS: "30.0"
-      FLUXI_HTTP_POOL_TIMEOUT_SECONDS: "2.0"
-      FLUXI_HTTP_MAX_CONNECTIONS: "128"
+      FLUXI_HTTP_POOL_TIMEOUT_SECONDS: "3.0"
+      FLUXI_HTTP_MAX_CONNECTIONS: "96"
       FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS: "64"
-      FLUXI_HTTP_CONTROL_MAX_CONNECTIONS: "256"
-      FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS: "128"
+      FLUXI_HTTP_CONTROL_MAX_CONNECTIONS: "96"
+      FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS: "48"
       FLUXI_HTTP_RESULT_MAX_CONNECTIONS: "256"
       FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS: "128"
       FLUXI_RESULT_WAIT_TIMEOUT_MS: "30000"
@@ -61,7 +61,7 @@ services:
       - --protected-mode
       - "no"
       - --maxmemory
-      - 2gb
+      - 4gb
       - --maxmemory-policy
       - noeviction
     volumes:
@@ -100,7 +100,7 @@ services:
       - --protected-mode
       - "no"
       - --maxmemory
-      - 2gb
+      - 4gb
       - --maxmemory-policy
       - noeviction
     volumes:
@@ -139,7 +139,7 @@ services:
       - --protected-mode
       - "no"
       - --maxmemory
-      - 2gb
+      - 4gb
       - --maxmemory-policy
       - noeviction
     volumes:
@@ -162,7 +162,7 @@ services:
       - --requirepass
       - redis
       - --maxmemory
-      - 4gb
+      - 8gb
       - --maxmemory-policy
       - noeviction
     volumes:

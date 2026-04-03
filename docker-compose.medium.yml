@@ -25,16 +25,16 @@ services:
       FLUXI_REDIS_MODE: direct
       FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
       FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS: "2.0"
-      FLUXI_HTTP_READ_TIMEOUT_SECONDS: "30.0"
+      FLUXI_HTTP_READ_TIMEOUT_SECONDS: "55.0"
       FLUXI_HTTP_WRITE_TIMEOUT_SECONDS: "30.0"
-      FLUXI_HTTP_POOL_TIMEOUT_SECONDS: "2.0"
-      FLUXI_HTTP_MAX_CONNECTIONS: "256"
+      FLUXI_HTTP_POOL_TIMEOUT_SECONDS: "4.0"
+      FLUXI_HTTP_MAX_CONNECTIONS: "160"
       FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS: "128"
-      FLUXI_HTTP_CONTROL_MAX_CONNECTIONS: "512"
-      FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS: "256"
-      FLUXI_HTTP_RESULT_MAX_CONNECTIONS: "512"
-      FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS: "256"
-      FLUXI_RESULT_WAIT_TIMEOUT_MS: "60000"
+      FLUXI_HTTP_CONTROL_MAX_CONNECTIONS: "160"
+      FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS: "80"
+      FLUXI_HTTP_RESULT_MAX_CONNECTIONS: "384"
+      FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS: "192"
+      FLUXI_RESULT_WAIT_TIMEOUT_MS: "45000"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 6 --timeout 60 --log-level=info order.app.main:app
@@ -61,7 +61,7 @@ services:
       - --protected-mode
       - "no"
       - --maxmemory
-      - 4gb
+      - 6gb
       - --maxmemory-policy
       - noeviction
     volumes:
@@ -100,7 +100,7 @@ services:
       - --protected-mode
       - "no"
       - --maxmemory
-      - 4gb
+      - 6gb
       - --maxmemory-policy
       - noeviction
     volumes:
@@ -139,7 +139,7 @@ services:
       - --protected-mode
       - "no"
       - --maxmemory
-      - 4gb
+      - 6gb
       - --maxmemory-policy
       - noeviction
     volumes:
@@ -162,7 +162,7 @@ services:
       - --requirepass
       - redis
       - --maxmemory
-      - 8gb
+      - 16gb
       - --maxmemory-policy
       - noeviction
     volumes:
@@ -178,7 +178,7 @@ services:
     environment:
       FLUXI_REDIS_MODE: direct
       FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
-      FLUXI_RESULT_WAIT_TIMEOUT_MS: "60000"
+      FLUXI_RESULT_WAIT_TIMEOUT_MS: "45000"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: uvicorn app:app --host 0.0.0.0 --port 8001 --workers 5
