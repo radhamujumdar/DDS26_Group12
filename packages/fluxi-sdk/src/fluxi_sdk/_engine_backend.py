@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -10,6 +11,7 @@ import inspect
 import logging
 import os
 import socket
+import time
 from typing import Any, Callable
 import uuid
 
@@ -43,7 +45,7 @@ from .errors import (
 from .types import ActivityOptions, RetryPolicy, StartPolicy, WorkflowReference
 from .workflow import WorkflowRegistration, _get_workflow_name, _get_workflow_run_callable
 
-_WORKFLOW_ACK_OUTCOMES = {"scheduled_activity", "completed", "stale", "conflict", "missing"}
+_WORKFLOW_ACK_OUTCOMES = {"scheduled_activity", "waiting", "completed", "stale", "conflict", "missing"}
 _ACTIVITY_ACK_OUTCOMES = {"accepted", "stale", "conflict", "missing"}
 _ATTEMPT_EVENT_TYPES = {
     "ActivityAttemptFailed",
@@ -275,11 +277,22 @@ class _EngineWorkerBinding:
     _stopped_event: asyncio.Event = field(init=False, repr=False)
     _workflow_capacity_event: asyncio.Event = field(init=False, repr=False)
     _activity_capacity_event: asyncio.Event = field(init=False, repr=False)
+    _sticky_task_queue: str = field(init=False, repr=False)
     _redis_store: FluxiRedisStore | None = field(init=False, default=None, repr=False)
     _http_client: httpx.AsyncClient | None = field(init=False, default=None, repr=False)
     _poller_tasks: list[asyncio.Task[None]] = field(init=False, default_factory=list, repr=False)
     _workflow_inflight: set[asyncio.Task[None]] = field(init=False, default_factory=set, repr=False)
     _activity_inflight: set[asyncio.Task[None]] = field(init=False, default_factory=set, repr=False)
+    _history_cache: OrderedDict[str, _HistoryCacheEntry] = field(
+        init=False,
+        default_factory=OrderedDict,
+        repr=False,
+    )
+    _history_fetch_locks: dict[str, asyncio.Lock] = field(
+        init=False,
+        default_factory=dict,
+        repr=False,
+    )
     _running: bool = field(init=False, default=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -296,12 +309,16 @@ class _EngineWorkerBinding:
             activity_consumer_group=self.config.activity_consumer_group,
             result_wait_timeout_ms=self.config.result_wait_timeout_ms,
             result_poll_interval_ms=self.config.result_poll_interval_ms,
+            sticky_schedule_to_start_timeout_ms=self.config.sticky_schedule_to_start_timeout_ms,
+            sticky_cache_max_runs=self.config.sticky_cache_max_runs,
+            sticky_cache_ttl_ms=self.config.sticky_cache_ttl_ms,
         )
         self._workflow_by_name = {registration.name: registration for registration in self.workflows}
         self._activity_by_name = {registration.name: registration for registration in self.activities}
         self._consumer_name = (
             f"fluxi-sdk:{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         )
+        self._sticky_task_queue = f"{self.task_queue}::sticky::{self._consumer_name}"
         self._stop_event = asyncio.Event()
         self._stopped_event = asyncio.Event()
         self._stopped_event.set()
@@ -314,6 +331,8 @@ class _EngineWorkerBinding:
         self._poller_tasks = []
         self._workflow_inflight = set()
         self._activity_inflight = set()
+        self._history_cache = OrderedDict()
+        self._history_fetch_locks = {}
         self._running = False
 
     async def start(self) -> None:
@@ -329,16 +348,27 @@ class _EngineWorkerBinding:
         self._poller_tasks = []
         self._workflow_inflight = set()
         self._activity_inflight = set()
+        self._history_cache = OrderedDict()
+        self._history_fetch_locks = {}
         redis = create_redis_client(self._settings)
         self._redis_store = FluxiRedisStore(redis, self._settings)
         self._http_client = _build_http_client(self.config)
 
         if self.workflows:
             await self._redis_store.ensure_workflow_queue(self.task_queue)
+            await self._redis_store.ensure_workflow_queue(self._sticky_task_queue)
             self._poller_tasks.append(
                 asyncio.create_task(
-                    self._workflow_loop(),
+                    self._workflow_loop(workflow_queue(self._settings.key_prefix, self.task_queue)),
                     name=f"fluxi-sdk:workflow:{self.task_queue}:{self._consumer_name}",
+                )
+            )
+            self._poller_tasks.append(
+                asyncio.create_task(
+                    self._workflow_loop(
+                        workflow_queue(self._settings.key_prefix, self._sticky_task_queue)
+                    ),
+                    name=f"fluxi-sdk:workflow:{self._sticky_task_queue}:{self._consumer_name}",
                 )
             )
         if self.activities:
@@ -374,9 +404,8 @@ class _EngineWorkerBinding:
         self._running = False
         self._stopped_event.set()
 
-    async def _workflow_loop(self) -> None:
+    async def _workflow_loop(self, stream_key: str) -> None:
         assert self._redis_store is not None
-        stream_key = workflow_queue(self._settings.key_prefix, self.task_queue)
         try:
             while not self._stop_event.is_set():
                 try:
@@ -535,6 +564,7 @@ class _EngineWorkerBinding:
     async def _ensure_workflow_group(self) -> None:
         assert self._redis_store is not None
         await self._redis_store.ensure_workflow_queue(self.task_queue)
+        await self._redis_store.ensure_workflow_queue(self._sticky_task_queue)
 
     async def _ensure_activity_group(self) -> None:
         assert self._redis_store is not None
@@ -676,12 +706,13 @@ class _EngineWorkerBinding:
                     f"Worker for task queue {self.task_queue!r} cannot execute workflow {task_payload['workflow_name']!r}."
                 )
             )
-            outcome = await self._submit_workflow_failure(
+            outcome = await self._submit_workflow_commands(
                 run_id=str(task_payload["run_id"]),
                 workflow_task_id=str(task_payload["workflow_task_id"]),
                 attempt_no=int(task_payload["attempt_no"]),
-                error_payload=failure_payload,
+                commands=[{"kind": "fail_workflow", "error_payload_b64": to_base64(failure_payload)}],
             )
+            self._history_cache.pop(str(task_payload["run_id"]), None)
             return outcome in _WORKFLOW_ACK_OUTCOMES
 
         history = await self._fetch_run_history(str(task_payload["run_id"]))
@@ -694,35 +725,37 @@ class _EngineWorkerBinding:
             with workflow._activate_execution_context(
                 registration,
                 self.task_queue,
-                controller.execute_activity,
+                controller.start_activity,
             ):
                 result = await run_method(*args)
             controller.assert_fully_replayed()
             result_payload = encode_payload(result)
         except _WorkflowSuspended:
-            outcome = await self._submit_workflow_schedule(
+            outcome = await self._submit_workflow_commands(
                 run_id=str(task_payload["run_id"]),
                 workflow_task_id=str(task_payload["workflow_task_id"]),
                 attempt_no=int(task_payload["attempt_no"]),
-                command=controller.pending_command,
+                commands=_serialize_workflow_commands(controller.pending_commands),
             )
             return outcome in _WORKFLOW_ACK_OUTCOMES
         except BaseException as exc:
             failure_payload = _safe_failure_payload(exc)
-            outcome = await self._submit_workflow_failure(
+            outcome = await self._submit_workflow_commands(
                 run_id=str(task_payload["run_id"]),
                 workflow_task_id=str(task_payload["workflow_task_id"]),
                 attempt_no=int(task_payload["attempt_no"]),
-                error_payload=failure_payload,
+                commands=[{"kind": "fail_workflow", "error_payload_b64": to_base64(failure_payload)}],
             )
+            self._history_cache.pop(str(task_payload["run_id"]), None)
             return outcome in _WORKFLOW_ACK_OUTCOMES
 
-        outcome = await self._submit_workflow_completion(
+        outcome = await self._submit_workflow_commands(
             run_id=str(task_payload["run_id"]),
             workflow_task_id=str(task_payload["workflow_task_id"]),
             attempt_no=int(task_payload["attempt_no"]),
-            result_payload=result_payload,
+            commands=[{"kind": "complete_workflow", "result_payload_b64": to_base64(result_payload)}],
         )
+        self._history_cache.pop(str(task_payload["run_id"]), None)
         return outcome in _WORKFLOW_ACK_OUTCOMES
 
     async def _process_activity_task(self, task_payload: dict[str, Any]) -> bool:
@@ -775,83 +808,94 @@ class _EngineWorkerBinding:
 
     async def _fetch_run_history(self, run_id: str) -> list[dict[str, Any]]:
         assert self._http_client is not None
-        response = await self._http_client.get(f"/runs/{run_id}/history")
-        response.raise_for_status()
-        body = response.json()
-        return [_restore_history_event(event) for event in body["events"]]
+        history_lock = self._history_fetch_locks.get(run_id)
+        if history_lock is None:
+            history_lock = asyncio.Lock()
+            self._history_fetch_locks[run_id] = history_lock
 
-    async def _submit_workflow_schedule(
+        try:
+            async with history_lock:
+                while True:
+                    cache_entry = self._history_cache.get(run_id)
+                    after_index: int | None = None
+                    if cache_entry is not None:
+                        if (
+                            (time.monotonic() - cache_entry.updated_at_monotonic) * 1000
+                            > self._settings.sticky_cache_ttl_ms
+                        ):
+                            self._history_cache.pop(run_id, None)
+                            cache_entry = None
+                        else:
+                            after_index = cache_entry.next_index
+                            self._history_cache.move_to_end(run_id)
+
+                    response = await self._http_client.get(
+                        f"/runs/{run_id}/history",
+                        params={"after_index": after_index} if after_index is not None else None,
+                    )
+                    response.raise_for_status()
+                    body = response.json()
+                    events = [_restore_history_event(event) for event in body["events"]]
+                    next_index = int(body.get("next_index", len(events) - 1))
+
+                    if cache_entry is None:
+                        cache_entry = _HistoryCacheEntry(
+                            history=events,
+                            next_index=next_index,
+                            updated_at_monotonic=time.monotonic(),
+                        )
+                        self._history_cache[run_id] = cache_entry
+                    else:
+                        if next_index < cache_entry.next_index:
+                            self._history_cache.pop(run_id, None)
+                            continue
+
+                        events_to_append = events
+                        if after_index is not None:
+                            response_start = after_index + 1
+                            overlap = cache_entry.next_index - response_start + 1
+                            if overlap > 0:
+                                overlap = min(overlap, len(events))
+                                existing_slice = cache_entry.history[
+                                    response_start : response_start + overlap
+                                ]
+                                if existing_slice != events[:overlap]:
+                                    self._history_cache.pop(run_id, None)
+                                    continue
+                                events_to_append = events[overlap:]
+
+                        cache_entry.history.extend(events_to_append)
+                        cache_entry.next_index = max(cache_entry.next_index, next_index)
+                        cache_entry.updated_at_monotonic = time.monotonic()
+
+                    while len(self._history_cache) > self._settings.sticky_cache_max_runs:
+                        self._history_cache.popitem(last=False)
+                    return list(cache_entry.history)
+        finally:
+            waiters = getattr(history_lock, "_waiters", None)
+            if not history_lock.locked() and not waiters:
+                self._history_fetch_locks.pop(run_id, None)
+
+    async def _submit_workflow_commands(
         self,
         *,
         run_id: str,
         workflow_task_id: str,
         attempt_no: int,
-        command: _ActivityScheduleCommand,
+        commands: list[dict[str, Any]],
     ) -> str:
         assert self._http_client is not None
-        retry_policy = _retry_policy_payload(command.retry_policy)
+        sticky_expires_at_ms = int(time.time() * 1000) + self._settings.sticky_schedule_to_start_timeout_ms
         response = await self._http_client.post(
             "/workflow-tasks/complete",
             json={
                 "run_id": run_id,
                 "workflow_task_id": workflow_task_id,
                 "attempt_no": attempt_no,
-                "command": {
-                    "kind": "schedule_activity",
-                    "activity_name": command.activity_name,
-                    "activity_task_queue": command.task_queue,
-                    "input_payload_b64": to_base64(command.input_payload),
-                    "retry_policy": retry_policy,
-                    "schedule_to_close_timeout_ms": command.schedule_to_close_timeout_ms,
-                },
-            },
-        )
-        response.raise_for_status()
-        return response.json()["outcome"]
-
-    async def _submit_workflow_completion(
-        self,
-        *,
-        run_id: str,
-        workflow_task_id: str,
-        attempt_no: int,
-        result_payload: bytes,
-    ) -> str:
-        assert self._http_client is not None
-        response = await self._http_client.post(
-            "/workflow-tasks/complete",
-            json={
-                "run_id": run_id,
-                "workflow_task_id": workflow_task_id,
-                "attempt_no": attempt_no,
-                "command": {
-                    "kind": "complete_workflow",
-                    "result_payload_b64": to_base64(result_payload),
-                },
-            },
-        )
-        response.raise_for_status()
-        return response.json()["outcome"]
-
-    async def _submit_workflow_failure(
-        self,
-        *,
-        run_id: str,
-        workflow_task_id: str,
-        attempt_no: int,
-        error_payload: bytes,
-    ) -> str:
-        assert self._http_client is not None
-        response = await self._http_client.post(
-            "/workflow-tasks/complete",
-            json={
-                "run_id": run_id,
-                "workflow_task_id": workflow_task_id,
-                "attempt_no": attempt_no,
-                "command": {
-                    "kind": "fail_workflow",
-                    "error_payload_b64": to_base64(error_payload),
-                },
+                "sticky_task_queue": self._sticky_task_queue,
+                "sticky_owner_id": self._consumer_name,
+                "sticky_expires_at_ms": sticky_expires_at_ms,
+                "commands": commands,
             },
         )
         response.raise_for_status()
@@ -889,8 +933,41 @@ class _ActivityScheduleCommand:
     schedule_to_close_timeout_ms: int | None
 
 
+@dataclass(slots=True)
+class _HistoryCacheEntry:
+    history: list[dict[str, Any]]
+    next_index: int
+    updated_at_monotonic: float
+
+
+def _serialize_workflow_commands(
+    commands: Sequence[_ActivityScheduleCommand],
+) -> list[dict[str, Any]]:
+    serialized: list[dict[str, Any]] = []
+    for command in commands:
+        serialized.append(
+            {
+                "kind": "schedule_activity",
+                "activity_name": command.activity_name,
+                "activity_task_queue": command.task_queue,
+                "input_payload_b64": to_base64(command.input_payload),
+                "retry_policy": _retry_policy_payload(command.retry_policy),
+                "schedule_to_close_timeout_ms": command.schedule_to_close_timeout_ms,
+            }
+        )
+    return serialized
+
+
 class _WorkflowSuspended(Exception):
     """Internal control-flow exception for deterministic workflow scheduling."""
+
+
+@dataclass(frozen=True, slots=True)
+class _ReplayActivityHandleState:
+    activity_name: str
+    pending: bool
+    activity_execution_id: str | None = None
+    terminal_outcome: dict[str, Any] | None = None
 
 
 class _WorkflowReplayController:
@@ -906,45 +983,67 @@ class _WorkflowReplayController:
             )
         self._history = history
         self._task_queue = task_queue
-        self._index = 1
         self.workflow_input_payload = history[0].get("input_payload")
-        self.pending_command: _ActivityScheduleCommand | None = None
+        self._schedule_events = [
+            event for event in history if event.get("event_type") == "ActivityScheduled"
+        ]
+        self._schedule_index = 0
+        self.pending_commands: list[_ActivityScheduleCommand] = []
+        self._terminal_outcomes: dict[str, dict[str, Any]] = {}
+        for event in history:
+            event_type = event.get("event_type")
+            if event_type in {"ActivityCompleted", "ActivityFailed"}:
+                self._terminal_outcomes[str(event["activity_execution_id"])] = event
 
-    async def execute_activity(
+    def start_activity(
         self,
         activity_name: str,
         args: Sequence[Any],
         options: ActivityOptions,
-    ) -> Any:
-        if self.pending_command is not None:
-            raise NonDeterministicWorkflowError(
-                "Workflow attempted to schedule multiple activities in a single task."
-            )
-
-        if self._index >= len(self._history):
-            self.pending_command = _ActivityScheduleCommand(
-                activity_name=activity_name,
-                task_queue=options.task_queue or self._task_queue,
-                input_payload=encode_args_payload(tuple(args)),
-                retry_policy=options.retry_policy,
-                schedule_to_close_timeout_ms=_timedelta_to_ms(
-                    options.schedule_to_close_timeout
-                ),
-            )
-            raise _WorkflowSuspended()
-
-        event = self._history[self._index]
-        if event.get("event_type") != "ActivityScheduled":
-            raise NonDeterministicWorkflowError(
-                f"Expected ActivityScheduled, found {event.get('event_type')!r}."
-            )
-
+    ) -> workflow.ActivityHandle[Any]:
         expected_payload = encode_args_payload(tuple(args))
         expected_queue = options.task_queue or self._task_queue
-        expected_timeout_ms = _timedelta_to_ms(options.schedule_to_close_timeout) or 0
+        expected_timeout_ms = _timedelta_to_ms(options.schedule_to_close_timeout)
         expected_max_attempts = (
             options.retry_policy.max_attempts if options.retry_policy else 1
         )
+        expected_initial_interval_ms = (
+            int(options.retry_policy.initial_interval_seconds * 1000)
+            if options.retry_policy and options.retry_policy.initial_interval_seconds is not None
+            else 0
+        )
+        expected_backoff_coefficient = (
+            float(options.retry_policy.backoff_coefficient)
+            if options.retry_policy and options.retry_policy.backoff_coefficient is not None
+            else 0.0
+        )
+        expected_max_interval_ms = (
+            int(options.retry_policy.max_interval_seconds * 1000)
+            if options.retry_policy and options.retry_policy.max_interval_seconds is not None
+            else 0
+        )
+
+        if self._schedule_index >= len(self._schedule_events):
+            self.pending_commands.append(
+                _ActivityScheduleCommand(
+                    activity_name=activity_name,
+                    task_queue=expected_queue,
+                    input_payload=expected_payload,
+                    retry_policy=options.retry_policy,
+                    schedule_to_close_timeout_ms=expected_timeout_ms,
+                )
+            )
+            return workflow.ActivityHandle(
+                lambda: self._await_handle(
+                    _ReplayActivityHandleState(
+                        activity_name=activity_name,
+                        pending=True,
+                    )
+                )
+            )
+
+        event = self._schedule_events[self._schedule_index]
+        self._schedule_index += 1
         if event.get("activity_name") != activity_name:
             raise NonDeterministicWorkflowError(
                 f"Expected scheduled activity {event.get('activity_name')!r}, got {activity_name!r}."
@@ -958,7 +1057,7 @@ class _WorkflowReplayController:
             raise NonDeterministicWorkflowError(
                 f"Activity {activity_name!r} input payload does not match stored history."
             )
-        if int(event.get("schedule_to_close_timeout_ms") or 0) != expected_timeout_ms:
+        if int(event.get("schedule_to_close_timeout_ms") or 0) != int(expected_timeout_ms or 0):
             raise NonDeterministicWorkflowError(
                 f"Activity {activity_name!r} timeout does not match stored history."
             )
@@ -966,38 +1065,57 @@ class _WorkflowReplayController:
             raise NonDeterministicWorkflowError(
                 f"Activity {activity_name!r} retry policy does not match stored history."
             )
+        if int(event.get("initial_interval_ms") or 0) != expected_initial_interval_ms:
+            raise NonDeterministicWorkflowError(
+                f"Activity {activity_name!r} retry policy does not match stored history."
+            )
+        if float(event.get("backoff_coefficient") or 0.0) != expected_backoff_coefficient:
+            raise NonDeterministicWorkflowError(
+                f"Activity {activity_name!r} retry policy does not match stored history."
+            )
+        if int(event.get("max_interval_ms") or 0) != expected_max_interval_ms:
+            raise NonDeterministicWorkflowError(
+                f"Activity {activity_name!r} retry policy does not match stored history."
+            )
 
         activity_execution_id = str(event["activity_execution_id"])
-        self._index += 1
-        while self._index < len(self._history):
-            outcome = self._history[self._index]
-            if outcome.get("activity_execution_id") != activity_execution_id:
-                break
-            event_type = outcome.get("event_type")
-            if event_type in _ATTEMPT_EVENT_TYPES:
-                self._index += 1
-                continue
-            if event_type == "ActivityCompleted":
-                self._index += 1
-                return decode_payload(outcome.get("result_payload"))
-            if event_type == "ActivityFailed":
-                self._index += 1
-                raise decode_failure_payload(
-                    outcome.get("error_payload"),
-                    fallback_error=RemoteActivityError,
+        terminal_outcome = self._terminal_outcomes.get(activity_execution_id)
+        return workflow.ActivityHandle(
+            lambda: self._await_handle(
+                _ReplayActivityHandleState(
+                    activity_name=activity_name,
+                    pending=False,
+                    activity_execution_id=activity_execution_id,
+                    terminal_outcome=terminal_outcome,
                 )
-            break
+            )
+        )
 
+    async def _await_handle(self, handle: _ReplayActivityHandleState) -> Any:
+        if handle.pending or handle.terminal_outcome is None:
+            raise _WorkflowSuspended()
+
+        outcome = handle.terminal_outcome
+        event_type = outcome.get("event_type")
+        if event_type == "ActivityCompleted":
+            return decode_payload(outcome.get("result_payload"))
+        if event_type == "ActivityFailed":
+            raise decode_failure_payload(
+                outcome.get("error_payload"),
+                fallback_error=RemoteActivityError,
+            )
         raise NonDeterministicWorkflowError(
-            f"Activity {activity_name!r} has no terminal outcome in history."
+            f"Activity {handle.activity_name!r} has unsupported terminal outcome {event_type!r}."
         )
 
     def assert_fully_replayed(self) -> None:
-        if self.pending_command is not None:
-            return
-        if self._index != len(self._history):
+        if self.pending_commands:
             raise NonDeterministicWorkflowError(
-                "Workflow completed without consuming the full stored history."
+                "Workflow completed while new activity commands were still pending."
+            )
+        if self._schedule_index != len(self._schedule_events):
+            raise NonDeterministicWorkflowError(
+                "Workflow completed without consuming the full scheduled activity history."
             )
 
 

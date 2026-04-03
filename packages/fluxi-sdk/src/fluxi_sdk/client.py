@@ -50,6 +50,9 @@ class EngineConnectionConfig:
     http_control_max_keepalive_connections: int = 64
     http_result_max_connections: int = 256
     http_result_max_keepalive_connections: int = 128
+    sticky_schedule_to_start_timeout_ms: int = 5000
+    sticky_cache_max_runs: int = 1000
+    sticky_cache_ttl_ms: int = 60000
 
     def __post_init__(self) -> None:
         mode = self.redis_mode.strip().lower()
@@ -116,6 +119,12 @@ class EngineConnectionConfig:
                 "http_result_max_keepalive_connections cannot exceed "
                 "http_result_max_connections."
             )
+        if self.sticky_schedule_to_start_timeout_ms < 1:
+            raise ValueError("sticky_schedule_to_start_timeout_ms must be at least 1.")
+        if self.sticky_cache_max_runs < 1:
+            raise ValueError("sticky_cache_max_runs must be at least 1.")
+        if self.sticky_cache_ttl_ms < 1:
+            raise ValueError("sticky_cache_ttl_ms must be at least 1.")
 
         if mode == "sentinel":
             if not sentinel_service_name:
@@ -226,6 +235,24 @@ class EngineConnectionConfig:
                 _env(
                     "FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS",
                     str(defaults.http_result_max_keepalive_connections),
+                )
+            ),
+            sticky_schedule_to_start_timeout_ms=int(
+                _env(
+                    "FLUXI_STICKY_SCHEDULE_TO_START_TIMEOUT_MS",
+                    str(defaults.sticky_schedule_to_start_timeout_ms),
+                )
+            ),
+            sticky_cache_max_runs=int(
+                _env(
+                    "FLUXI_STICKY_CACHE_MAX_RUNS",
+                    str(defaults.sticky_cache_max_runs),
+                )
+            ),
+            sticky_cache_ttl_ms=int(
+                _env(
+                    "FLUXI_STICKY_CACHE_TTL_MS",
+                    str(defaults.sticky_cache_ttl_ms),
                 )
             ),
         )

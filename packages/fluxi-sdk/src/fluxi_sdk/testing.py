@@ -65,6 +65,12 @@ class _WorkflowRunHandle:
     record: WorkflowExecutionRecord
     task: asyncio.Task[Any]
 
+
+class _FakeActivityHandle(workflow.ActivityHandle[Any]):
+    def __init__(self, task: asyncio.Task[Any]) -> None:
+        self.task = task
+        super().__init__(lambda: self.task)
+
 @dataclass(slots=True)
 class _WorkerBinding:
     task_queue: str
@@ -231,7 +237,7 @@ class FakeFluxiRuntime:
             with workflow._activate_execution_context(
                 registration,
                 record.task_queue,
-                lambda name, args, options: self._execute_activity(
+                lambda name, args, options: self._start_activity(
                     record,
                     name,
                     args,
@@ -248,13 +254,13 @@ class FakeFluxiRuntime:
         record.result = result
         return result
 
-    async def _execute_activity(
+    def _start_activity(
         self,
         workflow_record: WorkflowExecutionRecord,
         activity_name: str,
         args: tuple[Any, ...],
         options: ActivityOptions,
-    ) -> Any:
+    ) -> workflow.ActivityHandle[Any]:
         activity_execution_id = (
             f"{workflow_record.run_id}:act:{len(workflow_record.activity_executions) + 1}"
         )
@@ -271,23 +277,40 @@ class FakeFluxiRuntime:
             options=options,
         )
         workflow_record.activity_executions.append(execution)
+        task = asyncio.create_task(
+            self._run_activity_execution(
+                workflow_record=workflow_record,
+                execution=execution,
+            ),
+            name=(
+                f"fluxi:activity:{activity_name}:"
+                f"{workflow_record.workflow_id}:{activity_execution_id}"
+            ),
+        )
+        return _FakeActivityHandle(task)
 
+    async def _run_activity_execution(
+        self,
+        *,
+        workflow_record: WorkflowExecutionRecord,
+        execution: ActivityExecutionRecord,
+    ) -> Any:
         try:
             registration = self._get_activity_registration_for_task_queue(
-                activity_name,
-                task_queue=task_queue,
+                execution.activity_name,
+                task_queue=execution.task_queue,
             )
             with activity._activate_execution_context(
                 activity.ActivityExecutionInfo(
-                    activity_execution_id=activity_execution_id,
-                    attempt_no=1,
-                    activity_name=activity_name,
-                    task_queue=task_queue,
+                    activity_execution_id=execution.activity_execution_id,
+                    attempt_no=execution.attempt_no,
+                    activity_name=execution.activity_name,
+                    task_queue=execution.task_queue,
                     workflow_id=workflow_record.workflow_id,
                     run_id=workflow_record.run_id,
                 )
             ):
-                result = registration.fn(*args)
+                result = registration.fn(*execution.args)
                 if inspect.isawaitable(result):
                     result = await result
         except BaseException as exc:

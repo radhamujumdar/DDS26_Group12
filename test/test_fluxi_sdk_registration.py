@@ -178,6 +178,33 @@ class TestWorkflowExecutionContext(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "payment")
         self.assertEqual(captured["options"].task_queue, "payment")
 
+    async def test_start_activity_returns_awaitable_handle(self):
+        registration = self._workflow_registration()
+        captured: dict[str, object] = {}
+
+        async def schedule_activity(name, args, options):
+            captured["name"] = name
+            captured["args"] = args
+            captured["options"] = options
+            return f"scheduled:{name}:{options.task_queue}"
+
+        with workflow._activate_execution_context(
+            registration,
+            "orders",
+            schedule_activity,
+        ):
+            handle = workflow.start_activity(
+                "charge_payment",
+                "user-1",
+                task_queue="payment",
+            )
+            result = await handle
+
+        self.assertEqual(result, "scheduled:charge_payment:payment")
+        self.assertEqual(captured["name"], "charge_payment")
+        self.assertEqual(captured["args"], ("user-1",))
+        self.assertEqual(captured["options"].task_queue, "payment")
+
 
 if __name__ == "__main__":
     unittest.main()

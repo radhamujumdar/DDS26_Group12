@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import time
+from typing import Sequence
 from typing import Any
 import uuid
 
@@ -230,75 +231,116 @@ class FluxiRedisStore:
         run_id: str,
         workflow_task_id: str,
         attempt_no: int,
-        command: WorkflowTaskCommand,
+        commands: Sequence[WorkflowTaskCommand],
+        sticky_task_queue: str | None = None,
+        sticky_owner_id: str | None = None,
+        sticky_expires_at_ms: int | None = None,
     ) -> WorkflowTaskCompletionResult:
         workflow_id = await self._workflow_id_for_run(run_id)
         if workflow_id is None:
             return WorkflowTaskCompletionResult(outcome="missing")
 
-        if command.kind == "schedule_activity":
-            if command.activity_name is None or command.activity_task_queue is None:
-                raise ValueError("schedule_activity requires activity name and task queue.")
-            await self.ensure_activity_queue(command.activity_task_queue)
+        eval_args: list[Any] = [
+            _now_ms(),
+            workflow_task_id,
+            attempt_no,
+            f"workflow-timeout:{run_id}:{workflow_task_id}:{attempt_no}",
+            sticky_task_queue or "",
+            sticky_owner_id or "",
+            sticky_expires_at_ms or 0,
+            len(commands),
+        ]
+        for command in commands:
+            if command.kind == "schedule_activity":
+                if command.activity_name is None or command.activity_task_queue is None:
+                    raise ValueError("schedule_activity requires activity name and task queue.")
+                await self.ensure_activity_queue(command.activity_task_queue)
+                retry_policy = command.retry_policy or RetryPolicyConfig(max_attempts=1)
+                eval_args.extend(
+                    [
+                        command.kind,
+                        command.activity_name,
+                        command.activity_task_queue,
+                        activity_queue(
+                            self.settings.key_prefix,
+                            command.activity_task_queue,
+                        ),
+                        command.input_payload or b"",
+                        command.schedule_to_close_timeout_ms or 0,
+                        retry_policy.max_attempts or 1,
+                        retry_policy.initial_interval_ms or 0,
+                        retry_policy.backoff_coefficient or 0,
+                        retry_policy.max_interval_ms or 0,
+                        b"",
+                        b"",
+                    ]
+                )
+            elif command.kind == "complete_workflow":
+                eval_args.extend(
+                    [
+                        command.kind,
+                        "",
+                        "",
+                        "",
+                        b"",
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        command.result_payload or b"",
+                        b"",
+                    ]
+                )
+            else:
+                eval_args.extend(
+                    [
+                        command.kind,
+                        "",
+                        "",
+                        "",
+                        b"",
+                        0,
+                        1,
+                        0,
+                        0,
+                        0,
+                        b"",
+                        command.error_payload or b"",
+                    ]
+                )
 
-        run_state_key = workflow_state(self.settings.key_prefix, run_id)
-        history_key = workflow_history(self.settings.key_prefix, run_id)
-        timer_member = f"workflow-timeout:{run_id}:{workflow_task_id}:{attempt_no}"
+        raw = await self.redis.eval(
+            APPLY_WORKFLOW_TASK_COMPLETION,
+            6,
+            workflow_control(self.settings.key_prefix, workflow_id),
+            workflow_state(self.settings.key_prefix, run_id),
+            workflow_history(self.settings.key_prefix, run_id),
+            f"{self.settings.key_prefix}:activity:",
+            timers(self.settings.key_prefix),
+            workflow_result_channel(self.settings.key_prefix, workflow_id),
+            *eval_args,
+        )
 
-        if command.kind == "schedule_activity":
-            retry_policy = command.retry_policy or RetryPolicyConfig(max_attempts=1)
-            raw = await self.redis.eval(
-                APPLY_WORKFLOW_TASK_COMPLETION,
-                7,
-                workflow_control(self.settings.key_prefix, workflow_id),
-                run_state_key,
-                history_key,
-                f"{self.settings.key_prefix}:activity:",
-                activity_queue(self.settings.key_prefix, command.activity_task_queue),
-                timers(self.settings.key_prefix),
-                workflow_result_channel(self.settings.key_prefix, workflow_id),
-                _now_ms(),
-                workflow_task_id,
-                attempt_no,
-                self.settings.workflow_task_timeout_ms,
-                command.kind,
-                timer_member,
-                command.activity_name,
-                command.activity_task_queue,
-                command.input_payload or b"",
-                command.schedule_to_close_timeout_ms or 0,
-                retry_policy.max_attempts or 1,
-                retry_policy.initial_interval_ms or 0,
-                retry_policy.backoff_coefficient or 0,
-                retry_policy.max_interval_ms or 0,
-            )
-        else:
-            terminal_payload = command.result_payload if command.kind == "complete_workflow" else command.error_payload
-            raw = await self.redis.eval(
-                APPLY_WORKFLOW_TASK_COMPLETION,
-                7,
-                workflow_control(self.settings.key_prefix, workflow_id),
-                run_state_key,
-                history_key,
-                activity_state(self.settings.key_prefix, "__unused__"),
-                activity_queue(self.settings.key_prefix, "__unused__"),
-                timers(self.settings.key_prefix),
-                workflow_result_channel(self.settings.key_prefix, workflow_id),
-                _now_ms(),
-                workflow_task_id,
-                attempt_no,
-                self.settings.workflow_task_timeout_ms,
-                command.kind,
-                timer_member,
-                terminal_payload or b"",
-            )
+        activity_execution_ids: tuple[str, ...] = ()
+        if len(raw) > 3:
+            packed_ids = raw[3]
+            if packed_ids not in (None, b"", ""):
+                decoded_ids = unpackb(packed_ids)
+                activity_execution_ids = tuple(str(value) for value in decoded_ids)
+        first_activity_execution_id = _to_text(raw[2]) or None
+        if not activity_execution_ids and first_activity_execution_id:
+            activity_execution_ids = (first_activity_execution_id,)
 
         return WorkflowTaskCompletionResult(
             outcome=_to_text(raw[0]) or "",
             run_id=_to_text(raw[1]) or None,
-            activity_execution_id=_to_text(raw[2]) or None,
-            terminal_status="completed" if command.kind == "complete_workflow" else (
-                "failed" if command.kind == "fail_workflow" else None
+            activity_execution_id=first_activity_execution_id,
+            activity_execution_ids=activity_execution_ids,
+            terminal_status=(
+                "completed"
+                if commands and commands[-1].kind == "complete_workflow"
+                else ("failed" if commands and commands[-1].kind == "fail_workflow" else None)
             ),
         )
 
@@ -327,12 +369,11 @@ class FluxiRedisStore:
 
         raw = await self.redis.eval(
             APPLY_ACTIVITY_COMPLETION,
-            6,
+            5,
             workflow_control(self.settings.key_prefix, workflow_id),
             workflow_state(self.settings.key_prefix, run_id),
             workflow_history(self.settings.key_prefix, run_id),
             activity_key,
-            workflow_queue(self.settings.key_prefix, workflow_task_queue),
             timers(self.settings.key_prefix),
             _now_ms(),
             status,
@@ -340,6 +381,8 @@ class FluxiRedisStore:
             payload or b"",
             self.settings.workflow_task_timeout_ms,
             f"activity-timeout:{activity_execution_id}:{attempt_no}",
+            f"{self.settings.key_prefix}:queue:workflow:",
+            self.settings.sticky_schedule_to_start_timeout_ms,
         )
         return ActivityTaskCompletionResult(
             outcome=_to_text(raw[0]) or "",
@@ -392,12 +435,10 @@ class FluxiRedisStore:
 
         raw = await self.redis.eval(
             APPLY_TIMER,
-            6,
+            4,
             run_state_key,
             history_key,
             activity_key,
-            workflow_queue_key,
-            activity_queue_key,
             timers(self.settings.key_prefix),
             now_ms,
             timer_kind,
@@ -405,6 +446,9 @@ class FluxiRedisStore:
             attempt_no,
             self.settings.workflow_task_timeout_ms,
             timeout_error_payload,
+            f"{self.settings.key_prefix}:queue:workflow:",
+            f"{self.settings.key_prefix}:queue:activity:",
+            self.settings.sticky_schedule_to_start_timeout_ms,
         )
         return {
             "outcome": _to_text(raw[0]) or "",
@@ -413,13 +457,27 @@ class FluxiRedisStore:
             "timer_kind": timer_kind,
         }
 
-    async def get_history(self, run_id: str) -> list[Any]:
+    async def get_history_page(
+        self,
+        run_id: str,
+        *,
+        after_index: int | None = None,
+    ) -> tuple[list[Any], int]:
+        start = 0 if after_index is None or after_index < 0 else after_index + 1
         entries = await self.redis.lrange(
             workflow_history(self.settings.key_prefix, run_id),
-            0,
+            start,
             -1,
         )
-        return [unpackb(entry) for entry in entries]
+        events = [unpackb(entry) for entry in entries]
+        next_index = start + len(events) - 1
+        if after_index is not None and after_index >= 0 and len(events) == 0:
+            next_index = after_index
+        return events, next_index
+
+    async def get_history(self, run_id: str) -> list[Any]:
+        events, _ = await self.get_history_page(run_id)
+        return events
 
     async def get_run_state(self, run_id: str) -> dict[str, Any]:
         return _decode_hash(
@@ -540,6 +598,10 @@ class FluxiRedisStore:
             body = member.removeprefix("workflow-timeout:")
             run_id, workflow_task_id, attempt = body.rsplit(":", 2)
             return "workflow-timeout", workflow_task_id, int(attempt), run_id, None
+        if member.startswith("workflow-sticky-timeout:"):
+            body = member.removeprefix("workflow-sticky-timeout:")
+            run_id, workflow_task_id, attempt = body.rsplit(":", 2)
+            return "workflow-sticky-timeout", workflow_task_id, int(attempt), run_id, None
         if member.startswith("activity-timeout:"):
             body = member.removeprefix("activity-timeout:")
             activity_execution_id, attempt = body.rsplit(":", 1)

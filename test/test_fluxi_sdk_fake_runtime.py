@@ -68,6 +68,30 @@ class SlowWorkflow:
         return f"done:{value}"
 
 
+@activity.defn(name="echo_value")
+async def echo_value_activity(value: str) -> str:
+    await asyncio.sleep(0)
+    return value
+
+
+@workflow.defn
+class FanOutWorkflow:
+
+    @workflow.run
+    async def run(self, first: str, second: str) -> tuple[str, str]:
+        first_handle = workflow.start_activity(
+            echo_value_activity,
+            first,
+            task_queue="orders",
+        )
+        second_handle = workflow.start_activity(
+            echo_value_activity,
+            second,
+            task_queue="orders",
+        )
+        return (await second_handle, await first_handle)
+
+
 class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
@@ -258,7 +282,36 @@ class TestFakeFluxiRuntime(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_result, "done:alpha")
         self.assertEqual(len(runtime.workflow_runs), 1)
         self.assertEqual(runtime.workflow_runs[0].attach_count, 1)
-        self.assertEqual(runtime.workflow_runs[0].args, ("alpha",))
+
+    async def test_start_activity_supports_multiple_handles_and_reverse_await_order(self):
+        runtime, client = self._create_runtime()
+        orders_worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[FanOutWorkflow],
+            activities=[echo_value_activity],
+        )
+
+        async with orders_worker:
+            result = await client.execute_workflow(
+                FanOutWorkflow.run,
+                "alpha",
+                "beta",
+                id="fanout:1",
+                task_queue="orders",
+            )
+
+        self.assertEqual(result, ("beta", "alpha"))
+        run = runtime.workflow_runs[0]
+        self.assertEqual(
+            [execution.activity_name for execution in run.activity_executions],
+            ["echo_value", "echo_value"],
+        )
+        self.assertEqual(
+            [execution.args for execution in run.activity_executions],
+            [("alpha",), ("beta",)],
+        )
+        self.assertEqual(runtime.workflow_runs[0].args, ("alpha", "beta"))
 
     async def test_reject_duplicate_raises_for_existing_workflow_key(self):
         runtime = FakeFluxiRuntime()

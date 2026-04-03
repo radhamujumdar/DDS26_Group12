@@ -1,3 +1,4 @@
+import asyncio
 import inspect
 from datetime import timedelta
 import unittest
@@ -15,7 +16,7 @@ from fluxi_sdk import (
     WorkflowClient,
 )
 from fluxi_sdk import activity, client, errors, testing, types, worker, workflow
-from fluxi_sdk._engine_backend import EngineWorkflowBackend
+from fluxi_sdk._engine_backend import EngineWorkflowBackend, _EngineWorkerBinding
 
 
 class TestFluxiSdkContract(unittest.TestCase):
@@ -54,6 +55,23 @@ class TestFluxiSdkContract(unittest.TestCase):
             inspect.Parameter.VAR_POSITIONAL,
         )
         self.assertTrue(inspect.iscoroutinefunction(workflow.execute_activity))
+
+    def test_start_activity_signature(self):
+        signature = inspect.signature(workflow.start_activity)
+
+        self.assertEqual(
+            list(signature.parameters),
+            [
+                "activity",
+                "activity_args",
+                "task_queue",
+                "retry_policy",
+                "schedule_to_close_timeout",
+                "args",
+                "timeout_seconds",
+            ],
+        )
+        self.assertFalse(inspect.iscoroutinefunction(workflow.start_activity))
 
     def test_client_execute_workflow_signature(self):
         signature = inspect.signature(WorkflowClient.execute_workflow)
@@ -127,6 +145,9 @@ class TestFluxiSdkContract(unittest.TestCase):
         self.assertEqual(config.http_control_max_keepalive_connections, 64)
         self.assertEqual(config.http_result_max_connections, 256)
         self.assertEqual(config.http_result_max_keepalive_connections, 128)
+        self.assertEqual(config.sticky_schedule_to_start_timeout_ms, 5000)
+        self.assertEqual(config.sticky_cache_max_runs, 1000)
+        self.assertEqual(config.sticky_cache_ttl_ms, 60000)
 
     def test_connect_requires_explicit_backend_selection(self):
         with self.assertRaises(TypeError):
@@ -232,12 +253,155 @@ class TestFluxiSdkEngineHttpClient(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result_first.is_closed)
 
 
+class TestFluxiSdkEngineHistoryCache(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_history_fetch_uses_after_index_on_cache_hit(self):
+        config = EngineConnectionConfig(
+            server_url="http://localhost:8000",
+            redis_url="redis://localhost:6379/0",
+        )
+        binding = _EngineWorkerBinding(
+            config=config,
+            task_queue="orders",
+            workflows=(),
+            activities=(),
+            max_concurrent_workflow_tasks=1,
+            max_concurrent_activity_tasks=1,
+        )
+        fake_client = _HistoryClient(
+            [
+                _HistoryResponse(
+                    {
+                        "events": [
+                            {"event_type": "WorkflowStarted", "input_payload": None},
+                            {"event_type": "ActivityScheduled", "input_payload": None},
+                        ],
+                        "next_index": 1,
+                    }
+                ),
+                _HistoryResponse(
+                    {
+                        "events": [
+                            {
+                                "event_type": "ActivityCompleted",
+                                "result_payload": None,
+                                "activity_execution_id": "run-1:act:1",
+                            }
+                        ],
+                        "next_index": 2,
+                    }
+                ),
+            ]
+        )
+        binding._http_client = fake_client
+
+        first = await binding._fetch_run_history("run-1")
+        second = await binding._fetch_run_history("run-1")
+
+        self.assertEqual([event["event_type"] for event in first], ["WorkflowStarted", "ActivityScheduled"])
+        self.assertEqual(
+            [event["event_type"] for event in second],
+            ["WorkflowStarted", "ActivityScheduled", "ActivityCompleted"],
+        )
+        self.assertEqual(
+            fake_client.calls,
+            [
+                ("/runs/run-1/history", None),
+                ("/runs/run-1/history", {"after_index": 1}),
+            ],
+        )
+
+    async def test_worker_history_fetch_serializes_same_run_tail_requests(self):
+        config = EngineConnectionConfig(
+            server_url="http://localhost:8000",
+            redis_url="redis://localhost:6379/0",
+        )
+        binding = _EngineWorkerBinding(
+            config=config,
+            task_queue="orders",
+            workflows=(),
+            activities=(),
+            max_concurrent_workflow_tasks=1,
+            max_concurrent_activity_tasks=1,
+        )
+        fake_client = _HistoryClient(
+            [
+                _HistoryResponse(
+                    {
+                        "events": [
+                            {"event_type": "WorkflowStarted", "input_payload": None},
+                            {"event_type": "ActivityScheduled", "input_payload": None},
+                        ],
+                        "next_index": 1,
+                    }
+                ),
+                _HistoryResponse(
+                    {
+                        "events": [
+                            {
+                                "event_type": "ActivityCompleted",
+                                "result_payload": None,
+                                "activity_execution_id": "run-1:act:1",
+                            }
+                        ],
+                        "next_index": 2,
+                    }
+                ),
+                _HistoryResponse({"events": [], "next_index": 2}),
+            ]
+        )
+        binding._http_client = fake_client
+
+        await binding._fetch_run_history("run-1")
+        second, third = await asyncio.gather(
+            binding._fetch_run_history("run-1"),
+            binding._fetch_run_history("run-1"),
+        )
+
+        self.assertEqual(
+            [event["event_type"] for event in second],
+            ["WorkflowStarted", "ActivityScheduled", "ActivityCompleted"],
+        )
+        self.assertEqual(
+            [event["event_type"] for event in third],
+            ["WorkflowStarted", "ActivityScheduled", "ActivityCompleted"],
+        )
+        self.assertEqual(
+            fake_client.calls,
+            [
+                ("/runs/run-1/history", None),
+                ("/runs/run-1/history", {"after_index": 1}),
+                ("/runs/run-1/history", {"after_index": 2}),
+            ],
+        )
+
+
 class _FakeAsyncClient:
     def __init__(self) -> None:
         self.is_closed = False
 
     async def aclose(self) -> None:
         self.is_closed = True
+
+
+class _HistoryResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self):
+        return self._body
+
+
+class _HistoryClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    async def get(self, path, params=None):
+        self.calls.append((path, params))
+        return self._responses.pop(0)
 
 
 if __name__ == "__main__":

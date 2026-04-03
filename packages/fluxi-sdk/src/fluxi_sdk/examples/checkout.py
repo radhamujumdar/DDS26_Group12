@@ -81,26 +81,33 @@ class ReferenceCheckoutWorkflow:
     @workflow.run
     async def run(self, order_id: str) -> CheckoutWorkflowResult:
         order = await workflow.execute_activity("load_order", order_id)
+        reservation_handles = [
+            workflow.start_activity(
+                "reserve_stock",
+                item.item_id,
+                item.quantity,
+                task_queue="stock",
+                schedule_to_close_timeout=timedelta(seconds=30),
+            )
+            for item in order.items
+        ]
         reservations: list[StockReservation] = []
 
         try:
-            for item in order.items:
-                reservation = await workflow.execute_activity(
-                    "reserve_stock",
-                    item.item_id,
-                    item.quantity,
-                    task_queue="stock",
-                    schedule_to_close_timeout=timedelta(seconds=30),
-                )
-                reservations.append(reservation)
+            for handle in reservation_handles:
+                reservations.append(await handle)
         except StockUnavailableError:
-            for reservation in reversed(reservations):
-                await workflow.execute_activity(
+            release_handles = [
+                workflow.start_activity(
                     "release_stock",
                     reservation.item_id,
                     reservation.quantity,
                     task_queue="stock",
                 )
+                for reservation in reversed(reservations)
+            ]
+            for handle in release_handles:
+                await handle
             raise
 
         try:
@@ -112,15 +119,16 @@ class ReferenceCheckoutWorkflow:
                 schedule_to_close_timeout=timedelta(seconds=30),
             )
         except PaymentDeclinedError as exc:
-            released: list[StockReservation] = []
-            for reservation in reversed(reservations):
-                released_item = await workflow.execute_activity(
+            release_handles = [
+                workflow.start_activity(
                     "release_stock",
                     reservation.item_id,
                     reservation.quantity,
                     task_queue="stock",
                 )
-                released.append(released_item)
+                for reservation in reversed(reservations)
+            ]
+            released = [await handle for handle in release_handles]
             return CheckoutWorkflowResult(
                 order_id=order.order_id,
                 status="compensated",

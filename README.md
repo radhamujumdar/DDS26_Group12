@@ -56,6 +56,18 @@ docker compose up -d --build \
   --scale payment-activity-worker=2
 ```
 
+For laptop benchmarking, use the lean direct-Redis profile instead of the full Sentinel HA stack:
+
+```bash
+docker compose --env-file .env.benchmark -f docker-compose.benchmark.yml up -d --build
+```
+
+That profile uses:
+- one direct Fluxi Redis instead of Redis master/replica/Sentinel
+- fewer API and Fluxi server worker processes
+- one replica of each business worker role by default
+- lower in-process worker concurrency tuned for an 8-core / 16 GB laptop
+
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 
 K8s is also possible, but we do not require it as part of your submission. 

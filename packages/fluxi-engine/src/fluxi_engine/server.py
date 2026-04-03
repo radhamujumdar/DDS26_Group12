@@ -98,13 +98,39 @@ class WorkflowTaskCompletionRequest(BaseModel):
     run_id: str
     workflow_task_id: str
     attempt_no: int = Field(ge=1)
-    command: WorkflowCommandModel
+    command: WorkflowCommandModel | None = None
+    sticky_task_queue: str | None = None
+    sticky_owner_id: str | None = None
+    sticky_expires_at_ms: int | None = Field(default=None, ge=0)
+    commands: list[WorkflowCommandModel] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_commands(self) -> WorkflowTaskCompletionRequest:
+        normalized_commands = list(self.commands)
+        if self.command is not None:
+            if normalized_commands:
+                raise ValueError("Use command or commands, not both.")
+            normalized_commands = [self.command]
+        object.__setattr__(self, "commands", normalized_commands)
+
+        terminal_seen = False
+        for index, command in enumerate(normalized_commands):
+            if command.kind in {"complete_workflow", "fail_workflow"}:
+                if terminal_seen:
+                    raise ValueError("Workflow task completions may include at most one terminal command.")
+                terminal_seen = True
+                if index != len(normalized_commands) - 1:
+                    raise ValueError("Terminal workflow commands must be the final command.")
+            elif terminal_seen:
+                raise ValueError("Commands may not follow a terminal workflow command.")
+        return self
 
 
 class WorkflowTaskCompletionResponse(BaseModel):
     outcome: str
     run_id: str | None = None
     activity_execution_id: str | None = None
+    activity_execution_ids: list[str] = Field(default_factory=list)
     terminal_status: str | None = None
 
 
@@ -240,12 +266,16 @@ def create_app(
             run_id=request.run_id,
             workflow_task_id=request.workflow_task_id,
             attempt_no=request.attempt_no,
-            command=request.command.to_command(),
+            commands=[command.to_command() for command in request.commands],
+            sticky_task_queue=request.sticky_task_queue,
+            sticky_owner_id=request.sticky_owner_id,
+            sticky_expires_at_ms=request.sticky_expires_at_ms,
         )
         return WorkflowTaskCompletionResponse(
             outcome=result.outcome,
             run_id=result.run_id,
             activity_execution_id=result.activity_execution_id,
+            activity_execution_ids=list(result.activity_execution_ids),
             terminal_status=result.terminal_status,
         )
 
@@ -270,9 +300,15 @@ def create_app(
         )
 
     @app.get("/runs/{run_id}/history")
-    async def get_run_history(run_id: str) -> dict[str, Any]:
-        events = await get_store().get_history(run_id)
-        return {"events": normalize_payload(events)}
+    async def get_run_history(
+        run_id: str,
+        after_index: int | None = Query(default=None, ge=-1),
+    ) -> dict[str, Any]:
+        events, next_index = await get_store().get_history_page(
+            run_id,
+            after_index=after_index,
+        )
+        return {"events": normalize_payload(events), "next_index": next_index}
 
     @app.get("/runs/{run_id}/state")
     async def get_run_state(run_id: str) -> dict[str, Any]:

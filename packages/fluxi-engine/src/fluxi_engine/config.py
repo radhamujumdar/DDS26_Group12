@@ -41,6 +41,9 @@ class FluxiSettings:
     workflow_task_timeout_ms: int = 30_000
     result_wait_timeout_ms: int = 5_000
     result_poll_interval_ms: int = 100
+    sticky_schedule_to_start_timeout_ms: int = 5_000
+    sticky_cache_max_runs: int = 1000
+    sticky_cache_ttl_ms: int = 60_000
     timer_poll_interval_ms: int = 250
     pending_idle_threshold_ms: int = 30_000
     pending_claim_count: int = 100
@@ -70,6 +73,12 @@ class FluxiSettings:
             raise ValueError("sentinel_min_other_sentinels must be at least 0.")
         if self.result_wait_timeout_ms < 0:
             raise ValueError("result_wait_timeout_ms must be at least 0.")
+        if self.sticky_schedule_to_start_timeout_ms < 1:
+            raise ValueError("sticky_schedule_to_start_timeout_ms must be at least 1.")
+        if self.sticky_cache_max_runs < 1:
+            raise ValueError("sticky_cache_max_runs must be at least 1.")
+        if self.sticky_cache_ttl_ms < 1:
+            raise ValueError("sticky_cache_ttl_ms must be at least 1.")
 
         if mode == "sentinel":
             if not sentinel_service_name:
@@ -125,6 +134,24 @@ class FluxiSettings:
                 _env(
                     "FLUXI_RESULT_POLL_INTERVAL_MS",
                     str(defaults.result_poll_interval_ms),
+                )
+            ),
+            sticky_schedule_to_start_timeout_ms=int(
+                _env(
+                    "FLUXI_STICKY_SCHEDULE_TO_START_TIMEOUT_MS",
+                    str(defaults.sticky_schedule_to_start_timeout_ms),
+                )
+            ),
+            sticky_cache_max_runs=int(
+                _env(
+                    "FLUXI_STICKY_CACHE_MAX_RUNS",
+                    str(defaults.sticky_cache_max_runs),
+                )
+            ),
+            sticky_cache_ttl_ms=int(
+                _env(
+                    "FLUXI_STICKY_CACHE_TTL_MS",
+                    str(defaults.sticky_cache_ttl_ms),
                 )
             ),
             timer_poll_interval_ms=int(

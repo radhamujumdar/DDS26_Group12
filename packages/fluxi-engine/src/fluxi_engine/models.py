@@ -56,6 +56,7 @@ class WorkflowTaskCommand:
 class WorkflowTaskCompletionResult:
     outcome: str
     activity_execution_id: str | None = None
+    activity_execution_ids: tuple[str, ...] = ()
     run_id: str | None = None
     terminal_status: str | None = None
 

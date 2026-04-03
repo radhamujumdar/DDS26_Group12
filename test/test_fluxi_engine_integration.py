@@ -1,12 +1,82 @@
 from __future__ import annotations
 
 import asyncio
+import time
+import unittest
+
+import httpx
 
 from fluxi_engine_test_support import FluxiEngineAsyncTestCase
+from fluxi_engine import FluxiRedisStore, FluxiSettings, create_app, create_redis_client
 from fluxi_engine.scheduler import FluxiScheduler
 
 
 class TestFluxiEngineIntegration(FluxiEngineAsyncTestCase):
+    async def test_workflow_task_completion_supports_multiple_schedule_commands(self) -> None:
+        started = await self.start_workflow()
+        run_id = started["run_id"]
+        self.assertIsNotNone(run_id)
+
+        _, workflow_task = await self.latest_stream_payload(self.workflow_stream_key())
+        response = await self.client.post(
+            "/workflow-tasks/complete",
+            json={
+                "run_id": run_id,
+                "workflow_task_id": workflow_task["workflow_task_id"],
+                "attempt_no": workflow_task["attempt_no"],
+                "commands": [
+                    {
+                        "kind": "schedule_activity",
+                        "activity_name": "reserve_stock",
+                        "activity_task_queue": "stock",
+                        "input_payload_b64": self.payload_b64({"item_id": "item-1"}),
+                        "retry_policy": {
+                            "max_attempts": 2,
+                            "initial_interval_ms": 10,
+                            "backoff_coefficient": 2.0,
+                            "max_interval_ms": 100,
+                        },
+                        "schedule_to_close_timeout_ms": 200,
+                    },
+                    {
+                        "kind": "schedule_activity",
+                        "activity_name": "charge_payment",
+                        "activity_task_queue": "payment",
+                        "input_payload_b64": self.payload_b64({"amount": 10}),
+                        "retry_policy": {"max_attempts": 1},
+                        "schedule_to_close_timeout_ms": 300,
+                    },
+                ],
+            },
+        )
+        response.raise_for_status()
+        body = response.json()
+
+        self.assertEqual(body["outcome"], "scheduled_activity")
+        self.assertEqual(len(body["activity_execution_ids"]), 2)
+        self.assertEqual(body["activity_execution_id"], body["activity_execution_ids"][0])
+
+        _, stock_task = await self.latest_stream_payload(self.activity_stream_key("stock"))
+        _, payment_task = await self.latest_stream_payload(self.activity_stream_key("payment"))
+        self.assertEqual(
+            {stock_task["activity_execution_id"], payment_task["activity_execution_id"]},
+            set(body["activity_execution_ids"]),
+        )
+
+        history_response = await self.client.get(f"/runs/{run_id}/history")
+        history_response.raise_for_status()
+        scheduled_events = [
+            event
+            for event in history_response.json()["events"]
+            if event["event_type"] == "ActivityScheduled"
+        ]
+        self.assertEqual(len(scheduled_events), 2)
+        self.assertEqual(scheduled_events[0]["activity_name"], "reserve_stock")
+        self.assertEqual(scheduled_events[1]["activity_name"], "charge_payment")
+        self.assertEqual(scheduled_events[0]["initial_interval_ms"], 10)
+        self.assertEqual(scheduled_events[0]["backoff_coefficient"], 2.0)
+        self.assertEqual(scheduled_events[0]["max_interval_ms"], 100)
+
     async def test_wait_for_workflow_result_wakes_on_terminal_notification(self) -> None:
         started = await self.start_workflow()
         run_id = started["run_id"]
@@ -296,3 +366,181 @@ class TestFluxiEngineIntegration(FluxiEngineAsyncTestCase):
         self.assertEqual(retried_workflow_task["workflow_task_id"], workflow_task["workflow_task_id"])
         self.assertEqual(retried_workflow_task["attempt_no"], 2)
         self.assertEqual(retried_workflow_task["workflow_name"], "CheckoutWorkflow")
+
+    async def test_history_endpoint_supports_after_index(self) -> None:
+        started = await self.start_workflow()
+        run_id = started["run_id"]
+        self.assertIsNotNone(run_id)
+
+        _, workflow_task = await self.latest_stream_payload(self.workflow_stream_key())
+        schedule_response = await self.client.post(
+            "/workflow-tasks/complete",
+            json={
+                "run_id": run_id,
+                "workflow_task_id": workflow_task["workflow_task_id"],
+                "attempt_no": workflow_task["attempt_no"],
+                "command": {
+                    "kind": "schedule_activity",
+                    "activity_name": "reserve_stock",
+                    "activity_task_queue": "stock",
+                    "input_payload_b64": self.payload_b64({"order_id": "checkout:1"}),
+                    "retry_policy": {"max_attempts": 1},
+                    "schedule_to_close_timeout_ms": 200,
+                },
+            },
+        )
+        schedule_response.raise_for_status()
+        activity_execution_id = schedule_response.json()["activity_execution_id"]
+
+        await self.client.post(
+            "/activity-tasks/complete",
+            json={
+                "activity_execution_id": activity_execution_id,
+                "attempt_no": 1,
+                "status": "completed",
+                "result_payload_b64": self.payload_b64({"reserved": True}),
+            },
+        )
+
+        full_history_response = await self.client.get(f"/runs/{run_id}/history")
+        full_history_response.raise_for_status()
+        full_events = full_history_response.json()["events"]
+        self.assertEqual(len(full_events), 3)
+
+        tail_history_response = await self.client.get(
+            f"/runs/{run_id}/history",
+            params={"after_index": 0},
+        )
+        tail_history_response.raise_for_status()
+        tail_body = tail_history_response.json()
+        self.assertEqual(
+            [event["event_type"] for event in tail_body["events"]],
+            ["ActivityScheduled", "ActivityCompleted"],
+        )
+        self.assertEqual(tail_body["next_index"], 2)
+
+
+class TestFluxiEngineStickyIntegration(FluxiEngineAsyncTestCase):
+    async def asyncSetUp(self) -> None:
+        if self.harness.url is None:
+            raise unittest.SkipTest("No Redis URL available for engine tests.")
+
+        self.settings = FluxiSettings(
+            redis_url=self.harness.url,
+            key_prefix=f"fluxi-test:{self._testMethodName}",
+            workflow_task_timeout_ms=50,
+            result_poll_interval_ms=10,
+            sticky_schedule_to_start_timeout_ms=30,
+            timer_poll_interval_ms=10,
+            pending_idle_threshold_ms=1,
+            pending_claim_count=100,
+        )
+        redis = create_redis_client(self.settings)
+        self.store = FluxiRedisStore(redis, self.settings)
+        await self._wait_until_redis_ready()
+        await self.store.flushdb()
+
+        app = create_app(self.settings, store=self.store)
+        app.state.store = self.store
+        app.state.settings = self.settings
+        transport = httpx.ASGITransport(app=app)
+        self.client = httpx.AsyncClient(transport=transport, base_url="http://testserver")
+
+    async def test_activity_completion_routes_next_workflow_task_to_sticky_queue(self) -> None:
+        started = await self.start_workflow()
+        run_id = started["run_id"]
+        self.assertIsNotNone(run_id)
+
+        sticky_queue = "orders::sticky::worker-1"
+        _, workflow_task = await self.latest_stream_payload(self.workflow_stream_key())
+        response = await self.client.post(
+            "/workflow-tasks/complete",
+            json={
+                "run_id": run_id,
+                "workflow_task_id": workflow_task["workflow_task_id"],
+                "attempt_no": workflow_task["attempt_no"],
+                "sticky_task_queue": sticky_queue,
+                "sticky_owner_id": "worker-1",
+                "sticky_expires_at_ms": int(time.time() * 1000) + 30_000,
+                "commands": [
+                    {
+                        "kind": "schedule_activity",
+                        "activity_name": "reserve_stock",
+                        "activity_task_queue": "stock",
+                        "input_payload_b64": self.payload_b64({"order_id": "checkout:1"}),
+                        "retry_policy": {"max_attempts": 1},
+                        "schedule_to_close_timeout_ms": 200,
+                    }
+                ],
+            },
+        )
+        response.raise_for_status()
+        activity_execution_id = response.json()["activity_execution_id"]
+
+        completion = await self.client.post(
+            "/activity-tasks/complete",
+            json={
+                "activity_execution_id": activity_execution_id,
+                "attempt_no": 1,
+                "status": "completed",
+                "result_payload_b64": self.payload_b64({"reserved": True}),
+            },
+        )
+        completion.raise_for_status()
+
+        _, sticky_task = await self.latest_stream_payload(self.workflow_stream_key(sticky_queue))
+        self.assertEqual(sticky_task["task_queue"], sticky_queue)
+        self.assertEqual(sticky_task["attempt_no"], 1)
+
+    async def test_sticky_timeout_reroutes_workflow_task_to_normal_queue(self) -> None:
+        started = await self.start_workflow()
+        run_id = started["run_id"]
+        self.assertIsNotNone(run_id)
+
+        sticky_queue = "orders::sticky::worker-1"
+        _, workflow_task = await self.latest_stream_payload(self.workflow_stream_key())
+        response = await self.client.post(
+            "/workflow-tasks/complete",
+            json={
+                "run_id": run_id,
+                "workflow_task_id": workflow_task["workflow_task_id"],
+                "attempt_no": workflow_task["attempt_no"],
+                "sticky_task_queue": sticky_queue,
+                "sticky_owner_id": "worker-1",
+                "sticky_expires_at_ms": int(time.time() * 1000) + 30_000,
+                "commands": [
+                    {
+                        "kind": "schedule_activity",
+                        "activity_name": "reserve_stock",
+                        "activity_task_queue": "stock",
+                        "input_payload_b64": self.payload_b64({"order_id": "checkout:1"}),
+                        "retry_policy": {"max_attempts": 1},
+                        "schedule_to_close_timeout_ms": 200,
+                    }
+                ],
+            },
+        )
+        response.raise_for_status()
+        activity_execution_id = response.json()["activity_execution_id"]
+
+        completion = await self.client.post(
+            "/activity-tasks/complete",
+            json={
+                "activity_execution_id": activity_execution_id,
+                "attempt_no": 1,
+                "status": "completed",
+                "result_payload_b64": self.payload_b64({"reserved": True}),
+            },
+        )
+        completion.raise_for_status()
+        _, sticky_task = await self.latest_stream_payload(self.workflow_stream_key(sticky_queue))
+
+        scheduler = FluxiScheduler(self.store, self.settings)
+        await asyncio.sleep(0.05)
+        timer_result = await scheduler.run_once()
+        self.assertEqual(timer_result["timer_result"]["timer_kind"], "workflow-sticky-timeout")
+        self.assertEqual(timer_result["timer_result"]["outcome"], "retried")
+
+        _, retried_task = await self.latest_stream_payload(self.workflow_stream_key())
+        self.assertEqual(retried_task["workflow_task_id"], sticky_task["workflow_task_id"])
+        self.assertEqual(retried_task["attempt_no"], 2)

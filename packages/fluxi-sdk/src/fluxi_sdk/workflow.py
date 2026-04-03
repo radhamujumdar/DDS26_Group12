@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import timedelta
 import inspect
-from typing import Any, TypeVar, overload
+from typing import Any, Generic, TypeVar, overload
 
 from .activity import _get_activity_name
 from .errors import (
@@ -24,6 +25,7 @@ _WORKFLOW_RUN_ATTR = "__fluxi_workflow_run__"
 _WORKFLOW_CLASS_ATTR = "__fluxi_workflow_class__"
 
 WorkflowClassT = TypeVar("WorkflowClassT")
+ActivityResultT = TypeVar("ActivityResultT")
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,10 +47,20 @@ class WorkflowRegistration:
 class _WorkflowExecutionContext:
     registration: WorkflowRegistration
     task_queue: str
-    activity_executor: Callable[
+    activity_scheduler: Callable[
         [str, Sequence[Any], ActivityOptions],
-        Awaitable[Any],
+        Any,
     ]
+
+
+class ActivityHandle(Awaitable[ActivityResultT], Generic[ActivityResultT]):
+    """Awaitable handle returned by workflow.start_activity(...)."""
+
+    def __init__(self, awaiter: Callable[[], Awaitable[ActivityResultT]]) -> None:
+        self._awaiter = awaiter
+
+    def __await__(self):
+        return self._awaiter().__await__()
 
 
 _CURRENT_WORKFLOW_CONTEXT: ContextVar[_WorkflowExecutionContext | None] = ContextVar(
@@ -218,15 +230,15 @@ class WorkflowRegistry:
 def _activate_execution_context(
     registration: WorkflowRegistration,
     task_queue: str,
-    activity_executor: Callable[
+    activity_scheduler: Callable[
         [str, Sequence[Any], ActivityOptions],
-        Awaitable[Any],
+        Any,
     ],
 ) -> Iterator[None]:
     context = _WorkflowExecutionContext(
         registration=registration,
         task_queue=task_queue,
-        activity_executor=activity_executor,
+        activity_scheduler=activity_scheduler,
     )
     token = _CURRENT_WORKFLOW_CONTEXT.set(context)
     try:
@@ -270,12 +282,52 @@ async def execute_activity(
     args: Sequence[Any] | None = None,
     timeout_seconds: float | None = None,
 ) -> Any:
-    """Schedule an activity from inside workflow code."""
+    """Schedule an activity from inside workflow code and await its result."""
+
+    if _CURRENT_WORKFLOW_CONTEXT.get() is None:
+        raise WorkflowContextUnavailableError(
+            "workflow.execute_activity() requires an active workflow execution context."
+        )
+
+    return await start_activity(
+        activity,
+        *activity_args,
+        task_queue=task_queue,
+        retry_policy=retry_policy,
+        schedule_to_close_timeout=schedule_to_close_timeout,
+        args=args,
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _coerce_activity_handle(
+    value: Any,
+) -> ActivityHandle[Any]:
+    if isinstance(value, ActivityHandle):
+        return value
+    if inspect.isawaitable(value):
+        task = value if isinstance(value, asyncio.Task) else asyncio.ensure_future(value)
+        return ActivityHandle(lambda: task)
+    raise TypeError(
+        "Workflow activity scheduler must return an ActivityHandle or awaitable result."
+    )
+
+
+def start_activity(
+    activity: ActivityReference,
+    *activity_args: Any,
+    task_queue: str | None = None,
+    retry_policy: RetryPolicy | None = None,
+    schedule_to_close_timeout: timedelta | None = None,
+    args: Sequence[Any] | None = None,
+    timeout_seconds: float | None = None,
+) -> ActivityHandle[Any]:
+    """Schedule an activity from inside workflow code and return its awaitable handle."""
 
     context = _CURRENT_WORKFLOW_CONTEXT.get()
     if context is None:
         raise WorkflowContextUnavailableError(
-            "workflow.execute_activity() requires an active workflow execution context."
+            "workflow.start_activity() requires an active workflow execution context."
         )
 
     activity_name = _get_activity_name(activity)
@@ -288,7 +340,9 @@ async def execute_activity(
             timeout_seconds,
         ),
     )
-    return await context.activity_executor(activity_name, normalized_args, options)
+    return _coerce_activity_handle(
+        context.activity_scheduler(activity_name, normalized_args, options)
+    )
 
 
 class unsafe:
@@ -301,10 +355,12 @@ class unsafe:
 
 
 __all__ = [
+    "ActivityHandle",
     "WorkflowRegistration",
     "WorkflowRegistry",
     "defn",
     "execute_activity",
     "run",
+    "start_activity",
     "unsafe",
 ]

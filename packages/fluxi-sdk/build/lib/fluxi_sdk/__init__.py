@@ -10,7 +10,7 @@ from .testing import (
 )
 from .types import ActivityOptions, RetryPolicy, StartPolicy
 from .worker import Worker
-from .workflow import WorkflowRegistration, WorkflowRegistry
+from .workflow import ActivityHandle, WorkflowRegistration, WorkflowRegistry
 
 __all__ = [
     "__version__",
@@ -18,6 +18,7 @@ __all__ = [
     "ActivityRegistry",
     "ActivityExecutionInfo",
     "ActivityExecutionRecord",
+    "ActivityHandle",
     "ActivityOptions",
     "EngineConnectionConfig",
     "FakeFluxiRuntime",

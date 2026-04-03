@@ -282,6 +282,127 @@ class TestFluxiSdkEngineIntegration(FluxiSdkEngineAsyncTestCase):
 
         self.assertCountEqual(results, ["one", "two"])
 
+    async def test_workflow_start_activity_schedules_multiple_activities_in_one_task(self) -> None:
+        @activity.defn(name="fanout_step")
+        async def fanout_step(label: str) -> str:
+            await asyncio.sleep(0)
+            return label
+
+        @workflow.defn(name="FanOutWorkflow")
+        class FanOutWorkflow:
+
+            @workflow.run
+            async def run(self) -> tuple[str, str]:
+                first = workflow.start_activity(
+                    "fanout_step",
+                    "alpha",
+                    task_queue="orders",
+                )
+                second = workflow.start_activity(
+                    "fanout_step",
+                    "beta",
+                    task_queue="orders",
+                )
+                return (await second, await first)
+
+        client = WorkflowClient.connect(engine=self.engine)
+        worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[FanOutWorkflow],
+            activities=[fanout_step],
+            max_concurrent_workflow_tasks=2,
+            max_concurrent_activity_tasks=2,
+        )
+
+        async with worker:
+            result = await client.execute_workflow(
+                FanOutWorkflow.run,
+                id="fanout:1",
+                task_queue="orders",
+            )
+
+        self.assertEqual(result, ("beta", "alpha"))
+        run_id = await self._wait_for_run_id("fanout:1")
+        history = await self.assertion_store.get_history(run_id)
+        event_types = [event["event_type"] for event in history]
+        self.assertEqual(event_types.count("ActivityScheduled"), 2)
+        self.assertEqual(event_types.count("ActivityCompleted"), 2)
+        self.assertIn("WorkflowCompleted", event_types)
+        scheduled = [
+            event["activity_name"]
+            for event in history
+            if event["event_type"] == "ActivityScheduled"
+        ]
+        self.assertEqual(scheduled, ["fanout_step", "fanout_step"])
+
+    async def test_fanout_then_followup_activity_replays_without_nondeterminism(self) -> None:
+        release = asyncio.Event()
+        both_started = asyncio.Event()
+        started = 0
+        started_lock = asyncio.Lock()
+
+        @activity.defn(name="gated_step")
+        async def gated_step(label: str) -> str:
+            nonlocal started
+            if label != "gamma":
+                async with started_lock:
+                    started += 1
+                    if started == 2:
+                        both_started.set()
+                await both_started.wait()
+                await release.wait()
+            return label
+
+        @workflow.defn(name="FanOutThenFollowUpWorkflow")
+        class FanOutThenFollowUpWorkflow:
+
+            @workflow.run
+            async def run(self) -> tuple[str, str, str]:
+                first = workflow.start_activity(
+                    "gated_step",
+                    "alpha",
+                    task_queue="orders",
+                )
+                second = workflow.start_activity(
+                    "gated_step",
+                    "beta",
+                    task_queue="orders",
+                )
+                return (
+                    await first,
+                    await second,
+                    await workflow.execute_activity(
+                        "gated_step",
+                        "gamma",
+                        task_queue="orders",
+                    ),
+                )
+
+        client = WorkflowClient.connect(engine=self.engine)
+        worker = Worker(
+            client,
+            task_queue="orders",
+            workflows=[FanOutThenFollowUpWorkflow],
+            activities=[gated_step],
+            max_concurrent_workflow_tasks=2,
+            max_concurrent_activity_tasks=2,
+        )
+
+        async with worker:
+            execution = asyncio.create_task(
+                client.execute_workflow(
+                    FanOutThenFollowUpWorkflow.run,
+                    id="fanout-followup:1",
+                    task_queue="orders",
+                )
+            )
+            await asyncio.wait_for(both_started.wait(), timeout=10)
+            release.set()
+            result = await asyncio.wait_for(execution, timeout=10)
+
+        self.assertEqual(result, ("alpha", "beta", "gamma"))
+
     async def test_reference_checkout_happy_path(self) -> None:
         state = ReferenceCheckoutState(
             orders={
