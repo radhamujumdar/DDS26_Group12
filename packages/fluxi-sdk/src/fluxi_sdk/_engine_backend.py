@@ -1544,10 +1544,22 @@ def _decode_workflow_result(
 
 
 def _decode_workflow_failure(payload_b64: str | None) -> BaseException:
-    return decode_failure_payload(
-        from_base64(payload_b64),
-        fallback_error=RemoteWorkflowError,
-    )
+    if payload_b64 is None:
+        return RemoteWorkflowError(
+            "Workflow failed without an encoded failure payload.",
+        )
+    try:
+        return decode_failure_payload(
+            from_base64(payload_b64),
+            fallback_error=RemoteWorkflowError,
+        )
+    except Exception as exc:
+        return RemoteWorkflowError(
+            "Workflow failed with an invalid failure payload.",
+            remote_module=exc.__class__.__module__,
+            remote_qualname=exc.__class__.__qualname__,
+            remote_args=(str(exc),),
+        )
 
 
 def _resolve_terminal_start_response(

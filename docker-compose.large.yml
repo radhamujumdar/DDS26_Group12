@@ -4,13 +4,16 @@ services:
     restart: unless-stopped
     cpus: 1.75
     volumes:
-      - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./gateway_nginx.large.conf:/etc/nginx/nginx.conf:ro
     ports:
       - "${DDS_GATEWAY_PORT:-8000}:80"
     depends_on:
-      - order-service
-      - stock-service
-      - payment-service
+      order-service:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
 
   order-service:
     build:
@@ -44,11 +47,18 @@ services:
       REDIS_SENTINEL_ENDPOINTS: order-sentinel-1:26379,order-sentinel-2:26379,order-sentinel-3:26379
       REDIS_SENTINEL_SERVICE_NAME: order-master
       REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
+      REDIS_FAILOVER_RETRY_TIMEOUT_SECONDS: "30.0"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 3 --timeout 60 --log-level=info order.app.main:app
     env_file:
       - env/order_redis.env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     depends_on:
       - order-db-master
       - order-db-replica
@@ -79,6 +89,12 @@ services:
       - noeviction
     volumes:
       - order-db-master-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   order-db-replica:
     image: redis:7.2-bookworm
@@ -113,6 +129,12 @@ services:
       - order-db-master
     volumes:
       - order-db-replica-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   order-sentinel-1:
     image: redis:7.2-bookworm
@@ -203,11 +225,18 @@ services:
       REDIS_SENTINEL_ENDPOINTS: stock-sentinel-1:26379,stock-sentinel-2:26379,stock-sentinel-3:26379
       REDIS_SENTINEL_SERVICE_NAME: stock-master
       REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
+      REDIS_FAILOVER_RETRY_TIMEOUT_SECONDS: "30.0"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 60 --log-level=info stock.app.main:app
     env_file:
       - env/stock_redis.env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     depends_on:
       - stock-db-master
       - stock-db-replica
@@ -237,6 +266,12 @@ services:
       - noeviction
     volumes:
       - stock-db-master-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   stock-db-replica:
     image: redis:7.2-bookworm
@@ -271,6 +306,12 @@ services:
       - stock-db-master
     volumes:
       - stock-db-replica-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   stock-sentinel-1:
     image: redis:7.2-bookworm
@@ -361,11 +402,18 @@ services:
       REDIS_SENTINEL_ENDPOINTS: payment-sentinel-1:26379,payment-sentinel-2:26379,payment-sentinel-3:26379
       REDIS_SENTINEL_SERVICE_NAME: payment-master
       REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
+      REDIS_FAILOVER_RETRY_TIMEOUT_SECONDS: "30.0"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 60 --log-level=info payment.app.main:app
     env_file:
       - env/payment_redis.env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     depends_on:
       - payment-db-master
       - payment-db-replica
@@ -395,6 +443,12 @@ services:
       - noeviction
     volumes:
       - payment-db-master-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   payment-db-replica:
     image: redis:7.2-bookworm
@@ -429,6 +483,12 @@ services:
       - payment-db-master
     volumes:
       - payment-db-replica-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   payment-sentinel-1:
     image: redis:7.2-bookworm
@@ -522,6 +582,12 @@ services:
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: uvicorn app:app --host 0.0.0.0 --port 8001 --workers 3
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     depends_on:
       - fluxi-redis-master
       - fluxi-redis-replica
@@ -573,6 +639,12 @@ services:
       - noeviction
     volumes:
       - fluxi-redis-master-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   fluxi-redis-replica:
     image: redis:7.2-bookworm
@@ -607,6 +679,12 @@ services:
       - fluxi-redis-master
     volumes:
       - fluxi-redis-replica-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   fluxi-sentinel-1:
     image: redis:7.2-bookworm
@@ -709,6 +787,7 @@ services:
       REDIS_SENTINEL_ENDPOINTS: order-sentinel-1:26379,order-sentinel-2:26379,order-sentinel-3:26379
       REDIS_SENTINEL_SERVICE_NAME: order-master
       REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
+      REDIS_FAILOVER_RETRY_TIMEOUT_SECONDS: "30.0"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     env_file:
@@ -743,6 +822,7 @@ services:
       REDIS_SENTINEL_ENDPOINTS: stock-sentinel-1:26379,stock-sentinel-2:26379,stock-sentinel-3:26379
       REDIS_SENTINEL_SERVICE_NAME: stock-master
       REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
+      REDIS_FAILOVER_RETRY_TIMEOUT_SECONDS: "30.0"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     env_file:
@@ -777,6 +857,7 @@ services:
       REDIS_SENTINEL_ENDPOINTS: payment-sentinel-1:26379,payment-sentinel-2:26379,payment-sentinel-3:26379
       REDIS_SENTINEL_SERVICE_NAME: payment-master
       REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
+      REDIS_FAILOVER_RETRY_TIMEOUT_SECONDS: "30.0"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     env_file:

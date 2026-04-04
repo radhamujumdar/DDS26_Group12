@@ -34,7 +34,7 @@ class OrderCheckoutWorkflow:
                 order.user_id,
                 order.total_cost,
                 task_queue="payment",
-                schedule_to_close_timeout=timedelta(seconds=30),
+                schedule_to_close_timeout=timedelta(seconds=45),
             )
         except PaymentDeclinedError as exc:
             released: tuple[StockReservation, ...] = ()

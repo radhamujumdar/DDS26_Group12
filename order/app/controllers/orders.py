@@ -33,6 +33,10 @@ def _database_error(exc: DatabaseError) -> HTTPException:
     return HTTPException(status_code=400, detail=str(exc))
 
 
+def _service_unavailable_error(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=503, detail=str(exc))
+
+
 @router.post("/create/{user_id}", response_model=CreateOrderResponse)
 async def create_order(
     user_id: str,
@@ -118,6 +122,10 @@ async def checkout_order(
         raise HTTPException(status_code=400, detail="User out of credit") from exc
     except OrderNotFoundError as exc:
         raise HTTPException(status_code=400, detail=f"Order: {order_id} not found!") from exc
+    except DatabaseError as exc:
+        raise _service_unavailable_error(exc) from exc
+    except UpstreamServiceError as exc:
+        raise _service_unavailable_error(exc) from exc
     return PlainTextResponse(
         CheckoutService.to_http_response_text(result),
         status_code=200,

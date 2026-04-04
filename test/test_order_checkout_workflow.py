@@ -15,6 +15,7 @@ from shop_common.checkout import (
     PaymentReceipt,
     StockReservation,
 )
+from datetime import timedelta
 
 
 class TestOrderCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
@@ -100,6 +101,10 @@ class TestOrderCheckoutWorkflow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["stock"]["item-1"], 3)
         self.assertEqual(state["credit"]["user-1"], 5)
         self.assertEqual(len(runtime.workflow_runs[0].activity_executions), 3)
+        self.assertEqual(
+            runtime.workflow_runs[0].activity_executions[1].options.schedule_to_close_timeout,
+            timedelta(seconds=45),
+        )
         self.assertTrue(runtime.workflow_runs[0].activity_executions[2].is_local)
         self.assertEqual(
             runtime.workflow_runs[0].activity_executions[2].activity_name,

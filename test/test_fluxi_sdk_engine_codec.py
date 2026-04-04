@@ -10,6 +10,7 @@ from fluxi_sdk._codec import (
     encode_failure_payload,
     encode_payload,
 )
+from fluxi_sdk._engine_backend import _decode_workflow_failure
 from fluxi_sdk.errors import RemoteActivityError
 from fluxi_sdk.examples.checkout import (
     CheckoutItem,
@@ -114,6 +115,24 @@ class TestFluxiSdkEngineCodec(unittest.TestCase):
         self.assertIsInstance(decoded, RemoteActivityError)
         self.assertEqual(decoded.remote_qualname, "TestFluxiSdkEngineCodec.test_uses_fallback_for_unimportable_exceptions.<locals>.LocalFailure")
         self.assertEqual(decoded.remote_args, ("boom",))
+
+    def test_decode_workflow_failure_falls_back_when_payload_is_missing(self):
+        decoded = _decode_workflow_failure(None)
+
+        self.assertIsInstance(decoded, Exception)
+        self.assertEqual(
+            str(decoded),
+            "Workflow failed without an encoded failure payload.",
+        )
+
+    def test_decode_workflow_failure_falls_back_when_payload_is_invalid(self):
+        decoded = _decode_workflow_failure("bm90LWEtZmFpbHVyZS1lbnZlbG9wZQ==")
+
+        self.assertIsInstance(decoded, Exception)
+        self.assertEqual(
+            str(decoded),
+            "Workflow failed with an invalid failure payload.",
+        )
 
 
 if __name__ == "__main__":

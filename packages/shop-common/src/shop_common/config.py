@@ -28,6 +28,7 @@ class RedisSettings:
     port: int = 6379
     password: str | None = None
     db: int = 0
+    failover_retry_timeout_seconds: float = 15.0
     sentinel_endpoints: str = ""
     sentinel_service_name: str = "redis-master"
     sentinel_min_other_sentinels: int = 0
@@ -58,6 +59,8 @@ class RedisSettings:
             raise ValueError("port must be within 1-65535.")
         if self.db < 0:
             raise ValueError("db must be at least 0.")
+        if self.failover_retry_timeout_seconds <= 0:
+            raise ValueError("failover_retry_timeout_seconds must be greater than zero.")
         if self.sentinel_min_other_sentinels < 0:
             raise ValueError("sentinel_min_other_sentinels must be at least 0.")
 
@@ -89,6 +92,10 @@ class RedisSettings:
             port=port,
             password=password,
             db=db,
+            failover_retry_timeout_seconds=float(
+                optional_env("REDIS_FAILOVER_RETRY_TIMEOUT_SECONDS")
+                or str(defaults.failover_retry_timeout_seconds)
+            ),
             sentinel_endpoints=optional_env("REDIS_SENTINEL_ENDPOINTS") or defaults.sentinel_endpoints,
             sentinel_service_name=optional_env("REDIS_SENTINEL_SERVICE_NAME") or defaults.sentinel_service_name,
             sentinel_min_other_sentinels=int(

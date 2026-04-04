@@ -8,9 +8,12 @@ services:
     ports:
       - "${DDS_GATEWAY_PORT:-8000}:80"
     depends_on:
-      - order-service
-      - stock-service
-      - payment-service
+      order-service:
+        condition: service_healthy
+      stock-service:
+        condition: service_healthy
+      payment-service:
+        condition: service_healthy
 
   order-service:
     build:
@@ -40,6 +43,12 @@ services:
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 4 --timeout 60 --log-level=info order.app.main:app
     env_file:
       - env/order_redis.env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     depends_on:
       - order-db
       - fluxi-server
@@ -66,6 +75,12 @@ services:
       - noeviction
     volumes:
       - order-db-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   stock-service:
     build:
@@ -80,6 +95,12 @@ services:
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 1 --timeout 60 --log-level=info stock.app.main:app
     env_file:
       - env/stock_redis.env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     depends_on:
       - stock-db
 
@@ -105,6 +126,12 @@ services:
       - noeviction
     volumes:
       - stock-db-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   payment-service:
     build:
@@ -119,6 +146,12 @@ services:
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 1 --timeout 60 --log-level=info payment.app.main:app
     env_file:
       - env/payment_redis.env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     depends_on:
       - payment-db
 
@@ -144,6 +177,12 @@ services:
       - noeviction
     volumes:
       - payment-db-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   fluxi-redis:
     image: redis:7.2-bookworm
@@ -167,6 +206,12 @@ services:
       - noeviction
     volumes:
       - fluxi-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "redis", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
 
   fluxi-server:
     build:
@@ -182,6 +227,12 @@ services:
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: uvicorn app:app --host 0.0.0.0 --port 8001 --workers 3
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/readyz', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 15s
     depends_on:
       - fluxi-redis
     ports:

@@ -52,3 +52,16 @@ class TestShopCommonRedisSettings(unittest.TestCase):
         self.assertEqual(settings.sentinel_min_other_sentinels, 1)
         self.assertEqual(settings.password, "redis")
         self.assertEqual(settings.db, 0)
+
+    def test_failover_retry_timeout_can_be_overridden_from_env(self) -> None:
+        os.environ["REDIS_MODE"] = "sentinel"
+        os.environ["REDIS_SENTINEL_ENDPOINTS"] = (
+            "payment-sentinel-1:26379,payment-sentinel-2:26379,payment-sentinel-3:26379"
+        )
+        os.environ["REDIS_SENTINEL_SERVICE_NAME"] = "payment-master"
+        os.environ["REDIS_DB"] = "0"
+        os.environ["REDIS_FAILOVER_RETRY_TIMEOUT_SECONDS"] = "30.0"
+
+        settings = RedisSettings.from_env()
+
+        self.assertEqual(settings.failover_retry_timeout_seconds, 30.0)

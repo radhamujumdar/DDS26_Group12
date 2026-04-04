@@ -49,7 +49,13 @@ def create_connection_pool(settings: RedisSettings) -> Any:
 
 def create_redis_client(settings: RedisSettings) -> Redis:
     if settings.redis_mode == "direct":
-        return Redis.from_pool(create_connection_pool(settings))
+        redis = Redis.from_pool(create_connection_pool(settings))
+        setattr(
+            redis,
+            "_shop_failover_retry_timeout_seconds",
+            settings.failover_retry_timeout_seconds,
+        )
+        return redis
 
     sentinel = _ShopSentinel(
         _parse_sentinel_endpoints(settings.sentinel_endpoints),
@@ -59,11 +65,17 @@ def create_redis_client(settings: RedisSettings) -> Redis:
             _parse_sentinel_endpoints(settings.sentinel_endpoints)
         ),
     )
-    return sentinel.master_for(
+    redis = sentinel.master_for(
         settings.sentinel_service_name,
         redis_class=Redis,
         **_redis_connection_kwargs(settings),
     )
+    setattr(
+        redis,
+        "_shop_failover_retry_timeout_seconds",
+        settings.failover_retry_timeout_seconds,
+    )
+    return redis
 
 
 async def close_redis_client(redis: Redis) -> None:
@@ -156,11 +168,15 @@ async def run_with_failover_retry(
     operation_name: str,
     logger: logging.Logger | None = None,
     trace_logging_enabled: bool = False,
-    timeout_seconds: float = _FAILOVER_RETRY_TIMEOUT_SECONDS,
+    timeout_seconds: float | None = None,
 ) -> _T:
     start = time.monotonic()
     delay_seconds = _FAILOVER_RETRY_INITIAL_DELAY_SECONDS
     attempt_no = 1
+    retry_timeout_seconds = _resolve_failover_retry_timeout_seconds(
+        redis,
+        timeout_seconds,
+    )
 
     while True:
         try:
@@ -170,7 +186,7 @@ async def run_with_failover_retry(
                 raise
 
             elapsed_seconds = time.monotonic() - start
-            if elapsed_seconds >= timeout_seconds:
+            if elapsed_seconds >= retry_timeout_seconds:
                 raise
 
             if trace_logging_enabled and logger is not None:
@@ -187,6 +203,27 @@ async def run_with_failover_retry(
             await asyncio.sleep(delay_seconds)
             delay_seconds = min(delay_seconds * 2, _FAILOVER_RETRY_MAX_DELAY_SECONDS)
             attempt_no += 1
+
+
+async def wait_until_redis_ready(
+    redis: Redis,
+    *,
+    operation_name: str,
+    logger: logging.Logger | None = None,
+    trace_logging_enabled: bool = False,
+    timeout_seconds: float | None = None,
+) -> None:
+    async def operation() -> None:
+        await redis.ping()
+
+    await run_with_failover_retry(
+        redis,
+        operation,
+        operation_name=operation_name,
+        logger=logger,
+        trace_logging_enabled=trace_logging_enabled,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def activity_dedupe_key(activity_execution_id: str) -> str:
@@ -310,3 +347,15 @@ async def _disconnect_pool(pool: Any) -> None:
             return
     except BaseException:
         return
+
+
+def _resolve_failover_retry_timeout_seconds(
+    redis: Redis,
+    timeout_seconds: float | None,
+) -> float:
+    if timeout_seconds is not None:
+        return timeout_seconds
+    configured = getattr(redis, "_shop_failover_retry_timeout_seconds", None)
+    if isinstance(configured, (int, float)) and configured > 0:
+        return float(configured)
+    return _FAILOVER_RETRY_TIMEOUT_SECONDS

@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import logging
 from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
 from .codecs import from_base64, to_base64
 from .config import FluxiSettings, create_redis_client
 from .models import RetryPolicyConfig, WorkflowTaskCommand
-from .store import FluxiRedisStore
+from .store import FluxiRedisStore, is_transient_redis_store_error
+
+
+logger = logging.getLogger(__name__)
 
 
 class RetryPolicyModel(BaseModel):
@@ -198,6 +203,7 @@ def create_app(
         if runtime_store is None:
             redis = create_redis_client(settings)
             runtime_store = FluxiRedisStore(redis, settings)
+        await runtime_store.ping(timeout_seconds=30.0)
         app.state.store = runtime_store
         app.state.settings = settings
         try:
@@ -207,6 +213,22 @@ def create_app(
                 await runtime_store.aclose()
 
     app = FastAPI(title="Fluxi Server", version="0.1.0", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def map_transient_store_errors(request, call_next):
+        try:
+            return await call_next(request)
+        except BaseException as exc:
+            if is_transient_redis_store_error(exc):
+                logger.warning(
+                    "Fluxi control-plane dependency temporarily unavailable: %s",
+                    exc,
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Fluxi store temporarily unavailable."},
+                )
+            raise
 
     def normalize_payload(value: Any) -> Any:
         if isinstance(value, bytes):
@@ -226,7 +248,14 @@ def create_app(
 
     @app.get("/readyz")
     async def readyz() -> dict[str, str]:
-        await get_store().redis.ping()
+        try:
+            await get_store().ping(timeout_seconds=2.0)
+        except BaseException as exc:
+            logger.warning("Fluxi ready check failed: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail="Fluxi store temporarily unavailable.",
+            ) from exc
         return {"status": "ready"}
 
     @app.post("/workflows/start-or-attach", response_model=StartWorkflowResponse)

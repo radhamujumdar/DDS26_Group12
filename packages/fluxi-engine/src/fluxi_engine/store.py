@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+import asyncio
+from collections.abc import Awaitable, Callable, Iterable
 import logging
 import time
-from typing import Sequence
-from typing import Any
+from typing import Any, Sequence, TypeVar
 import uuid
 
 from redis.asyncio import Redis
-from redis.exceptions import ResponseError
+from redis.asyncio.sentinel import MasterNotFoundError
+from redis.exceptions import ConnectionError, ReadOnlyError, ResponseError, TimeoutError
 
 from .codecs import packb, unpackb
 from .config import FluxiSettings, close_redis_client
@@ -45,6 +46,11 @@ from .scripts import (
 
 logger = logging.getLogger(__name__)
 TRACE_LOGGING_ENABLED = trace_logging_enabled()
+_FAILOVER_RETRY_TIMEOUT_SECONDS = 15.0
+_FAILOVER_RETRY_INITIAL_DELAY_SECONDS = 0.05
+_FAILOVER_RETRY_MAX_DELAY_SECONDS = 0.75
+_FAILOVER_LOADING_MARKERS = ("LOADING", "MASTERDOWN", "TRYAGAIN")
+_T = TypeVar("_T")
 
 
 def _now_ms() -> int:
@@ -85,6 +91,46 @@ def _decode_hash(mapping: dict[Any, Any]) -> dict[str, Any]:
     return decoded
 
 
+async def _disconnect_pool(pool: Any) -> None:
+    disconnect = getattr(pool, "disconnect", None)
+    if not callable(disconnect):
+        return
+    try:
+        await disconnect(inuse_connections=True)
+    except TypeError:
+        await disconnect()
+
+
+async def _reset_redis_connections(redis: Redis) -> None:
+    pool = getattr(redis, "connection_pool", None)
+    if pool is not None:
+        await _disconnect_pool(pool)
+
+        sentinel_manager = getattr(pool, "sentinel_manager", None)
+        sentinels = getattr(sentinel_manager, "sentinels", ())
+        for sentinel_client in sentinels:
+            sentinel_pool = getattr(sentinel_client, "connection_pool", None)
+            if sentinel_pool is not None:
+                await _disconnect_pool(sentinel_pool)
+
+
+def is_transient_redis_store_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            ConnectionError,
+            TimeoutError,
+            MasterNotFoundError,
+            ReadOnlyError,
+        ),
+    ):
+        return True
+    if isinstance(exc, ResponseError):
+        message = str(exc).upper()
+        return any(marker in message for marker in _FAILOVER_LOADING_MARKERS)
+    return False
+
+
 class FluxiRedisStore:
     """Async Redis-backed storage and atomic operations for Fluxi."""
 
@@ -98,20 +144,86 @@ class FluxiRedisStore:
     async def flushdb(self) -> None:
         await self.redis.flushdb()
 
+    async def ping(
+        self,
+        *,
+        timeout_seconds: float = _FAILOVER_RETRY_TIMEOUT_SECONDS,
+    ) -> bool:
+        async def operation() -> bool:
+            return bool(await self.redis.ping())
+
+        return await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.ping",
+            timeout_seconds=timeout_seconds,
+        )
+
+    async def _run_redis_operation(
+        self,
+        operation: Callable[[], Awaitable[_T]],
+        *,
+        operation_name: str,
+        timeout_seconds: float = _FAILOVER_RETRY_TIMEOUT_SECONDS,
+    ) -> _T:
+        start = time.monotonic()
+        delay_seconds = _FAILOVER_RETRY_INITIAL_DELAY_SECONDS
+        attempt_no = 1
+
+        while True:
+            try:
+                return await operation()
+            except BaseException as exc:
+                if not is_transient_redis_store_error(exc):
+                    raise
+
+                elapsed_seconds = time.monotonic() - start
+                if elapsed_seconds >= timeout_seconds:
+                    raise
+
+                if TRACE_LOGGING_ENABLED:
+                    logger.warning(
+                        "%s transient redis failover error attempt=%d elapsed_ms=%.2f error_type=%s message=%s",
+                        operation_name,
+                        attempt_no,
+                        elapsed_seconds * 1000,
+                        exc.__class__.__name__,
+                        exc,
+                    )
+
+                await _reset_redis_connections(self.redis)
+                await asyncio.sleep(delay_seconds)
+                delay_seconds = min(
+                    delay_seconds * 2,
+                    _FAILOVER_RETRY_MAX_DELAY_SECONDS,
+                )
+                attempt_no += 1
+
     async def ensure_workflow_queue(self, task_queue: str) -> None:
-        await self._ensure_stream_group(
-            stream_key=workflow_queue(self.settings.key_prefix, task_queue),
-            group_name=self.settings.workflow_consumer_group,
-            registry_key=workflow_task_queues(self.settings.key_prefix),
-            task_queue=task_queue,
+        async def operation() -> None:
+            await self._ensure_stream_group(
+                stream_key=workflow_queue(self.settings.key_prefix, task_queue),
+                group_name=self.settings.workflow_consumer_group,
+                registry_key=workflow_task_queues(self.settings.key_prefix),
+                task_queue=task_queue,
+            )
+
+        await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.ensure_workflow_queue",
         )
 
     async def ensure_activity_queue(self, task_queue: str) -> None:
-        await self._ensure_stream_group(
-            stream_key=activity_queue(self.settings.key_prefix, task_queue),
-            group_name=self.settings.activity_consumer_group,
-            registry_key=activity_task_queues(self.settings.key_prefix),
-            task_queue=task_queue,
+        async def operation() -> None:
+            await self._ensure_stream_group(
+                stream_key=activity_queue(self.settings.key_prefix, task_queue),
+                group_name=self.settings.activity_consumer_group,
+                registry_key=activity_task_queues(self.settings.key_prefix),
+                task_queue=task_queue,
+            )
+
+        await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.ensure_activity_queue",
         )
 
     async def _ensure_stream_group(
@@ -143,65 +255,77 @@ class FluxiRedisStore:
         start_policy: str,
         input_payload: bytes | None,
     ) -> StartWorkflowResult:
-        operation_start = time.perf_counter()
-        await self.ensure_workflow_queue(task_queue)
+        async def operation() -> StartWorkflowResult:
+            operation_start = time.perf_counter()
+            await self.ensure_workflow_queue(task_queue)
 
-        run_id = f"run-{uuid.uuid4().hex}"
-        raw = await self.redis.eval(
-            START_OR_ATTACH_WORKFLOW,
-            5,
-            workflow_control(self.settings.key_prefix, workflow_id),
-            workflow_state(self.settings.key_prefix, run_id),
-            workflow_history(self.settings.key_prefix, run_id),
-            workflow_queue(self.settings.key_prefix, task_queue),
-            timers(self.settings.key_prefix),
-            _now_ms(),
-            workflow_id,
-            workflow_name,
-            task_queue,
-            start_policy,
-            input_payload or b"",
-            run_id,
-            self.settings.workflow_task_timeout_ms,
-        )
-        decision = _to_text(raw[0]) or ""
-        result = StartWorkflowResult(
-            decision=decision,  # type: ignore[arg-type]
-            run_id=_to_text(raw[1]) or None,
-            status=_to_text(raw[2]) or "",
-            run_no=_to_int(raw[3]),
-            result_payload=_to_bytes(raw[4]),
-            error_payload=_to_bytes(raw[5]),
-        )
-        if TRACE_LOGGING_ENABLED:
-            logger.info(
-                "fluxi.store.start_or_attach workflow_id=%s workflow_name=%s task_queue=%s start_policy=%s decision=%s status=%s run_id=%s run_no=%s duration_ms=%.2f",
+            run_id = f"run-{uuid.uuid4().hex}"
+            raw = await self.redis.eval(
+                START_OR_ATTACH_WORKFLOW,
+                5,
+                workflow_control(self.settings.key_prefix, workflow_id),
+                workflow_state(self.settings.key_prefix, run_id),
+                workflow_history(self.settings.key_prefix, run_id),
+                workflow_queue(self.settings.key_prefix, task_queue),
+                timers(self.settings.key_prefix),
+                _now_ms(),
                 workflow_id,
                 workflow_name,
                 task_queue,
                 start_policy,
-                result.decision,
-                result.status,
-                result.run_id,
-                result.run_no,
-                elapsed_ms(operation_start),
+                input_payload or b"",
+                run_id,
+                self.settings.workflow_task_timeout_ms,
             )
-        return result
+            decision = _to_text(raw[0]) or ""
+            result = StartWorkflowResult(
+                decision=decision,  # type: ignore[arg-type]
+                run_id=_to_text(raw[1]) or None,
+                status=_to_text(raw[2]) or "",
+                run_no=_to_int(raw[3]),
+                result_payload=_to_bytes(raw[4]),
+                error_payload=_to_bytes(raw[5]),
+            )
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "fluxi.store.start_or_attach workflow_id=%s workflow_name=%s task_queue=%s start_policy=%s decision=%s status=%s run_id=%s run_no=%s duration_ms=%.2f",
+                    workflow_id,
+                    workflow_name,
+                    task_queue,
+                    start_policy,
+                    result.decision,
+                    result.status,
+                    result.run_id,
+                    result.run_no,
+                    elapsed_ms(operation_start),
+                )
+            return result
+
+        return await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.start_or_attach",
+        )
 
     async def get_workflow_result(self, workflow_id: str) -> WorkflowResultSnapshot | None:
-        mapping = await self.redis.hgetall(
-            workflow_control(self.settings.key_prefix, workflow_id)
-        )
-        if not mapping:
-            return None
-        record = _decode_hash(mapping)
-        return WorkflowResultSnapshot(
-            workflow_id=workflow_id,
-            run_id=_to_text(record.get("current_run_id")),
-            status=_to_text(record.get("status")) or "",
-            run_no=_to_int(record.get("run_no")),
-            result_payload=_to_bytes(record.get("result_payload")),
-            error_payload=_to_bytes(record.get("error_payload")),
+        async def operation() -> WorkflowResultSnapshot | None:
+            mapping = await self.redis.hgetall(
+                workflow_control(self.settings.key_prefix, workflow_id)
+            )
+            if not mapping:
+                return None
+            record = _decode_hash(mapping)
+            return WorkflowResultSnapshot(
+                workflow_id=workflow_id,
+                run_id=_to_text(record.get("current_run_id")),
+                status=_to_text(record.get("status")) or "",
+                run_no=_to_int(record.get("run_no")),
+                result_payload=_to_bytes(record.get("result_payload")),
+                error_payload=_to_bytes(record.get("error_payload")),
+            )
+
+        return await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.get_workflow_result",
         )
 
     async def wait_for_workflow_result(
@@ -210,73 +334,79 @@ class FluxiRedisStore:
         *,
         timeout_ms: int,
     ) -> WorkflowResultSnapshot | None:
-        operation_start = time.perf_counter()
-        snapshot = await self.get_workflow_result(workflow_id)
-        if snapshot is None:
-            if TRACE_LOGGING_ENABLED:
-                logger.info(
-                    "fluxi.store.wait_for_result workflow_id=%s status=missing timeout_ms=%d duration_ms=%.2f",
-                    workflow_id,
-                    timeout_ms,
-                    elapsed_ms(operation_start),
-                )
-            return None
-        if snapshot.status in {"completed", "failed"} or timeout_ms <= 0:
-            if TRACE_LOGGING_ENABLED:
-                logger.info(
-                    "fluxi.store.wait_for_result workflow_id=%s status=%s timeout_ms=%d duration_ms=%.2f",
-                    workflow_id,
-                    snapshot.status,
-                    timeout_ms,
-                    elapsed_ms(operation_start),
-                )
-            return snapshot
-
-        channel = workflow_result_channel(self.settings.key_prefix, workflow_id)
-        pubsub = self.redis.pubsub()
-        try:
-            await pubsub.subscribe(channel)
+        async def operation() -> WorkflowResultSnapshot | None:
+            operation_start = time.perf_counter()
             snapshot = await self.get_workflow_result(workflow_id)
             if snapshot is None:
+                if TRACE_LOGGING_ENABLED:
+                    logger.info(
+                        "fluxi.store.wait_for_result workflow_id=%s status=missing timeout_ms=%d duration_ms=%.2f",
+                        workflow_id,
+                        timeout_ms,
+                        elapsed_ms(operation_start),
+                    )
                 return None
-            if snapshot.status in {"completed", "failed"}:
+            if snapshot.status in {"completed", "failed"} or timeout_ms <= 0:
+                if TRACE_LOGGING_ENABLED:
+                    logger.info(
+                        "fluxi.store.wait_for_result workflow_id=%s status=%s timeout_ms=%d duration_ms=%.2f",
+                        workflow_id,
+                        snapshot.status,
+                        timeout_ms,
+                        elapsed_ms(operation_start),
+                    )
                 return snapshot
-            deadline = time.monotonic() + (timeout_ms / 1000)
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                message = await pubsub.get_message(
-                    ignore_subscribe_messages=True,
-                    timeout=min(remaining, 0.25),
-                )
-                if message is not None:
-                    snapshot = await self.get_workflow_result(workflow_id)
-                    if snapshot is not None:
-                        if TRACE_LOGGING_ENABLED:
-                            logger.info(
-                                "fluxi.store.wait_for_result workflow_id=%s status=%s timeout_ms=%d duration_ms=%.2f",
-                                workflow_id,
-                                snapshot.status,
-                                timeout_ms,
-                                elapsed_ms(operation_start),
-                            )
-                        return snapshot
-            snapshot = await self.get_workflow_result(workflow_id)
-            if TRACE_LOGGING_ENABLED and snapshot is not None:
-                logger.info(
-                    "fluxi.store.wait_for_result workflow_id=%s status=%s timeout_ms=%d duration_ms=%.2f",
-                    workflow_id,
-                    snapshot.status,
-                    timeout_ms,
-                    elapsed_ms(operation_start),
-                )
-            return snapshot
-        finally:
+
+            channel = workflow_result_channel(self.settings.key_prefix, workflow_id)
+            pubsub = self.redis.pubsub()
             try:
-                await pubsub.unsubscribe(channel)
+                await pubsub.subscribe(channel)
+                snapshot = await self.get_workflow_result(workflow_id)
+                if snapshot is None:
+                    return None
+                if snapshot.status in {"completed", "failed"}:
+                    return snapshot
+                deadline = time.monotonic() + (timeout_ms / 1000)
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    message = await pubsub.get_message(
+                        ignore_subscribe_messages=True,
+                        timeout=min(remaining, 0.25),
+                    )
+                    if message is not None:
+                        snapshot = await self.get_workflow_result(workflow_id)
+                        if snapshot is not None:
+                            if TRACE_LOGGING_ENABLED:
+                                logger.info(
+                                    "fluxi.store.wait_for_result workflow_id=%s status=%s timeout_ms=%d duration_ms=%.2f",
+                                    workflow_id,
+                                    snapshot.status,
+                                    timeout_ms,
+                                    elapsed_ms(operation_start),
+                                )
+                            return snapshot
+                snapshot = await self.get_workflow_result(workflow_id)
+                if TRACE_LOGGING_ENABLED and snapshot is not None:
+                    logger.info(
+                        "fluxi.store.wait_for_result workflow_id=%s status=%s timeout_ms=%d duration_ms=%.2f",
+                        workflow_id,
+                        snapshot.status,
+                        timeout_ms,
+                        elapsed_ms(operation_start),
+                    )
+                return snapshot
             finally:
-                await pubsub.aclose()
+                try:
+                    await pubsub.unsubscribe(channel)
+                finally:
+                    await pubsub.aclose()
+
+        return await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.wait_for_result",
+        )
 
     async def complete_workflow_task(
         self,
@@ -289,161 +419,167 @@ class FluxiRedisStore:
         sticky_owner_id: str | None = None,
         sticky_expires_at_ms: int | None = None,
     ) -> WorkflowTaskCompletionResult:
-        operation_start = time.perf_counter()
-        workflow_id = await self._workflow_id_for_run(run_id)
-        if workflow_id is None:
-            return WorkflowTaskCompletionResult(outcome="missing")
+        async def operation() -> WorkflowTaskCompletionResult:
+            operation_start = time.perf_counter()
+            workflow_id = await self._workflow_id_for_run(run_id)
+            if workflow_id is None:
+                return WorkflowTaskCompletionResult(outcome="missing")
 
-        eval_args: list[Any] = [
-            _now_ms(),
-            workflow_task_id,
-            attempt_no,
-            f"workflow-timeout:{run_id}:{workflow_task_id}:{attempt_no}",
-            sticky_task_queue or "",
-            sticky_owner_id or "",
-            sticky_expires_at_ms or 0,
-            len(commands),
-        ]
-        for command in commands:
-            if command.kind == "schedule_activity":
-                if command.activity_name is None or command.activity_task_queue is None:
-                    raise ValueError("schedule_activity requires activity name and task queue.")
-                await self.ensure_activity_queue(command.activity_task_queue)
-                retry_policy = command.retry_policy or RetryPolicyConfig(max_attempts=1)
-                eval_args.extend(
-                    [
-                        command.kind,
-                        command.activity_execution_id or "",
-                        command.activity_name,
-                        command.activity_task_queue,
-                        activity_queue(
-                            self.settings.key_prefix,
-                            command.activity_task_queue,
-                        ),
-                        "",
-                        command.input_payload or b"",
-                        command.schedule_to_close_timeout_ms or 0,
-                        retry_policy.max_attempts or 1,
-                        retry_policy.initial_interval_ms or 0,
-                        retry_policy.backoff_coefficient or 0,
-                        retry_policy.max_interval_ms or 0,
-                        b"",
-                        b"",
-                    ]
-                )
-            elif command.kind == "record_local_activity":
-                if (
-                    command.activity_execution_id is None
-                    or command.activity_name is None
-                    or command.activity_status is None
-                ):
-                    raise ValueError(
-                        "record_local_activity requires execution id, activity name and activity status."
-                    )
-                retry_policy = command.retry_policy or RetryPolicyConfig(max_attempts=1)
-                eval_args.extend(
-                    [
-                        command.kind,
-                        command.activity_execution_id,
-                        command.activity_name,
-                        "",
-                        "",
-                        command.activity_status,
-                        command.input_payload or b"",
-                        command.schedule_to_close_timeout_ms or 0,
-                        retry_policy.max_attempts or 1,
-                        retry_policy.initial_interval_ms or 0,
-                        retry_policy.backoff_coefficient or 0,
-                        retry_policy.max_interval_ms or 0,
-                        command.result_payload or b"",
-                        command.error_payload or b"",
-                    ]
-                )
-            elif command.kind == "complete_workflow":
-                eval_args.extend(
-                    [
-                        command.kind,
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        b"",
-                        0,
-                        1,
-                        0,
-                        0,
-                        0,
-                        command.result_payload or b"",
-                        b"",
-                    ]
-                )
-            else:
-                eval_args.extend(
-                    [
-                        command.kind,
-                        "",
-                        "",
-                        "",
-                        "",
-                        "",
-                        b"",
-                        0,
-                        1,
-                        0,
-                        0,
-                        0,
-                        b"",
-                        command.error_payload or b"",
-                    ]
-                )
-
-        raw = await self.redis.eval(
-            APPLY_WORKFLOW_TASK_COMPLETION,
-            6,
-            workflow_control(self.settings.key_prefix, workflow_id),
-            workflow_state(self.settings.key_prefix, run_id),
-            workflow_history(self.settings.key_prefix, run_id),
-            f"{self.settings.key_prefix}:activity:",
-            timers(self.settings.key_prefix),
-            workflow_result_channel(self.settings.key_prefix, workflow_id),
-            *eval_args,
-        )
-
-        activity_execution_ids: tuple[str, ...] = ()
-        if len(raw) > 3:
-            packed_ids = raw[3]
-            if packed_ids not in (None, b"", ""):
-                decoded_ids = unpackb(packed_ids)
-                activity_execution_ids = tuple(str(value) for value in decoded_ids)
-        first_activity_execution_id = _to_text(raw[2]) or None
-        if not activity_execution_ids and first_activity_execution_id:
-            activity_execution_ids = (first_activity_execution_id,)
-
-        result = WorkflowTaskCompletionResult(
-            outcome=_to_text(raw[0]) or "",
-            run_id=_to_text(raw[1]) or None,
-            activity_execution_id=first_activity_execution_id,
-            activity_execution_ids=activity_execution_ids,
-            terminal_status=(
-                "completed"
-                if commands and commands[-1].kind == "complete_workflow"
-                else ("failed" if commands and commands[-1].kind == "fail_workflow" else None)
-            ),
-        )
-        if TRACE_LOGGING_ENABLED:
-            logger.info(
-                "fluxi.store.complete_workflow_task run_id=%s workflow_id=%s workflow_task_id=%s attempt_no=%d command_count=%d outcome=%s activity_execution_ids=%d duration_ms=%.2f",
-                run_id,
-                workflow_id,
+            eval_args: list[Any] = [
+                _now_ms(),
                 workflow_task_id,
                 attempt_no,
+                f"workflow-timeout:{run_id}:{workflow_task_id}:{attempt_no}",
+                sticky_task_queue or "",
+                sticky_owner_id or "",
+                sticky_expires_at_ms or 0,
                 len(commands),
-                result.outcome,
-                len(result.activity_execution_ids),
-                elapsed_ms(operation_start),
+            ]
+            for command in commands:
+                if command.kind == "schedule_activity":
+                    if command.activity_name is None or command.activity_task_queue is None:
+                        raise ValueError("schedule_activity requires activity name and task queue.")
+                    await self.ensure_activity_queue(command.activity_task_queue)
+                    retry_policy = command.retry_policy or RetryPolicyConfig(max_attempts=1)
+                    eval_args.extend(
+                        [
+                            command.kind,
+                            command.activity_execution_id or "",
+                            command.activity_name,
+                            command.activity_task_queue,
+                            activity_queue(
+                                self.settings.key_prefix,
+                                command.activity_task_queue,
+                            ),
+                            "",
+                            command.input_payload or b"",
+                            command.schedule_to_close_timeout_ms or 0,
+                            retry_policy.max_attempts or 1,
+                            retry_policy.initial_interval_ms or 0,
+                            retry_policy.backoff_coefficient or 0,
+                            retry_policy.max_interval_ms or 0,
+                            b"",
+                            b"",
+                        ]
+                    )
+                elif command.kind == "record_local_activity":
+                    if (
+                        command.activity_execution_id is None
+                        or command.activity_name is None
+                        or command.activity_status is None
+                    ):
+                        raise ValueError(
+                            "record_local_activity requires execution id, activity name and activity status."
+                        )
+                    retry_policy = command.retry_policy or RetryPolicyConfig(max_attempts=1)
+                    eval_args.extend(
+                        [
+                            command.kind,
+                            command.activity_execution_id,
+                            command.activity_name,
+                            "",
+                            "",
+                            command.activity_status,
+                            command.input_payload or b"",
+                            command.schedule_to_close_timeout_ms or 0,
+                            retry_policy.max_attempts or 1,
+                            retry_policy.initial_interval_ms or 0,
+                            retry_policy.backoff_coefficient or 0,
+                            retry_policy.max_interval_ms or 0,
+                            command.result_payload or b"",
+                            command.error_payload or b"",
+                        ]
+                    )
+                elif command.kind == "complete_workflow":
+                    eval_args.extend(
+                        [
+                            command.kind,
+                            "",
+                            "",
+                            "",
+                            "",
+                            "",
+                            b"",
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            command.result_payload or b"",
+                            b"",
+                        ]
+                    )
+                else:
+                    eval_args.extend(
+                        [
+                            command.kind,
+                            "",
+                            "",
+                            "",
+                            "",
+                            "",
+                            b"",
+                            0,
+                            1,
+                            0,
+                            0,
+                            0,
+                            b"",
+                            command.error_payload or b"",
+                        ]
+                    )
+
+            raw = await self.redis.eval(
+                APPLY_WORKFLOW_TASK_COMPLETION,
+                6,
+                workflow_control(self.settings.key_prefix, workflow_id),
+                workflow_state(self.settings.key_prefix, run_id),
+                workflow_history(self.settings.key_prefix, run_id),
+                f"{self.settings.key_prefix}:activity:",
+                timers(self.settings.key_prefix),
+                workflow_result_channel(self.settings.key_prefix, workflow_id),
+                *eval_args,
             )
-        return result
+
+            activity_execution_ids: tuple[str, ...] = ()
+            if len(raw) > 3:
+                packed_ids = raw[3]
+                if packed_ids not in (None, b"", ""):
+                    decoded_ids = unpackb(packed_ids)
+                    activity_execution_ids = tuple(str(value) for value in decoded_ids)
+            first_activity_execution_id = _to_text(raw[2]) or None
+            if not activity_execution_ids and first_activity_execution_id:
+                activity_execution_ids = (first_activity_execution_id,)
+
+            result = WorkflowTaskCompletionResult(
+                outcome=_to_text(raw[0]) or "",
+                run_id=_to_text(raw[1]) or None,
+                activity_execution_id=first_activity_execution_id,
+                activity_execution_ids=activity_execution_ids,
+                terminal_status=(
+                    "completed"
+                    if commands and commands[-1].kind == "complete_workflow"
+                    else ("failed" if commands and commands[-1].kind == "fail_workflow" else None)
+                ),
+            )
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "fluxi.store.complete_workflow_task run_id=%s workflow_id=%s workflow_task_id=%s attempt_no=%d command_count=%d outcome=%s activity_execution_ids=%d duration_ms=%.2f",
+                    run_id,
+                    workflow_id,
+                    workflow_task_id,
+                    attempt_no,
+                    len(commands),
+                    result.outcome,
+                    len(result.activity_execution_ids),
+                    elapsed_ms(operation_start),
+                )
+            return result
+
+        return await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.complete_workflow_task",
+        )
 
     async def complete_activity_task(
         self,
@@ -453,57 +589,63 @@ class FluxiRedisStore:
         status: str,
         payload: bytes | None,
     ) -> ActivityTaskCompletionResult:
-        operation_start = time.perf_counter()
-        activity_key = activity_state(self.settings.key_prefix, activity_execution_id)
-        mapping = await self.redis.hgetall(activity_key)
-        if not mapping:
-            return ActivityTaskCompletionResult(outcome="missing")
+        async def operation() -> ActivityTaskCompletionResult:
+            operation_start = time.perf_counter()
+            activity_key = activity_state(self.settings.key_prefix, activity_execution_id)
+            mapping = await self.redis.hgetall(activity_key)
+            if not mapping:
+                return ActivityTaskCompletionResult(outcome="missing")
 
-        record = _decode_hash(mapping)
-        run_id = _to_text(record.get("run_id"))
-        if run_id is None:
-            return ActivityTaskCompletionResult(outcome="missing")
+            record = _decode_hash(mapping)
+            run_id = _to_text(record.get("run_id"))
+            if run_id is None:
+                return ActivityTaskCompletionResult(outcome="missing")
 
-        workflow_task_queue = await self._workflow_task_queue_for_run(run_id)
-        workflow_id = await self._workflow_id_for_run(run_id)
-        if workflow_id is None:
-            return ActivityTaskCompletionResult(outcome="missing")
+            await self._workflow_task_queue_for_run(run_id)
+            workflow_id = await self._workflow_id_for_run(run_id)
+            if workflow_id is None:
+                return ActivityTaskCompletionResult(outcome="missing")
 
-        raw = await self.redis.eval(
-            APPLY_ACTIVITY_COMPLETION,
-            5,
-            workflow_control(self.settings.key_prefix, workflow_id),
-            workflow_state(self.settings.key_prefix, run_id),
-            workflow_history(self.settings.key_prefix, run_id),
-            activity_key,
-            timers(self.settings.key_prefix),
-            _now_ms(),
-            status,
-            attempt_no,
-            payload or b"",
-            self.settings.workflow_task_timeout_ms,
-            f"activity-timeout:{activity_execution_id}:{attempt_no}",
-            f"{self.settings.key_prefix}:queue:workflow:",
-            self.settings.sticky_schedule_to_start_timeout_ms,
-        )
-        result = ActivityTaskCompletionResult(
-            outcome=_to_text(raw[0]) or "",
-            run_id=_to_text(raw[1]) or None,
-            next_workflow_task_id=_to_text(raw[2]) or None,
-            activity_execution_id=activity_execution_id,
-        )
-        if TRACE_LOGGING_ENABLED:
-            logger.info(
-                "fluxi.store.complete_activity_task activity_execution_id=%s run_id=%s attempt_no=%d status=%s outcome=%s next_workflow_task_id=%s duration_ms=%.2f",
-                activity_execution_id,
-                result.run_id,
-                attempt_no,
+            raw = await self.redis.eval(
+                APPLY_ACTIVITY_COMPLETION,
+                5,
+                workflow_control(self.settings.key_prefix, workflow_id),
+                workflow_state(self.settings.key_prefix, run_id),
+                workflow_history(self.settings.key_prefix, run_id),
+                activity_key,
+                timers(self.settings.key_prefix),
+                _now_ms(),
                 status,
-                result.outcome,
-                result.next_workflow_task_id,
-                elapsed_ms(operation_start),
+                attempt_no,
+                payload or b"",
+                self.settings.workflow_task_timeout_ms,
+                f"activity-timeout:{activity_execution_id}:{attempt_no}",
+                f"{self.settings.key_prefix}:queue:workflow:",
+                self.settings.sticky_schedule_to_start_timeout_ms,
             )
-        return result
+            result = ActivityTaskCompletionResult(
+                outcome=_to_text(raw[0]) or "",
+                run_id=_to_text(raw[1]) or None,
+                next_workflow_task_id=_to_text(raw[2]) or None,
+                activity_execution_id=activity_execution_id,
+            )
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "fluxi.store.complete_activity_task activity_execution_id=%s run_id=%s attempt_no=%d status=%s outcome=%s next_workflow_task_id=%s duration_ms=%.2f",
+                    activity_execution_id,
+                    result.run_id,
+                    attempt_no,
+                    status,
+                    result.outcome,
+                    result.next_workflow_task_id,
+                    elapsed_ms(operation_start),
+                )
+            return result
+
+        return await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.complete_activity_task",
+        )
 
     async def pop_due_timer(self) -> str | None:
         due = await self.redis.zrangebyscore(
@@ -577,42 +719,60 @@ class FluxiRedisStore:
         *,
         after_index: int | None = None,
     ) -> tuple[list[Any], int]:
-        operation_start = time.perf_counter()
-        start = 0 if after_index is None or after_index < 0 else after_index + 1
-        entries = await self.redis.lrange(
-            workflow_history(self.settings.key_prefix, run_id),
-            start,
-            -1,
-        )
-        events = [unpackb(entry) for entry in entries]
-        next_index = start + len(events) - 1
-        if after_index is not None and after_index >= 0 and len(events) == 0:
-            next_index = after_index
-        if TRACE_LOGGING_ENABLED:
-            logger.info(
-                "fluxi.store.get_history_page run_id=%s after_index=%s event_count=%d next_index=%d duration_ms=%.2f",
-                run_id,
-                after_index,
-                len(events),
-                next_index,
-                elapsed_ms(operation_start),
+        async def operation() -> tuple[list[Any], int]:
+            operation_start = time.perf_counter()
+            start = 0 if after_index is None or after_index < 0 else after_index + 1
+            entries = await self.redis.lrange(
+                workflow_history(self.settings.key_prefix, run_id),
+                start,
+                -1,
             )
-        return events, next_index
+            events = [unpackb(entry) for entry in entries]
+            next_index = start + len(events) - 1
+            if after_index is not None and after_index >= 0 and len(events) == 0:
+                next_index = after_index
+            if TRACE_LOGGING_ENABLED:
+                logger.info(
+                    "fluxi.store.get_history_page run_id=%s after_index=%s event_count=%d next_index=%d duration_ms=%.2f",
+                    run_id,
+                    after_index,
+                    len(events),
+                    next_index,
+                    elapsed_ms(operation_start),
+                )
+            return events, next_index
+
+        return await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.get_history_page",
+        )
 
     async def get_history(self, run_id: str) -> list[Any]:
         events, _ = await self.get_history_page(run_id)
         return events
 
     async def get_run_state(self, run_id: str) -> dict[str, Any]:
-        return _decode_hash(
-            await self.redis.hgetall(workflow_state(self.settings.key_prefix, run_id))
+        async def operation() -> dict[str, Any]:
+            return _decode_hash(
+                await self.redis.hgetall(workflow_state(self.settings.key_prefix, run_id))
+            )
+
+        return await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.get_run_state",
         )
 
     async def get_activity_state(self, activity_execution_id: str) -> dict[str, Any]:
-        return _decode_hash(
-            await self.redis.hgetall(
-                activity_state(self.settings.key_prefix, activity_execution_id)
+        async def operation() -> dict[str, Any]:
+            return _decode_hash(
+                await self.redis.hgetall(
+                    activity_state(self.settings.key_prefix, activity_execution_id)
+                )
             )
+
+        return await self._run_redis_operation(
+            operation,
+            operation_name="fluxi.store.get_activity_state",
         )
 
     async def cleanup_stale_pending_entries(self, consumer_name: str) -> int:
