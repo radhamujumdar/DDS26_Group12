@@ -2,7 +2,7 @@ services:
   gateway:
     image: nginx:1.25-bookworm
     restart: unless-stopped
-    cpus: 1.0
+    cpus: 1.5
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -18,26 +18,29 @@ services:
       dockerfile: order/Dockerfile
     image: order:latest
     restart: unless-stopped
-    cpus: 10.0
+    cpus: 3.0
     environment:
       GATEWAY_URL: http://gateway:80
       FLUXI_SERVER_URL: http://fluxi-server:8001
-      FLUXI_REDIS_MODE: direct
-      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
+      FLUXI_REDIS_MODE: sentinel
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis-master:6379/0
+      FLUXI_SENTINEL_ENDPOINTS: fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
+      FLUXI_SENTINEL_SERVICE_NAME: fluxi-master
+      FLUXI_SENTINEL_MIN_OTHER_SENTINELS: "1"
       FLUXI_HTTP_CONNECT_TIMEOUT_SECONDS: "2.0"
       FLUXI_HTTP_READ_TIMEOUT_SECONDS: "70.0"
       FLUXI_HTTP_WRITE_TIMEOUT_SECONDS: "30.0"
       FLUXI_HTTP_POOL_TIMEOUT_SECONDS: "5.0"
-      FLUXI_HTTP_MAX_CONNECTIONS: "256"
-      FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS: "128"
-      FLUXI_HTTP_CONTROL_MAX_CONNECTIONS: "256"
-      FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS: "128"
-      FLUXI_HTTP_RESULT_MAX_CONNECTIONS: "512"
-      FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS: "256"
+      FLUXI_HTTP_MAX_CONNECTIONS: "192"
+      FLUXI_HTTP_MAX_KEEPALIVE_CONNECTIONS: "96"
+      FLUXI_HTTP_CONTROL_MAX_CONNECTIONS: "96"
+      FLUXI_HTTP_CONTROL_MAX_KEEPALIVE_CONNECTIONS: "48"
+      FLUXI_HTTP_RESULT_MAX_CONNECTIONS: "192"
+      FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS: "96"
       FLUXI_RESULT_WAIT_TIMEOUT_MS: "60000"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
-    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 10 --timeout 60 --log-level=info order.app.main:app
+    command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 3 --timeout 60 --log-level=info order.app.main:app
     env_file:
       - env/order_redis.env
     depends_on:
@@ -61,7 +64,7 @@ services:
       - --protected-mode
       - "no"
       - --maxmemory
-      - 8gb
+      - 6gb
       - --maxmemory-policy
       - noeviction
     volumes:
@@ -73,7 +76,7 @@ services:
       dockerfile: stock/Dockerfile
     image: stock:latest
     restart: unless-stopped
-    cpus: 2.0
+    cpus: 1.5
     environment:
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
@@ -100,7 +103,7 @@ services:
       - --protected-mode
       - "no"
       - --maxmemory
-      - 8gb
+      - 6gb
       - --maxmemory-policy
       - noeviction
     volumes:
@@ -112,7 +115,7 @@ services:
       dockerfile: payment/Dockerfile
     image: user:latest
     restart: unless-stopped
-    cpus: 2.0
+    cpus: 1.5
     environment:
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
@@ -139,16 +142,62 @@ services:
       - --protected-mode
       - "no"
       - --maxmemory
-      - 8gb
+      - 6gb
       - --maxmemory-policy
       - noeviction
     volumes:
       - payment-db-data:/data
 
-  fluxi-redis:
+  fluxi-server:
+    build:
+      context: .
+      dockerfile: fluxi-server/Dockerfile
+    image: fluxi-server:latest
+    restart: unless-stopped
+    cpus: 2.5
+    environment:
+      FLUXI_REDIS_MODE: sentinel
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis-master:6379/0
+      FLUXI_SENTINEL_ENDPOINTS: fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
+      FLUXI_SENTINEL_SERVICE_NAME: fluxi-master
+      FLUXI_SENTINEL_MIN_OTHER_SENTINELS: "1"
+      FLUXI_RESULT_WAIT_TIMEOUT_MS: "60000"
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    command: uvicorn app:app --host 0.0.0.0 --port 8001 --workers 3
+    depends_on:
+      - fluxi-redis-master
+      - fluxi-redis-replica
+      - fluxi-sentinel-1
+      - fluxi-sentinel-2
+      - fluxi-sentinel-3
+
+  fluxi-scheduler:
+    build:
+      context: .
+      dockerfile: fluxi-scheduler/Dockerfile
+    image: fluxi-scheduler:latest
+    restart: unless-stopped
+    cpus: 1.0
+    environment:
+      FLUXI_REDIS_MODE: sentinel
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis-master:6379/0
+      FLUXI_SENTINEL_ENDPOINTS: fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
+      FLUXI_SENTINEL_SERVICE_NAME: fluxi-master
+      FLUXI_SENTINEL_MIN_OTHER_SENTINELS: "1"
+      DDS_TRACE_LOGGING: "0"
+      DDS_LOG_LEVEL: WARNING
+    depends_on:
+      - fluxi-redis-master
+      - fluxi-redis-replica
+      - fluxi-sentinel-1
+      - fluxi-sentinel-2
+      - fluxi-sentinel-3
+
+  fluxi-redis-master:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    cpus: 2.0
+    cpus: 3.0
     command:
       - redis-server
       - --appendonly
@@ -162,45 +211,120 @@ services:
       - --requirepass
       - redis
       - --maxmemory
-      - 24gb
+      - 12gb
       - --maxmemory-policy
       - noeviction
     volumes:
-      - fluxi-redis-data:/data
+      - fluxi-redis-master-data:/data
 
-  fluxi-server:
-    build:
-      context: .
-      dockerfile: fluxi-server/Dockerfile
-    image: fluxi-server:latest
+  fluxi-redis-replica:
+    image: redis:7.2-bookworm
     restart: unless-stopped
-    cpus: 8.0
-    environment:
-      FLUXI_REDIS_MODE: direct
-      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
-      FLUXI_RESULT_WAIT_TIMEOUT_MS: "60000"
-      DDS_TRACE_LOGGING: "0"
-      DDS_LOG_LEVEL: WARNING
-    command: uvicorn app:app --host 0.0.0.0 --port 8001 --workers 8
+    cpus: 3.0
+    command:
+      - redis-server
+      - --replicaof
+      - fluxi-redis-master
+      - "6379"
+      - --masterauth
+      - redis
+      - --requirepass
+      - redis
+      - --replica-announce-ip
+      - fluxi-redis-replica
+      - --replica-announce-port
+      - "6379"
+      - --save
+      - ""
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --protected-mode
+      - "no"
+      - --maxmemory
+      - 12gb
+      - --maxmemory-policy
+      - noeviction
     depends_on:
-      - fluxi-redis
-    ports:
-      - "${DDS_FLUXI_SERVER_PORT:-8001}:8001"
+      - fluxi-redis-master
+    volumes:
+      - fluxi-redis-replica-data:/data
 
-  fluxi-scheduler:
-    build:
-      context: .
-      dockerfile: fluxi-scheduler/Dockerfile
-    image: fluxi-scheduler:latest
+  fluxi-sentinel-1:
+    image: redis:7.2-bookworm
     restart: unless-stopped
-    cpus: 2.0
-    environment:
-      FLUXI_REDIS_MODE: direct
-      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
-      DDS_TRACE_LOGGING: "0"
-      DDS_LOG_LEVEL: WARNING
+    cpus: 0.5
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor fluxi-master fluxi-redis-master 6379 2
+        sentinel auth-pass fluxi-master redis
+        sentinel down-after-milliseconds fluxi-master 3000
+        sentinel failover-timeout fluxi-master 10000
+        sentinel parallel-syncs fluxi-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
     depends_on:
-      - fluxi-redis
+      - fluxi-redis-master
+      - fluxi-redis-replica
+
+  fluxi-sentinel-2:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.5
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor fluxi-master fluxi-redis-master 6379 2
+        sentinel auth-pass fluxi-master redis
+        sentinel down-after-milliseconds fluxi-master 3000
+        sentinel failover-timeout fluxi-master 10000
+        sentinel parallel-syncs fluxi-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - fluxi-redis-master
+      - fluxi-redis-replica
+
+  fluxi-sentinel-3:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.5
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor fluxi-master fluxi-redis-master 6379 2
+        sentinel auth-pass fluxi-master redis
+        sentinel down-after-milliseconds fluxi-master 3000
+        sentinel failover-timeout fluxi-master 10000
+        sentinel parallel-syncs fluxi-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - fluxi-redis-master
+      - fluxi-redis-replica
 
   order-checkout-worker:
     build:
@@ -208,13 +332,16 @@ services:
       dockerfile: order/Dockerfile
     image: order:latest
     restart: unless-stopped
-    cpus: 9.0
+    cpus: 7.5
     command: python -m order.workers.checkout_worker
     environment:
       FLUXI_SERVER_URL: http://fluxi-server:8001
-      FLUXI_REDIS_MODE: direct
-      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
-      FLUXI_MAX_CONCURRENT_WORKFLOW_TASKS: "16"
+      FLUXI_REDIS_MODE: sentinel
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis-master:6379/0
+      FLUXI_SENTINEL_ENDPOINTS: fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
+      FLUXI_SENTINEL_SERVICE_NAME: fluxi-master
+      FLUXI_SENTINEL_MIN_OTHER_SENTINELS: "1"
+      FLUXI_MAX_CONCURRENT_WORKFLOW_TASKS: "12"
       FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS: "2"
       FLUXI_STICKY_SCHEDULE_TO_START_TIMEOUT_MS: "5000"
       FLUXI_STICKY_CACHE_MAX_RUNS: "40000"
@@ -233,12 +360,15 @@ services:
       dockerfile: stock/Dockerfile
     image: stock:latest
     restart: unless-stopped
-    cpus: 4.0
+    cpus: 5.0
     command: python -m stock.workers.stock_worker
     environment:
       FLUXI_SERVER_URL: http://fluxi-server:8001
-      FLUXI_REDIS_MODE: direct
-      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
+      FLUXI_REDIS_MODE: sentinel
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis-master:6379/0
+      FLUXI_SENTINEL_ENDPOINTS: fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
+      FLUXI_SENTINEL_SERVICE_NAME: fluxi-master
+      FLUXI_SENTINEL_MIN_OTHER_SENTINELS: "1"
       FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS: "12"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
@@ -254,12 +384,15 @@ services:
       dockerfile: payment/Dockerfile
     image: user:latest
     restart: unless-stopped
-    cpus: 4.0
+    cpus: 5.0
     command: python -m payment.workers.payment_worker
     environment:
       FLUXI_SERVER_URL: http://fluxi-server:8001
-      FLUXI_REDIS_MODE: direct
-      FLUXI_REDIS_URL: redis://:redis@fluxi-redis:6379/0
+      FLUXI_REDIS_MODE: sentinel
+      FLUXI_REDIS_URL: redis://:redis@fluxi-redis-master:6379/0
+      FLUXI_SENTINEL_ENDPOINTS: fluxi-sentinel-1:26379,fluxi-sentinel-2:26379,fluxi-sentinel-3:26379
+      FLUXI_SENTINEL_SERVICE_NAME: fluxi-master
+      FLUXI_SENTINEL_MIN_OTHER_SENTINELS: "1"
       FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS: "12"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
@@ -270,7 +403,8 @@ services:
       - fluxi-server
 
 volumes:
-  fluxi-redis-data:
+  fluxi-redis-master-data:
+  fluxi-redis-replica-data:
   order-db-data:
   stock-db-data:
   payment-db-data:

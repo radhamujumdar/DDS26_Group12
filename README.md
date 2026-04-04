@@ -75,16 +75,18 @@ For the course staff cluster, use the dedicated deployment profiles:
   - about `24` CPUs total
 - `docker-compose.medium.yml` plus `scripts/up-medium.sh`
   - targets exactly `50` CPUs
-  - scales only the hot worker roles: `order-checkout-worker=3`, `stock-activity-worker=2`, `payment-activity-worker=2`
+  - Fluxi HA topology: one Redis master, one Redis replica, and three Sentinels
+  - scales API roles and hot worker roles: `order-service=2`, `stock-service=2`, `payment-service=2`, `fluxi-server=2`, `order-checkout-worker=3`, `stock-activity-worker=2`, `payment-activity-worker=2`
 - `docker-compose.large.yml` plus `scripts/up-large.sh`
   - targets exactly `90` CPUs
-  - scales only the hot worker roles: `order-checkout-worker=4`, `stock-activity-worker=3`, `payment-activity-worker=3`
+  - Fluxi HA topology: one Redis master, one Redis replica, and three Sentinels
+  - scales API roles and hot worker roles: `order-service=2`, `stock-service=2`, `payment-service=2`, `fluxi-server=2`, `order-checkout-worker=4`, `stock-activity-worker=3`, `payment-activity-worker=3`
 
-The CPU split follows the checkout hot path:
+The CPU split follows the checkout hot path while leaving room for replica overhead:
 
 - roughly `60%` of worker CPU goes to order workflow execution, because each successful checkout still spends most of its orchestration work on the `orders` workflow queue
 - roughly `20%` goes to stock activities and `20%` to payment activities, because each successful checkout performs one stock reservation and one payment charge
-- the remaining fixed CPU budget is reserved for the synchronous API path, `fluxi-server`, the scheduler, ingress, and Redis
+- the remaining fixed CPU budget is reserved for the synchronous API path, `fluxi-server`, the scheduler, ingress, and Redis/Sentinel infrastructure
 
 The main tuning knobs in those profiles are:
 
@@ -95,7 +97,7 @@ The main tuning knobs in those profiles are:
 - `FLUXI_STICKY_CACHE_MAX_RUNS` and `FLUXI_STICKY_CACHE_TTL_MS`: size and lifetime of the sticky workflow session cache
 - `FLUXI_RESULT_WAIT_TIMEOUT_MS`: long-poll timeout for synchronous workflow completion
 
-All three cluster profiles use direct Fluxi Redis with persistent AOF-backed volumes and `restart: unless-stopped` to improve recovery after a container kill/restart test.
+The `small` profile keeps a single direct Fluxi Redis for simplicity. The `medium` and `large` profiles switch back to the planned Sentinel-based Fluxi topology and keep all stateful Redis services on persistent AOF-backed volumes with `restart: unless-stopped`.
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 
