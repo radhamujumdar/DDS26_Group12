@@ -438,7 +438,7 @@ class TestFluxiEngineIntegration(FluxiEngineAsyncTestCase):
         timer_result = await scheduler.run_once()
         self.assertEqual(timer_result["timer_result"]["outcome"], "retried")
         self.assertGreaterEqual(timer_result["cleaned_pending_entries"], 1)
-        cleaned = await self.store.cleanup_stale_pending_entries()
+        cleaned = await self.store.cleanup_stale_pending_entries("test-scheduler")
         self.assertEqual(cleaned, 0)
 
         pending_after = await self.store.redis.xpending_range(

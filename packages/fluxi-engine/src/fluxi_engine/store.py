@@ -615,13 +615,13 @@ class FluxiRedisStore:
             )
         )
 
-    async def cleanup_stale_pending_entries(self) -> int:
+    async def cleanup_stale_pending_entries(self, consumer_name: str) -> int:
         cleaned = 0
-        cleaned += await self._cleanup_pending_kind("workflow")
-        cleaned += await self._cleanup_pending_kind("activity")
+        cleaned += await self._cleanup_pending_kind("workflow", consumer_name)
+        cleaned += await self._cleanup_pending_kind("activity", consumer_name)
         return cleaned
 
-    async def _cleanup_pending_kind(self, kind: str) -> int:
+    async def _cleanup_pending_kind(self, kind: str, consumer_name: str) -> int:
         registry_key = (
             workflow_task_queues(self.settings.key_prefix)
             if kind == "workflow"
@@ -645,7 +645,7 @@ class FluxiRedisStore:
                 claimed = await self.redis.xautoclaim(
                     stream_key,
                     group_name,
-                    "fluxi-scheduler",
+                    consumer_name,
                     self.settings.pending_idle_threshold_ms,
                     start_id="0-0",
                     count=self.settings.pending_claim_count,

@@ -2,7 +2,7 @@ services:
   gateway:
     image: nginx:1.25-bookworm
     restart: unless-stopped
-    cpus: 1.5
+    cpus: 1.75
     volumes:
       - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
@@ -18,7 +18,7 @@ services:
       dockerfile: order/Dockerfile
     image: order:latest
     restart: unless-stopped
-    cpus: 3.0
+    cpus: 2.5
     environment:
       GATEWAY_URL: http://gateway:80
       FLUXI_SERVER_URL: http://fluxi-server:8001
@@ -38,19 +38,29 @@ services:
       FLUXI_HTTP_RESULT_MAX_CONNECTIONS: "192"
       FLUXI_HTTP_RESULT_MAX_KEEPALIVE_CONNECTIONS: "96"
       FLUXI_RESULT_WAIT_TIMEOUT_MS: "60000"
+      REDIS_MODE: sentinel
+      REDIS_HOST: order-db-master
+      REDIS_PORT: "6379"
+      REDIS_SENTINEL_ENDPOINTS: order-sentinel-1:26379,order-sentinel-2:26379,order-sentinel-3:26379
+      REDIS_SENTINEL_SERVICE_NAME: order-master
+      REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 3 --timeout 60 --log-level=info order.app.main:app
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      - order-db-master
+      - order-db-replica
+      - order-sentinel-1
+      - order-sentinel-2
+      - order-sentinel-3
       - fluxi-server
 
-  order-db:
+  order-db-master:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    cpus: 1.0
+    cpus: 1.5
     command:
       - redis-server
       - --requirepass
@@ -68,7 +78,116 @@ services:
       - --maxmemory-policy
       - noeviction
     volumes:
-      - order-db-data:/data
+      - order-db-master-data:/data
+
+  order-db-replica:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 1.5
+    command:
+      - redis-server
+      - --replicaof
+      - order-db-master
+      - "6379"
+      - --masterauth
+      - redis
+      - --requirepass
+      - redis
+      - --replica-announce-ip
+      - order-db-replica
+      - --replica-announce-port
+      - "6379"
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --maxmemory
+      - 6gb
+      - --maxmemory-policy
+      - noeviction
+    depends_on:
+      - order-db-master
+    volumes:
+      - order-db-replica-data:/data
+
+  order-sentinel-1:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.25
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor order-master order-db-master 6379 2
+        sentinel auth-pass order-master redis
+        sentinel down-after-milliseconds order-master 3000
+        sentinel failover-timeout order-master 10000
+        sentinel parallel-syncs order-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - order-db-master
+      - order-db-replica
+
+  order-sentinel-2:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.25
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor order-master order-db-master 6379 2
+        sentinel auth-pass order-master redis
+        sentinel down-after-milliseconds order-master 3000
+        sentinel failover-timeout order-master 10000
+        sentinel parallel-syncs order-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - order-db-master
+      - order-db-replica
+
+  order-sentinel-3:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.25
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor order-master order-db-master 6379 2
+        sentinel auth-pass order-master redis
+        sentinel down-after-milliseconds order-master 3000
+        sentinel failover-timeout order-master 10000
+        sentinel parallel-syncs order-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - order-db-master
+      - order-db-replica
 
   stock-service:
     build:
@@ -76,20 +195,30 @@ services:
       dockerfile: stock/Dockerfile
     image: stock:latest
     restart: unless-stopped
-    cpus: 1.5
+    cpus: 1.25
     environment:
+      REDIS_MODE: sentinel
+      REDIS_HOST: stock-db-master
+      REDIS_PORT: "6379"
+      REDIS_SENTINEL_ENDPOINTS: stock-sentinel-1:26379,stock-sentinel-2:26379,stock-sentinel-3:26379
+      REDIS_SENTINEL_SERVICE_NAME: stock-master
+      REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 60 --log-level=info stock.app.main:app
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      - stock-db-master
+      - stock-db-replica
+      - stock-sentinel-1
+      - stock-sentinel-2
+      - stock-sentinel-3
 
-  stock-db:
+  stock-db-master:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    cpus: 1.0
+    cpus: 1.5
     command:
       - redis-server
       - --requirepass
@@ -107,7 +236,116 @@ services:
       - --maxmemory-policy
       - noeviction
     volumes:
-      - stock-db-data:/data
+      - stock-db-master-data:/data
+
+  stock-db-replica:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 1.5
+    command:
+      - redis-server
+      - --replicaof
+      - stock-db-master
+      - "6379"
+      - --masterauth
+      - redis
+      - --requirepass
+      - redis
+      - --replica-announce-ip
+      - stock-db-replica
+      - --replica-announce-port
+      - "6379"
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --maxmemory
+      - 6gb
+      - --maxmemory-policy
+      - noeviction
+    depends_on:
+      - stock-db-master
+    volumes:
+      - stock-db-replica-data:/data
+
+  stock-sentinel-1:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.25
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor stock-master stock-db-master 6379 2
+        sentinel auth-pass stock-master redis
+        sentinel down-after-milliseconds stock-master 3000
+        sentinel failover-timeout stock-master 10000
+        sentinel parallel-syncs stock-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - stock-db-master
+      - stock-db-replica
+
+  stock-sentinel-2:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.25
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor stock-master stock-db-master 6379 2
+        sentinel auth-pass stock-master redis
+        sentinel down-after-milliseconds stock-master 3000
+        sentinel failover-timeout stock-master 10000
+        sentinel parallel-syncs stock-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - stock-db-master
+      - stock-db-replica
+
+  stock-sentinel-3:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.25
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor stock-master stock-db-master 6379 2
+        sentinel auth-pass stock-master redis
+        sentinel down-after-milliseconds stock-master 3000
+        sentinel failover-timeout stock-master 10000
+        sentinel parallel-syncs stock-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - stock-db-master
+      - stock-db-replica
 
   payment-service:
     build:
@@ -115,20 +353,30 @@ services:
       dockerfile: payment/Dockerfile
     image: user:latest
     restart: unless-stopped
-    cpus: 1.5
+    cpus: 1.25
     environment:
+      REDIS_MODE: sentinel
+      REDIS_HOST: payment-db-master
+      REDIS_PORT: "6379"
+      REDIS_SENTINEL_ENDPOINTS: payment-sentinel-1:26379,payment-sentinel-2:26379,payment-sentinel-3:26379
+      REDIS_SENTINEL_SERVICE_NAME: payment-master
+      REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     command: gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000 -w 2 --timeout 60 --log-level=info payment.app.main:app
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      - payment-db-master
+      - payment-db-replica
+      - payment-sentinel-1
+      - payment-sentinel-2
+      - payment-sentinel-3
 
-  payment-db:
+  payment-db-master:
     image: redis:7.2-bookworm
     restart: unless-stopped
-    cpus: 1.0
+    cpus: 1.5
     command:
       - redis-server
       - --requirepass
@@ -146,7 +394,116 @@ services:
       - --maxmemory-policy
       - noeviction
     volumes:
-      - payment-db-data:/data
+      - payment-db-master-data:/data
+
+  payment-db-replica:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 1.5
+    command:
+      - redis-server
+      - --replicaof
+      - payment-db-master
+      - "6379"
+      - --masterauth
+      - redis
+      - --requirepass
+      - redis
+      - --replica-announce-ip
+      - payment-db-replica
+      - --replica-announce-port
+      - "6379"
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --maxmemory
+      - 6gb
+      - --maxmemory-policy
+      - noeviction
+    depends_on:
+      - payment-db-master
+    volumes:
+      - payment-db-replica-data:/data
+
+  payment-sentinel-1:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.25
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor payment-master payment-db-master 6379 2
+        sentinel auth-pass payment-master redis
+        sentinel down-after-milliseconds payment-master 3000
+        sentinel failover-timeout payment-master 10000
+        sentinel parallel-syncs payment-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - payment-db-master
+      - payment-db-replica
+
+  payment-sentinel-2:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.25
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor payment-master payment-db-master 6379 2
+        sentinel auth-pass payment-master redis
+        sentinel down-after-milliseconds payment-master 3000
+        sentinel failover-timeout payment-master 10000
+        sentinel parallel-syncs payment-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - payment-db-master
+      - payment-db-replica
+
+  payment-sentinel-3:
+    image: redis:7.2-bookworm
+    restart: unless-stopped
+    cpus: 0.25
+    command:
+      - sh
+      - -c
+      - |
+        cat <<'EOF' >/tmp/sentinel.conf
+        port 26379
+        dir /tmp
+        protected-mode no
+        sentinel resolve-hostnames yes
+        sentinel announce-hostnames yes
+        sentinel monitor payment-master payment-db-master 6379 2
+        sentinel auth-pass payment-master redis
+        sentinel down-after-milliseconds payment-master 3000
+        sentinel failover-timeout payment-master 10000
+        sentinel parallel-syncs payment-master 1
+        EOF
+        redis-server /tmp/sentinel.conf --sentinel
+    depends_on:
+      - payment-db-master
+      - payment-db-replica
 
   fluxi-server:
     build:
@@ -346,12 +703,22 @@ services:
       FLUXI_STICKY_SCHEDULE_TO_START_TIMEOUT_MS: "5000"
       FLUXI_STICKY_CACHE_MAX_RUNS: "40000"
       FLUXI_STICKY_CACHE_TTL_MS: "180000"
+      REDIS_MODE: sentinel
+      REDIS_HOST: order-db-master
+      REDIS_PORT: "6379"
+      REDIS_SENTINEL_ENDPOINTS: order-sentinel-1:26379,order-sentinel-2:26379,order-sentinel-3:26379
+      REDIS_SENTINEL_SERVICE_NAME: order-master
+      REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     env_file:
       - env/order_redis.env
     depends_on:
-      - order-db
+      - order-db-master
+      - order-db-replica
+      - order-sentinel-1
+      - order-sentinel-2
+      - order-sentinel-3
       - fluxi-server
 
   stock-activity-worker:
@@ -360,7 +727,7 @@ services:
       dockerfile: stock/Dockerfile
     image: stock:latest
     restart: unless-stopped
-    cpus: 5.0
+    cpus: 3.75
     command: python -m stock.workers.stock_worker
     environment:
       FLUXI_SERVER_URL: http://fluxi-server:8001
@@ -370,12 +737,22 @@ services:
       FLUXI_SENTINEL_SERVICE_NAME: fluxi-master
       FLUXI_SENTINEL_MIN_OTHER_SENTINELS: "1"
       FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS: "12"
+      REDIS_MODE: sentinel
+      REDIS_HOST: stock-db-master
+      REDIS_PORT: "6379"
+      REDIS_SENTINEL_ENDPOINTS: stock-sentinel-1:26379,stock-sentinel-2:26379,stock-sentinel-3:26379
+      REDIS_SENTINEL_SERVICE_NAME: stock-master
+      REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     env_file:
       - env/stock_redis.env
     depends_on:
-      - stock-db
+      - stock-db-master
+      - stock-db-replica
+      - stock-sentinel-1
+      - stock-sentinel-2
+      - stock-sentinel-3
       - fluxi-server
 
   payment-activity-worker:
@@ -384,7 +761,7 @@ services:
       dockerfile: payment/Dockerfile
     image: user:latest
     restart: unless-stopped
-    cpus: 5.0
+    cpus: 3.75
     command: python -m payment.workers.payment_worker
     environment:
       FLUXI_SERVER_URL: http://fluxi-server:8001
@@ -394,17 +771,30 @@ services:
       FLUXI_SENTINEL_SERVICE_NAME: fluxi-master
       FLUXI_SENTINEL_MIN_OTHER_SENTINELS: "1"
       FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS: "12"
+      REDIS_MODE: sentinel
+      REDIS_HOST: payment-db-master
+      REDIS_PORT: "6379"
+      REDIS_SENTINEL_ENDPOINTS: payment-sentinel-1:26379,payment-sentinel-2:26379,payment-sentinel-3:26379
+      REDIS_SENTINEL_SERVICE_NAME: payment-master
+      REDIS_SENTINEL_MIN_OTHER_SENTINELS: "1"
       DDS_TRACE_LOGGING: "0"
       DDS_LOG_LEVEL: WARNING
     env_file:
       - env/payment_redis.env
     depends_on:
-      - payment-db
+      - payment-db-master
+      - payment-db-replica
+      - payment-sentinel-1
+      - payment-sentinel-2
+      - payment-sentinel-3
       - fluxi-server
 
 volumes:
   fluxi-redis-master-data:
   fluxi-redis-replica-data:
-  order-db-data:
-  stock-db-data:
-  payment-db-data:
+  order-db-master-data:
+  order-db-replica-data:
+  stock-db-master-data:
+  stock-db-replica-data:
+  payment-db-master-data:
+  payment-db-replica-data:

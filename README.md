@@ -75,12 +75,12 @@ For the course staff cluster, use the dedicated deployment profiles:
   - about `24` CPUs total
 - `docker-compose.medium.yml` plus `scripts/up-medium.sh`
   - targets exactly `50` CPUs
-  - Fluxi HA topology: one Redis master, one Redis replica, and three Sentinels
-  - scales API roles and hot worker roles: `order-service=2`, `stock-service=2`, `payment-service=2`, `fluxi-server=2`, `order-checkout-worker=3`, `stock-activity-worker=2`, `payment-activity-worker=2`
+  - Sentinel-backed HA for Fluxi plus the `order`, `stock`, and `payment` Redis stores
+  - scales API roles and hot worker roles: `order-service=2`, `stock-service=2`, `payment-service=2`, `fluxi-server=2`, `fluxi-scheduler=2`, `order-checkout-worker=3`, `stock-activity-worker=2`, `payment-activity-worker=2`
 - `docker-compose.large.yml` plus `scripts/up-large.sh`
   - targets exactly `90` CPUs
-  - Fluxi HA topology: one Redis master, one Redis replica, and three Sentinels
-  - scales API roles and hot worker roles: `order-service=2`, `stock-service=2`, `payment-service=2`, `fluxi-server=2`, `order-checkout-worker=4`, `stock-activity-worker=3`, `payment-activity-worker=3`
+  - Sentinel-backed HA for Fluxi plus the `order`, `stock`, and `payment` Redis stores
+  - scales API roles and hot worker roles: `order-service=2`, `stock-service=2`, `payment-service=2`, `fluxi-server=2`, `fluxi-scheduler=2`, `order-checkout-worker=4`, `stock-activity-worker=3`, `payment-activity-worker=3`
 
 The CPU split follows the checkout hot path while leaving room for replica overhead:
 
@@ -96,8 +96,9 @@ The main tuning knobs in those profiles are:
 - `FLUXI_MAX_CONCURRENT_ACTIVITY_TASKS`: activity slots per stock/payment worker container
 - `FLUXI_STICKY_CACHE_MAX_RUNS` and `FLUXI_STICKY_CACHE_TTL_MS`: size and lifetime of the sticky workflow session cache
 - `FLUXI_RESULT_WAIT_TIMEOUT_MS`: long-poll timeout for synchronous workflow completion
+- `REDIS_MODE`, `REDIS_SENTINEL_ENDPOINTS`, and `REDIS_SENTINEL_SERVICE_NAME`: business-service failover wiring for the `order`, `stock`, and `payment` Redis backends
 
-The `small` profile keeps a single direct Fluxi Redis for simplicity. The `medium` and `large` profiles switch back to the planned Sentinel-based Fluxi topology and keep all stateful Redis services on persistent AOF-backed volumes with `restart: unless-stopped`.
+The `small` profile keeps a single direct Fluxi Redis for simplicity. The `medium` and `large` profiles use Sentinel-backed failover for Fluxi and each business Redis store, replicate `fluxi-scheduler`, and keep all stateful Redis services on persistent AOF-backed volumes with `restart: unless-stopped`.
 
 ***Requirements:*** You need to have docker and docker-compose installed on your machine. 
 

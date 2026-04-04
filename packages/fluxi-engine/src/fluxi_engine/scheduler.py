@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import socket
 import time
 
 from redis.asyncio.sentinel import MasterNotFoundError
@@ -36,6 +37,7 @@ class FluxiScheduler:
         self.store = store
         self.settings = settings
         self._stopped = asyncio.Event()
+        self._consumer_name = f"fluxi-scheduler:{socket.gethostname()}"
 
     @classmethod
     def from_settings(cls, settings: FluxiSettings | None = None) -> FluxiScheduler:
@@ -49,7 +51,9 @@ class FluxiScheduler:
         timer_result = None
         if timer_member is not None:
             timer_result = await self.store.apply_timer(timer_member)
-        cleaned = await self.store.cleanup_stale_pending_entries()
+        cleaned = await self.store.cleanup_stale_pending_entries(
+            self._consumer_name
+        )
         result = {
             "timer_member": timer_member,
             "timer_result": timer_result,
