@@ -17,6 +17,7 @@ from shop_common.redis import (
     decode_dedupe_record,
     encode_error_record,
     encode_success_record,
+    run_with_failover_retry,
 )
 
 from ..domain.models import OrderValue
@@ -29,6 +30,18 @@ TRACE_LOGGING_ENABLED = trace_logging_enabled()
 class OrderRepository:
     def __init__(self, redis: Redis) -> None:
         self._redis = redis
+
+    async def _run_redis_operation(self, operation_name: str, operation):
+        try:
+            return await run_with_failover_retry(
+                self._redis,
+                operation,
+                operation_name=operation_name,
+                logger=logger,
+                trace_logging_enabled=TRACE_LOGGING_ENABLED,
+            )
+        except RedisError as exc:
+            raise DatabaseError("DB error") from exc
 
     async def create_order(self, user_id: str) -> str:
         order_id = str(uuid.uuid4())
@@ -61,25 +74,25 @@ class OrderRepository:
             f"{index}": msgpack.encode(generate_entry())
             for index in range(count)
         }
-        try:
-            await self._redis.mset(kv_pairs)
-        except RedisError as exc:
-            raise DatabaseError("DB error") from exc
+        await self._run_redis_operation(
+            "order.batch_init",
+            lambda: self._redis.mset(kv_pairs),
+        )
 
     async def get_order(self, order_id: str) -> OrderValue:
-        try:
-            raw = await self._redis.get(order_id)
-        except RedisError as exc:
-            raise DatabaseError("DB error") from exc
+        raw = await self._run_redis_operation(
+            "order.get",
+            lambda: self._redis.get(order_id),
+        )
         if raw is None:
             raise OrderNotFoundError(f"Order {order_id!r} not found")
         return msgpack.decode(raw, type=OrderValue)
 
     async def save_order(self, order_id: str, order_entry: OrderValue) -> None:
-        try:
-            await self._redis.set(order_id, msgpack.encode(order_entry))
-        except RedisError as exc:
-            raise DatabaseError("DB error") from exc
+        await self._run_redis_operation(
+            "order.save",
+            lambda: self._redis.set(order_id, msgpack.encode(order_entry)),
+        )
 
     async def add_item(
         self,
@@ -89,30 +102,103 @@ class OrderRepository:
         quantity: int,
         item_price: int,
     ) -> OrderValue:
-        while True:
-            try:
-                async with self._redis.pipeline(transaction=True) as pipe:
-                    await pipe.watch(order_id)
-                    raw = await pipe.get(order_id)
-                    if raw is None:
-                        raise OrderNotFoundError(f"Order {order_id!r} not found")
+        async def operation() -> OrderValue:
+            while True:
+                try:
+                    async with self._redis.pipeline(transaction=True) as pipe:
+                        await pipe.watch(order_id)
+                        raw = await pipe.get(order_id)
+                        if raw is None:
+                            raise OrderNotFoundError(f"Order {order_id!r} not found")
 
-                    order_entry = msgpack.decode(raw, type=OrderValue)
-                    order_entry.items.append((item_id, quantity))
-                    order_entry.total_cost += quantity * item_price
+                        order_entry = msgpack.decode(raw, type=OrderValue)
+                        order_entry.items.append((item_id, quantity))
+                        order_entry.total_cost += quantity * item_price
 
-                    pipe.multi()
-                    pipe.set(order_id, msgpack.encode(order_entry))
-                    await pipe.execute()
-                    return order_entry
-            except WatchError:
-                continue
-            except RedisError as exc:
-                raise DatabaseError("DB error") from exc
+                        pipe.multi()
+                        pipe.set(order_id, msgpack.encode(order_entry))
+                        await pipe.execute()
+                        return order_entry
+                except WatchError:
+                    continue
+
+        return await self._run_redis_operation("order.add_item", operation)
 
     async def load_checkout_order(self, order_id: str) -> CheckoutOrder:
         entry = await self.get_order(order_id)
         return self._to_checkout_order(order_id, entry)
+
+    async def prepare_checkout_attempt(
+        self,
+        order_id: str,
+    ) -> tuple[CheckoutOrder, int | None, bool]:
+        async def operation() -> tuple[CheckoutOrder, int | None, bool]:
+            while True:
+                try:
+                    async with self._redis.pipeline(transaction=True) as pipe:
+                        await pipe.watch(order_id)
+                        raw = await pipe.get(order_id)
+                        if raw is None:
+                            raise OrderNotFoundError(f"Order {order_id!r} not found")
+
+                        entry = msgpack.decode(raw, type=OrderValue)
+                        order = self._to_checkout_order(order_id, entry)
+                        if entry.paid:
+                            return order, None, True
+
+                        if (
+                            entry.active_checkout_attempt_no is not None
+                            and entry.active_checkout_status == "running"
+                        ):
+                            return order, entry.active_checkout_attempt_no, False
+
+                        attempt_no = entry.checkout_attempt_seq + 1
+                        entry.checkout_attempt_seq = attempt_no
+                        entry.active_checkout_attempt_no = attempt_no
+                        entry.active_checkout_status = "running"
+
+                        pipe.multi()
+                        pipe.set(order_id, msgpack.encode(entry))
+                        await pipe.execute()
+                        return self._to_checkout_order(order_id, entry), attempt_no, False
+                except WatchError:
+                    continue
+
+        return await self._run_redis_operation("order.prepare_checkout_attempt", operation)
+
+    async def complete_checkout_attempt(
+        self,
+        order_id: str,
+        *,
+        attempt_no: int,
+        status: str,
+    ) -> None:
+        async def operation() -> None:
+            while True:
+                try:
+                    async with self._redis.pipeline(transaction=True) as pipe:
+                        await pipe.watch(order_id)
+                        raw = await pipe.get(order_id)
+                        if raw is None:
+                            raise OrderNotFoundError(f"Order {order_id!r} not found")
+
+                        entry = msgpack.decode(raw, type=OrderValue)
+                        if entry.active_checkout_attempt_no != attempt_no:
+                            return
+
+                        entry.active_checkout_status = status
+                        entry.active_checkout_attempt_no = None
+                        if status == "paid":
+                            entry.paid = True
+
+                        pipe.multi()
+                        pipe.set(order_id, msgpack.encode(entry))
+                        await pipe.execute()
+                        return
+                except WatchError:
+                    continue
+
+        await self._run_redis_operation("order.complete_checkout_attempt", operation)
 
     async def mark_order_paid_idempotent(
         self,
@@ -124,63 +210,66 @@ class OrderRepository:
         operation_start = time.perf_counter()
         watch_retries = 0
 
-        while True:
-            try:
-                async with self._redis.pipeline(transaction=True) as pipe:
-                    await pipe.watch(dedupe_key, order_id)
-                    existing = await pipe.get(dedupe_key)
-                    if existing is not None:
-                        if TRACE_LOGGING_ENABLED:
-                            logger.info(
-                                "order.mark_paid.dedupe_hit order_id=%s activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
-                                order_id,
-                                activity_execution_id,
-                                watch_retries,
-                                elapsed_ms(operation_start),
-                            )
-                        return self._materialize_mark_paid_record(existing)
+        async def operation() -> CheckoutOrder:
+            nonlocal watch_retries
 
-                    raw = await pipe.get(order_id)
-                    if raw is None:
-                        record = encode_error_record(
-                            "order_not_found",
-                            f"Order {order_id!r} not found",
-                        )
+            while True:
+                try:
+                    async with self._redis.pipeline(transaction=True) as pipe:
+                        await pipe.watch(dedupe_key, order_id)
+                        existing = await pipe.get(dedupe_key)
+                        if existing is not None:
+                            if TRACE_LOGGING_ENABLED:
+                                logger.info(
+                                    "order.mark_paid.dedupe_hit order_id=%s activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
+                                    order_id,
+                                    activity_execution_id,
+                                    watch_retries,
+                                    elapsed_ms(operation_start),
+                                )
+                            return self._materialize_mark_paid_record(existing)
+
+                        raw = await pipe.get(order_id)
+                        if raw is None:
+                            record = encode_error_record(
+                                "order_not_found",
+                                f"Order {order_id!r} not found",
+                            )
+                            pipe.multi()
+                            pipe.set(dedupe_key, record)
+                            await pipe.execute()
+                            if TRACE_LOGGING_ENABLED:
+                                logger.info(
+                                    "order.mark_paid.not_found order_id=%s activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
+                                    order_id,
+                                    activity_execution_id,
+                                    watch_retries,
+                                    elapsed_ms(operation_start),
+                                )
+                            raise OrderNotFoundError(f"Order {order_id!r} not found")
+
+                        entry = msgpack.decode(raw, type=OrderValue)
+                        entry.paid = True
+                        result = self._encode_checkout_order_result(order_id, entry)
+
                         pipe.multi()
-                        pipe.set(dedupe_key, record)
+                        pipe.set(order_id, msgpack.encode(entry))
+                        pipe.set(dedupe_key, encode_success_record(result))
                         await pipe.execute()
                         if TRACE_LOGGING_ENABLED:
                             logger.info(
-                                "order.mark_paid.not_found order_id=%s activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
+                                "order.mark_paid.success order_id=%s activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
                                 order_id,
                                 activity_execution_id,
                                 watch_retries,
                                 elapsed_ms(operation_start),
                             )
-                        raise OrderNotFoundError(f"Order {order_id!r} not found")
+                        return self._decode_checkout_order_result(result)
+                except WatchError:
+                    watch_retries += 1
+                    continue
 
-                    entry = msgpack.decode(raw, type=OrderValue)
-                    entry.paid = True
-                    result = self._encode_checkout_order_result(order_id, entry)
-
-                    pipe.multi()
-                    pipe.set(order_id, msgpack.encode(entry))
-                    pipe.set(dedupe_key, encode_success_record(result))
-                    await pipe.execute()
-                    if TRACE_LOGGING_ENABLED:
-                        logger.info(
-                            "order.mark_paid.success order_id=%s activity_execution_id=%s watch_retries=%d duration_ms=%.2f",
-                            order_id,
-                            activity_execution_id,
-                            watch_retries,
-                            elapsed_ms(operation_start),
-                        )
-                    return self._decode_checkout_order_result(result)
-            except WatchError:
-                watch_retries += 1
-                continue
-            except RedisError as exc:
-                raise DatabaseError("DB error") from exc
+        return await self._run_redis_operation("order.mark_paid_idempotent", operation)
 
     @staticmethod
     def _to_checkout_order(order_id: str, entry: OrderValue) -> CheckoutOrder:

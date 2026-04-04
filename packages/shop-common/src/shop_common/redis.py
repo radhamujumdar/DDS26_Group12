@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
-from typing import Any
+import asyncio
+from collections.abc import Awaitable, Callable
+import logging
+import time
+from typing import Any, TypeVar
 from urllib.parse import unquote, urlparse
 
 from msgspec import msgpack
 from redis.asyncio import ConnectionPool, Redis
-from redis.asyncio.sentinel import Sentinel
+from redis.asyncio.sentinel import MasterNotFoundError, Sentinel
+from redis.exceptions import ConnectionError, ReadOnlyError, ResponseError, TimeoutError
 
 from .config import RedisSettings
+
+_FAILOVER_RETRY_TIMEOUT_SECONDS = 15.0
+_FAILOVER_RETRY_INITIAL_DELAY_SECONDS = 0.05
+_FAILOVER_RETRY_MAX_DELAY_SECONDS = 0.75
+_FAILOVER_LOADING_MARKERS = ("LOADING", "MASTERDOWN", "TRYAGAIN")
+_T = TypeVar("_T")
 
 
 def create_connection_pool(settings: RedisSettings) -> Any:
@@ -107,6 +117,76 @@ async def close_redis_client(redis: Redis) -> None:
 
     if close_error is not None:
         raise close_error
+
+
+async def reset_redis_connections(redis: Redis) -> None:
+    pool = getattr(redis, "connection_pool", None)
+    if pool is not None:
+        await _disconnect_pool(pool)
+
+        sentinel_manager = getattr(pool, "sentinel_manager", None)
+        sentinels = getattr(sentinel_manager, "sentinels", ())
+        for sentinel_client in sentinels:
+            sentinel_pool = getattr(sentinel_client, "connection_pool", None)
+            if sentinel_pool is not None:
+                await _disconnect_pool(sentinel_pool)
+
+
+def is_transient_failover_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            ConnectionError,
+            TimeoutError,
+            MasterNotFoundError,
+            ReadOnlyError,
+        ),
+    ):
+        return True
+    if isinstance(exc, ResponseError):
+        message = str(exc).upper()
+        return any(marker in message for marker in _FAILOVER_LOADING_MARKERS)
+    return False
+
+
+async def run_with_failover_retry(
+    redis: Redis,
+    operation: Callable[[], Awaitable[_T]],
+    *,
+    operation_name: str,
+    logger: logging.Logger | None = None,
+    trace_logging_enabled: bool = False,
+    timeout_seconds: float = _FAILOVER_RETRY_TIMEOUT_SECONDS,
+) -> _T:
+    start = time.monotonic()
+    delay_seconds = _FAILOVER_RETRY_INITIAL_DELAY_SECONDS
+    attempt_no = 1
+
+    while True:
+        try:
+            return await operation()
+        except BaseException as exc:
+            if not is_transient_failover_error(exc):
+                raise
+
+            elapsed_seconds = time.monotonic() - start
+            if elapsed_seconds >= timeout_seconds:
+                raise
+
+            if trace_logging_enabled and logger is not None:
+                logger.warning(
+                    "%s transient redis failover error attempt=%d elapsed_ms=%.2f error_type=%s message=%s",
+                    operation_name,
+                    attempt_no,
+                    elapsed_seconds * 1000,
+                    exc.__class__.__name__,
+                    exc,
+                )
+
+            await reset_redis_connections(redis)
+            await asyncio.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 2, _FAILOVER_RETRY_MAX_DELAY_SECONDS)
+            attempt_no += 1
 
 
 def activity_dedupe_key(activity_execution_id: str) -> str:
@@ -215,3 +295,18 @@ def _sentinel_discovery_remap(
         return (host, port)
 
     return remap
+
+
+async def _disconnect_pool(pool: Any) -> None:
+    disconnect = getattr(pool, "disconnect", None)
+    if not callable(disconnect):
+        return
+    try:
+        await disconnect(inuse_connections=True)
+    except TypeError:
+        try:
+            await disconnect()
+        except BaseException:
+            return
+    except BaseException:
+        return

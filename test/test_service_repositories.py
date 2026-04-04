@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import unittest
 
 import fluxi_sdk_test_support  # noqa: F401
@@ -35,6 +36,7 @@ class RepositoryRedisAsyncTestCase(unittest.IsolatedAsyncioTestCase):
         if self.harness.url is None:
             raise unittest.SkipTest("No Redis URL available for repository tests.")
         self.redis = Redis.from_url(self.harness.url, decode_responses=False)
+        await self._wait_until_redis_ready()
         await self.redis.flushdb()
 
     async def asyncTearDown(self) -> None:
@@ -55,6 +57,17 @@ class RepositoryRedisAsyncTestCase(unittest.IsolatedAsyncioTestCase):
                 await client.aclose(close_connection_pool=True)
             except TypeError:
                 await client.aclose()
+
+    async def _wait_until_redis_ready(self) -> None:
+        deadline = time.time() + 15
+        while True:
+            try:
+                await self.redis.ping()
+                return
+            except Exception:
+                if time.time() >= deadline:
+                    raise
+                await asyncio.sleep(0.1)
 
 
 class TestServiceRepositories(RepositoryRedisAsyncTestCase):
@@ -355,4 +368,68 @@ class TestServiceRepositories(RepositoryRedisAsyncTestCase):
         self.assertTrue(first.paid)
         self.assertEqual(first, second)
         order = await repository.get_order("order-1")
+        self.assertTrue(order.paid)
+
+    async def test_checkout_attempt_reuses_running_attempt_and_allocates_next_after_completion(self) -> None:
+        repository = OrderRepository(self.redis)
+        await self.redis.set(
+            "order-attempt",
+            msgpack.encode(
+                OrderValue(
+                    paid=False,
+                    items=[("item-1", 1)],
+                    user_id="user-1",
+                    total_cost=10,
+                )
+            ),
+        )
+
+        first_order, first_attempt_no, first_already_paid = (
+            await repository.prepare_checkout_attempt("order-attempt")
+        )
+        second_order, second_attempt_no, second_already_paid = (
+            await repository.prepare_checkout_attempt("order-attempt")
+        )
+
+        self.assertFalse(first_already_paid)
+        self.assertFalse(second_already_paid)
+        self.assertEqual(first_order.order_id, "order-attempt")
+        self.assertEqual(second_order.order_id, "order-attempt")
+        self.assertEqual(first_attempt_no, 1)
+        self.assertEqual(second_attempt_no, 1)
+
+        await repository.complete_checkout_attempt(
+            "order-attempt",
+            attempt_no=1,
+            status="compensated",
+        )
+
+        _, third_attempt_no, third_already_paid = await repository.prepare_checkout_attempt(
+            "order-attempt"
+        )
+
+        self.assertFalse(third_already_paid)
+        self.assertEqual(third_attempt_no, 2)
+
+    async def test_checkout_attempt_short_circuits_for_paid_orders(self) -> None:
+        repository = OrderRepository(self.redis)
+        await self.redis.set(
+            "order-paid",
+            msgpack.encode(
+                OrderValue(
+                    paid=True,
+                    items=[("item-1", 1)],
+                    user_id="user-1",
+                    total_cost=10,
+                    checkout_attempt_seq=2,
+                )
+            ),
+        )
+
+        order, attempt_no, already_paid = await repository.prepare_checkout_attempt(
+            "order-paid"
+        )
+
+        self.assertTrue(already_paid)
+        self.assertIsNone(attempt_no)
         self.assertTrue(order.paid)

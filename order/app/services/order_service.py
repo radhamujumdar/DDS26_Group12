@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from shop_common.checkout import CheckoutOrder
 
 from ..clients.stock_client import StockGatewayClient
 from ..repositories.order_repository import OrderRepository
+
+
+@dataclass(frozen=True, slots=True)
+class CheckoutPreparation:
+    order: CheckoutOrder
+    attempt_no: int | None
+    already_paid: bool = False
 
 
 class OrderService:
@@ -63,6 +72,29 @@ class OrderService:
 
     async def load_checkout_order(self, order_id: str) -> CheckoutOrder:
         return await self._repository.load_checkout_order(order_id)
+
+    async def prepare_checkout(self, order_id: str) -> CheckoutPreparation:
+        order, attempt_no, already_paid = await self._repository.prepare_checkout_attempt(
+            order_id
+        )
+        return CheckoutPreparation(
+            order=order,
+            attempt_no=attempt_no,
+            already_paid=already_paid,
+        )
+
+    async def complete_checkout_attempt(
+        self,
+        order_id: str,
+        *,
+        attempt_no: int,
+        status: str,
+    ) -> None:
+        await self._repository.complete_checkout_attempt(
+            order_id,
+            attempt_no=attempt_no,
+            status=status,
+        )
 
     async def mark_order_paid(
         self,
