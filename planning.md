@@ -1,567 +1,369 @@
-# Requirements
+# Fluxi Final Architecture
 
-## 1. Functional Requirements
+## 1. Goal
 
-### 1.1. Fluxi Orchestrator Engine
+Fluxi is the reusable workflow runtime used to orchestrate checkout in the shopping-cart system without changing the course-provided HTTP API. The public contract stays synchronous, but the distributed coordination is moved into a Temporal-inspired engine.
 
-* **Durable Workflow State:** Fluxi must durably track active, completed, and failed workflows.
-* **Durable Workflow History:** Fluxi must persist workflow events so a workflow worker can replay the history after a crash and rebuild deterministic local state.
-* **Logical Task Queues:** Fluxi must maintain distinct logical queues for workflow tasks and activity tasks.
-* **Task Dispatching:** Fluxi must assign pending activities to available workers listening on the corresponding queue.
-* **State Advancement:** When a workflow task or activity result arrives, Fluxi must append the event, update the workflow snapshot, and schedule the next step.
-* **Timeout Handling:** Fluxi must detect missing activity completions and mark the activity attempt as timed out.
-* **Retry Handling:** Fluxi should own activity retries, backoff, and retry limits. Upstream clients should only retry idempotent workflow start requests when the initial result is ambiguous.
-* **Idempotent Workflow Start:** Starting a workflow with the same stable workflow key must be safe to retry.
-* **Attempt Fencing:** Every workflow-task attempt and activity-task attempt must carry an `attempt_no` (or equivalent token). Fluxi must accept a completion only if it matches the currently open attempt and must ignore stale late completions from superseded attempts.
+The final design is shaped by three constraints:
 
-### 1.2. SDK and Worker Runtime
+* keep `POST /orders/checkout/{order_id}` unchanged
+* survive single-container failures
+* reduce hot-path orchestration overhead enough to make the benchmark viable
 
-* **Declarative Registration:** The SDK must let developers register Python workflows and activities explicitly.
-* **Workflow Replay:** Workflow execution must resume by rerunning deterministic workflow code against durable event history until it reaches the same logical point again. It must not depend on preserving Python stack frames in memory or on arbitrary coroutine metaprogramming.
-* **Execution Interception:** When workflow code schedules an activity, the SDK must not run the function locally. It must emit an activity command to Fluxi instead.
-* **Background Polling:** Worker processes must continuously poll Redis queues managed by Fluxi for workflow tasks or activity tasks.
-* **Result Reporting:** After an activity finishes, the worker must report success or failure back to Fluxi.
-* **Deterministic Workflow Rules:** Workflow code must avoid nondeterministic operations such as direct network I/O, direct database access, uncontrolled randomness, or wall-clock time without going through Fluxi APIs.
+## 2. Final System Shape
 
-### 1.3. Shopping Cart Integration
+### 2.1. Business Services
 
-* **Stable External API:** The public `order`, `stock`, and `payment` HTTP APIs provided by the course template must remain unchanged.
-* **FastAPI Runtime:** The template implementation will be rewritten on FastAPI while preserving the externally visible API contract.
-* **Checkout via Fluxi:** `POST /orders/checkout/{order_id}` must start or resume a Fluxi workflow internally instead of coordinating the transaction directly in application code.
-* **Synchronous Client Experience:** The external checkout endpoint must still wait for a terminal workflow result so the provided tests and benchmark can keep the same request-response contract.
-* **Checkout Attempt Semantics:** A new `/orders/checkout/{order_id}` call after a retryable business failure must be able to start a fresh checkout attempt for the same order. A concurrent or duplicate call while checkout is already in progress must attach to the existing in-flight attempt instead of creating a second one.
-* **No Direct Coordination Between Microservices:** Business services must not call each other directly to coordinate checkout.
+The application is split into three business domains:
 
-## 2. Non-Functional Requirements
+* `order-service`
+* `stock-service`
+* `payment-service`
 
-### 2.1. Fault Tolerance and Resilience
+Each domain owns its own Redis-backed business state. For the `medium` and `large` deployments, each business Redis runs as:
 
-* **Worker Crash Recovery:** If a worker dies mid-task, the task must become available for recovery and re-execution by another healthy worker.
-* **Orchestrator Crash Recovery:** If a Fluxi server crashes, another server instance must reconstruct workflow progress from Redis state and history.
-* **At-Least-Once Delivery:** Task delivery is at-least-once. Exactly-once execution is not assumed.
-* **Idempotent Activities:** Every activity must be safe under duplicate delivery by using a stable `activity_execution_id` and durable deduplication.
-* **Ambiguous Start Recovery:** If a workflow start succeeds but the caller does not know whether the acknowledgment was durably recorded, retrying the same stable workflow key must be safe.
-* **Stale Completion Safety:** If a timed-out worker reports a late result after a newer retry has already started, Fluxi must ignore that stale result.
+* one master
+* one replica
+* three Sentinels
 
-### 2.2. Scalability and Performance
+The business services are FastAPI applications served with Gunicorn/Uvicorn workers. They expose the original course-facing endpoints unchanged.
 
-* **Horizontal Worker Scaling:** Each worker type must support multiple replicas.
-* **Competing Consumers:** Tasks in a queue must be distributed across worker replicas with Redis Streams consumer groups.
-* **Stateless Fluxi Servers:** Fluxi server instances must be horizontally scalable because durable state lives in Redis, not in process memory.
-* **Async Internal Communication:** Internal coordination must be event-driven and non-blocking.
-* **Connection Pooling**: All API nodes, Fluxi servers, and workers maintain persistent async Redis connection pools (redis.asyncio.ConnectionPool) to prevent TCP exhaustion at high throughput.
+### 2.2. Fluxi Runtime
 
-### 2.3. Maintainability and Developer Experience
+Fluxi consists of:
 
-* **Workflows as Code:** Developers should express workflow coordination in normal Python control flow.
-* **Separation of Concerns:** Workflow coordination belongs in Fluxi. Business logic belongs in the microservices.
-* **Operational Simplicity:** Phase 2 should prefer a simpler, defensible architecture over a more ambitious but fragile one.
+* `fluxi-server`
+* `fluxi-scheduler`
+* workflow workers
+* activity workers
+* Fluxi Redis master/replica/Sentinel
 
-# Architecture Overview
+Fluxi Redis is the durable store for workflow execution metadata:
 
-## 1. Executive Summary
+* workflow snapshots
+* workflow history
+* workflow task queues
+* activity task queues
+* timers and retry state
+* sticky routing metadata
 
-Fluxi is a Temporal-inspired workflow engine designed as a reusable orchestration runtime. For Phase 2 of the DDS project, it will be used to move distributed coordination out of the `order`, `stock`, and `payment` application code and into that runtime.
+Workers no longer use `fluxi-server` for the hot path. They talk directly to the Fluxi Redis store for:
 
-The system keeps the course-facing HTTP API unchanged, but replaces direct service-to-service coordination with:
+* history fetches
+* workflow-task completion
+* activity-task completion
 
-* FastAPI-based HTTP services
-* durable workflow state and event history in Redis
-* workflow and activity task queues in Redis Streams
-* replay-based workflow execution
-* idempotent activity execution
-* multi-worker services for load balancing and crash recovery
+`fluxi-server` remains the client-facing control plane for:
 
-Fluxi is not trying to be a full Temporal replacement. The goal is a focused, defensible workflow engine with reusable execution primitives, validated through the shopping-cart workflow and the course fault-injection benchmark.
+* workflow start/attach
+* result waiting
+* readiness and administrative access
 
-## 2. Final Design Decisions
+### 2.3. Gateway
 
-### 2.1. Storage and HA
+The gateway is Nginx. In `medium` and `large`, it uses explicit upstream pools with `least_conn` and failover settings instead of relying on Docker DNS for a single service name.
 
-We will use a **single logical Redis deployment** as Fluxi's only state store:
+That gives real balancing across API replicas for:
 
-* one writable Redis master
-* one or more Redis replicas
-* Redis Sentinel for failover
-* AOF enabled with `appendfsync everysec`
+* `order-service`
+* `stock-service`
+* `payment-service`
 
-This choice is intentionally pragmatic:
+Important operational note:
 
-* simpler than Redis Cluster
-* keeps state updates and queue appends in the same datastore
-* allows atomic state transition plus task enqueue operations
-* good enough for the project timeline
+* this gateway setup is robust for kill/start testing on existing containers
+* if API containers are recreated and get new IPs, the gateway should be restarted so upstream name resolution is refreshed
 
-Known limitation:
+## 3. Checkout Execution Model
 
-* recent writes can still be lost during crash or failover because AOF and replication are not synchronous
+### 3.1. Public API
 
-Mitigations:
+External checkout is still synchronous:
 
-* stable workflow IDs
-* idempotent activity execution
-* replay from durable history
-* safe retry of ambiguous workflow start requests
+1. client calls `POST /orders/checkout/{order_id}`
+2. `order-service` prepares workflow input from business state
+3. `order-service` executes a Fluxi workflow and waits for the terminal result
+4. the HTTP response is mapped back to the original API contract
 
-### 2.2. No Redis Cluster in v1
+There is no API contract change and no asynchronous callback/polling API.
 
-We are **not** using Redis Cluster in the first version.
+### 3.2. Checkout Attempt Model
+
+The original single-key checkout model was not sufficient because a later retry after a terminal failure must be able to create a new workflow run, while duplicate concurrent calls should attach to the existing in-flight attempt.
+
+The final design uses explicit checkout attempts:
+
+* workflow id: `order-checkout:{order_id}:attempt:{n}`
+* start policy: `ATTACH_OR_START`
+
+This gives the desired behavior:
+
+* duplicate or retried HTTP requests while attempt `n` is running attach to the same workflow
+* a later legitimate retry after a terminal business failure can start attempt `n+1`
+
+### 3.3. Happy Path
+
+The checkout workflow is:
+
+1. reserve stock on the `stock` activity queue
+2. charge payment on the `payment` activity queue
+3. mark the order as paid using a local activity
+4. complete the workflow
+
+The final `mark_order_paid` step is intentionally a local activity. That removes:
+
+* one extra remote activity task
+* one extra workflow wakeup
+* one extra round through the `orders` activity queue
+
+So the happy path now completes in three order workflow tasks instead of four.
+
+## 4. Important Design Decisions
+
+### 4.1. Hybrid State Model
+
+Fluxi uses snapshot plus history:
+
+* a current workflow snapshot for fast reads and state advancement
+* append-only durable history for replay and recovery
+
+This was chosen over pure event sourcing because the benchmark hot path benefits from fast current-state reads.
+
+### 4.2. Real Sticky Execution
+
+Sticky routing is not just a sticky queue name. The worker now keeps a per-run in-memory workflow session cache containing:
+
+* workflow instance
+* live coroutine/session state
+* pending activity futures
+* last applied history index
+
+On a sticky hit, the worker fetches only incremental history and resumes the live session. On a miss, timeout, or failover, it rebuilds deterministically from durable history.
+
+This was a major design choice because the original replay-every-turn approach was structurally too expensive.
+
+### 4.3. Direct Store Worker Hot Path
+
+Workers use the Fluxi Redis store directly instead of making an HTTP round-trip through `fluxi-server` for each workflow turn.
+
+This was done because:
+
+* the workflow path is latency-sensitive
+* repeated HTTP control-plane hops were dominating checkout latency
+* `fluxi-server` is still useful for client start/result traffic, but not for worker hot-path execution
+
+### 4.4. General Local Activities
+
+Fluxi now supports both remote and local activities.
+
+Local activities:
+
+* run inside the workflow worker
+* are recorded in workflow history
+* do not create Redis activity tasks
+* do not require a follow-up workflow task just to consume their result
+
+The shopping-cart workflow uses this for `mark_order_paid`, but the capability is general rather than checkout-specific.
+
+### 4.5. At-Least-Once Delivery With Idempotency
+
+The system does not assume exactly-once execution.
+
+Instead:
+
+* task delivery is at least once
+* every activity uses a stable `activity_execution_id`
+* duplicate effects are prevented with durable idempotency checks
+* stale completions are fenced by `attempt_no`
+
+This design is much more defensible than trying to simulate exactly-once semantics on top of Redis and container restarts.
+
+### 4.6. Retry Ownership
+
+Retry ownership is split deliberately:
+
+* Fluxi owns workflow-task and activity-task retries, timeout handling, and stale-attempt fencing
+* business services own bounded retry of transient Redis/Sentinel failover errors when accessing their own domain Redis
+* `order-service` owns bounded retry of ambiguous workflow result decoding during failover on the same checkout attempt
+
+This keeps the engine responsible for orchestration while still letting service endpoints degrade into slower success instead of leaking raw `500`s during Redis failover.
+
+### 4.7. Sentinel Instead of Redis Cluster
+
+The project uses master/replica Redis with Sentinel, not Redis Cluster.
 
 Reasoning:
 
-* Cluster adds substantial operational complexity in Docker and local development.
-* Hash tags help colocate per-workflow keys, but they do not automatically solve global queue design.
-* Atomic `update workflow state + append next task` becomes more complicated once the state key and queue key can end up on different shards.
-* The project is more likely to bottleneck on application logic and worker throughput before one Redis master becomes the limiting factor.
+* simpler to reason about in Docker Compose
+* easier to keep queue and state transitions atomic
+* sufficient for the course deployment model
 
-### 2.3. Hybrid State Model
+Trade-off:
 
-Fluxi will use **hybrid snapshot + history**:
+* failover is not zero-downtime
+* recent writes can still be lost during crash/failover windows
+* horizontal write scaling is not provided
 
-* a current workflow snapshot for fast reads
-* an append-only event history for replay, debugging, and recovery
+## 5. Runtime Roles
 
-We are not using pure event-sourcing in v1 because replaying the full history for every operational read adds complexity and latency without enough benefit for this project.
+The codebase is shared, but runtime roles are separated.
 
-### 2.4. Internal Retries, Not App-Level Coordination
+### 5.1. API Roles
 
-Fluxi will own **activity retries, timeouts, and retry policy**.
-
-Upstream retry is still useful, but only for ambiguous workflow-start requests such as:
-
-* a client called `StartWorkflow(workflow_key, workflow_type, input...)`
-* the network failed before the caller knew whether the start was committed
-
-The caller should be able to retry the same stable `workflow_key` safely. It should not re-implement workflow retry logic itself.
-
-Fluxi itself owns activity timeout detection and retry scheduling. Workers should stay operationally simple and consume only new tasks.
-
-Fluxi should distinguish between:
-
-* the workflow key: stable caller-supplied logical identity used for idempotent start-or-attach
-* the run number: monotonically increasing execution sequence for that workflow key
-* the concrete execution identity: `run_id`
-* the task delivery attempt: `attempt_no`
-
-The important rule is that one logical workflow key can have multiple runs over time, but only one open run at a time in v1.
-
-Fluxi, not application code, should therefore own a generic execution state machine, for example:
-
-* `absent`
-* `running`
-* `completed`
-* `failed`
-
-Business-specific meanings such as `paid`, `rejected`, or `failed_retryable` belong in workflow results or application-level projections, not in the engine's core execution state.
-
-Expected behavior:
-
-* if `execute_workflow(workflow_key, ...)` arrives while a run is already `running`, Fluxi should attach the caller and wait for that run's terminal result
-* if start policy permits a new run after a terminal result, Fluxi should create run `n+1`
-* if idempotency policy says the prior terminal result should be reused, Fluxi should return it without creating a second concurrent run
-
-For the shopping-cart integration, the order API should stay thin:
-
-* load the business order data needed as workflow input
-* call a Fluxi `start_or_attach` / `execute_workflow` API using `workflow_key = checkout:{order_id}`
-* wait for the terminal workflow result
-* map that result back to the existing HTTP response contract
-
-This avoids a crash window where application code records engine lifecycle state before Fluxi durably creates the workflow, or where Fluxi finishes the workflow before the application durably records any domain projection it wants to maintain.
-
-### 2.5. Separate API and Worker Roles
-
-We will use **multi-worker services**, but worker loops will not run inside the same FastAPI / ASGI web-server processes that serve HTTP traffic.
-
-Instead, each business domain will expose separate runtime roles:
-
-* API role: serves the existing HTTP endpoints
-* workflow-worker role: executes workflow code by replaying history
-* activity-worker role: executes business activities
-
-The codebase can still be shared, but the runtime roles should be deployed as separate processes or containers.
-
-### 2.6. Scope of Fluxi v1
-
-Fluxi v1 is intended to be a reusable workflow runtime. For this course, the shopping-cart system is the first integration target and validation workload.
-
-It aims to:
-
-* abstract the coordination logic previously embedded in the services
-* provide reusable workflow and activity execution primitives
-* expose a clean model for start-or-attach, replay, retries, and durable history
-* demonstrate the engine by powering the checkout workflow cleanly and defensibly
-
-It does **not** aim to:
-
-* reproduce all of Temporal's features
-* expose a complete generic library of every distributed transaction protocol
-* optimize for production-grade multi-tenant scale in the first version
-
-## 3. System Architecture
-
-### 3.1. Layer 1: Redis Persistence and Routing
-
-Redis is the single logical durable backend for Fluxi.
-
-Redis responsibilities:
-
-* workflow snapshots
-* workflow event history
-* workflow task queues
-* activity task queues
-* timer and retry scheduling
-* leases or attempt bookkeeping
-
-Suggested Redis structures:
-
-* `workflow:{run_id}:state` -> hash with current snapshot for one concrete workflow run
-* `workflow:{run_id}:history` -> stream or list of durable events for one concrete workflow run
-* `queue:workflow:{task_queue}` -> stream of workflow tasks
-* `queue:activity:{activity_queue}` -> stream of activity tasks
-* `timers` -> sorted set for retry and timeout deadlines
-* `activity:{execution_id}` -> deduplication record plus current accepted attempt metadata
-* `workflow_key:{workflow_key}:control` -> Fluxi-owned control record with current `run_no`, active `run_id`, terminal status, and start/attach metadata
-
-Outside Fluxi itself, applications should persist their own domain state and any idempotent projections they need, but Fluxi should remain the source of truth for workflow execution lifecycle metadata.
-
-### 3.2. Layer 2: Fluxi Server
-
-Fluxi server is a stateless Python FastAPI service that owns orchestration metadata and scheduling decisions.
+* `order-service`
+* `stock-service`
+* `payment-service`
 
 Responsibilities:
 
-* atomically decide `start new run` vs `attach to running run` vs `return existing terminal result`
-* start workflows
-* append workflow events
-* maintain workflow snapshot
-* own execution metadata such as current `run_no`, active `run_id`, and terminal status
-* schedule workflow tasks and activity tasks
-* process activity results
-* evaluate retry policy and timeout policy
-* finalize workflow outcomes and expose them to callers idempotently
-* expose SDK-facing APIs
+* serve HTTP requests
+* validate and map inputs/outputs
+* call Fluxi or local repositories
+* remain thin with respect to orchestration
 
-A Fluxi server does **not** keep workflow progress in memory as the source of truth. Redis remains authoritative.
+### 5.2. Workflow Worker Role
 
-### 3.3. Layer 3: Workflow Workers
-
-Workflow workers execute user-defined workflow code.
+* `order-checkout-worker`
 
 Responsibilities:
 
-* poll workflow tasks from Redis queues managed by Fluxi
-* load and replay workflow history
-* run deterministic workflow code until the next command or terminal result
-* emit commands such as `schedule_activity`, `complete_workflow`, or `fail_workflow`
+* poll workflow tasks
+* rebuild or resume workflow sessions
+* execute deterministic workflow code
+* emit workflow commands
+* run local activities inline
 
-This is the part that is intentionally Temporal-like:
+### 5.3. Activity Worker Roles
 
-* workflow code is written by developers
-* workflow code is executed by workers
-* replay rebuilds local workflow state after crashes
-* Fluxi server stores history and schedules tasks into Redis queues
-
-Workflow workers should stay dumb with respect to orchestration bookkeeping:
-
-* they do not decide whether a caller should attach to an existing run or start a new run
-* they do not own retry counters, timeout policy, or stale-attempt fencing
-* they simply replay deterministic code and emit the next command
-
-### 3.4. Layer 4: Activity Workers
-
-Activity workers run user-defined activity logic.
+* `stock-activity-worker`
+* `payment-activity-worker`
 
 Responsibilities:
 
-* poll activity tasks from Redis Streams
-* execute domain logic
-* persist local service changes
-* report activity result back to Fluxi
-* deduplicate duplicate deliveries using `activity_execution_id`
+* poll activity queues
+* execute business operations
+* deduplicate duplicate deliveries
+* report results back to Fluxi
 
-Each activity worker type can have multiple replicas.
+### 5.4. Fluxi Control Plane
 
-Activity workers should also stay operationally simple:
+* `fluxi-server`
+* `fluxi-scheduler`
 
-* they do not decide retry policy or timeout policy
-* they do not coordinate with other services directly
-* they execute one task, persist an idempotent result, and report back to Fluxi
+Responsibilities:
 
-### 3.5. Runtime Stack
+* workflow start/attach decisions
+* result waiting
+* timer expiry
+* retry scheduling
+* stale-entry cleanup
 
-The implementation stack for Phase 2 is:
+## 6. High Availability Model
 
-* FastAPI for all HTTP-facing services
-* ASGI server processes for API roles
-* dedicated Python worker entrypoints for workflow and activity workers
-* shared domain modules so API and worker roles reuse the same business logic where appropriate
+### 6.1. Small Profile
 
-## 4. Execution Model
+The `small` profile is intentionally simple:
 
-### 4.1. Workflow Start
+* single instance of each API
+* single instance of each worker role
+* single instance of each control-plane component
+* single Redis instance per domain
 
-1. A caller invokes a Fluxi API such as `execute_workflow(workflow_key=..., workflow_type=..., input=...)`.
-2. Fluxi atomically loads the control record for that `workflow_key` and decides one of:
-   * `attach` to the currently running run
-   * `return existing terminal result` if start policy says the existing terminal run should be reused
-   * `start new run n+1` if no run exists yet or if start policy allows a new run after the previous terminal state
-3. If a new run is needed, Fluxi atomically:
-   * increments `run_no`
-   * allocates a fresh `run_id`
-   * updates `workflow_key:{workflow_key}:control` to `running`
-   * creates the initial workflow snapshot for that `run_id`
-   * appends a `WorkflowStarted` history event for that `run_id`
-   * enqueues the first workflow task
-4. Fluxi waits for or later returns the terminal result for the active run.
-5. Fluxi durably records the terminal workflow outcome in its control record before exposing that result to callers.
+It is meant for basic correctness and local development, not high availability.
 
-If the same logical workflow is started again, the operation must be idempotent at the level of the stable `workflow_key`. The important point is that the caller supplies the stable logical identity, while Fluxi derives a concrete `run_id` for each new run.
+### 6.2. Medium and Large Profiles
 
-At the SDK level, `execute_workflow(...)` should therefore mean "start-or-attach using a stable workflow key, then await the terminal result", not "blindly create a brand new workflow run every time."
+The `medium` and `large` profiles are the HA-shaped deployments.
 
-For the shopping-cart integration, the order API can simply call `execute_workflow(workflow_key=f"checkout:{order_id}", workflow_type=CheckoutWorkflow, input=...)` and then map the returned workflow result back to the existing HTTP response contract.
+They include:
 
-### 4.2. Workflow Replay
+* replicated API services
+* replicated Fluxi servers
+* replicated workflow/activity workers
+* two scheduler replicas
+* Fluxi Redis master/replica/3 Sentinels
+* order Redis master/replica/3 Sentinels
+* stock Redis master/replica/3 Sentinels
+* payment Redis master/replica/3 Sentinels
 
-Workflow code does not resume from a suspended Python stack frame. Instead, Fluxi uses constrained replay of deterministic SDK-based workflow code:
+## 7. Resilience Strategy
 
-1. a workflow worker receives a workflow task
-2. it loads the durable event history
-3. it reruns the workflow code from the beginning
-4. when the workflow reaches a previously completed SDK command, Fluxi returns the recorded result from history instead of re-executing side effects
-5. execution continues until the workflow reaches a new SDK command that must be scheduled, or reaches a terminal state
-6. the worker then emits the resulting command back to Fluxi and stops
+### 7.1. Worker and Service Failures
 
-This is not a general-purpose replay engine for arbitrary Python programs. It only works for deterministic workflow code written against Fluxi SDK primitives.
+For worker and stateless service failures, the target behavior is:
 
-This is why workflow code must be deterministic.
+* no permanent outage
+* transient latency spike
+* automatic recovery after the container returns
 
-### 4.3. Activity Scheduling
+With the final gateway and retry changes, low-load HA testing showed clean recovery for:
 
-When workflow code calls something like:
+* `order-service`
+* `order-checkout-worker`
+* `payment-activity-worker`
+* `fluxi-server`
 
-```python
-await workflow.execute_activity("process_step", args=[resource_id])
-```
+### 7.2. Redis Master Failover
 
-the SDK does not execute that activity locally.
+Redis master failover is handled through:
 
-Instead, the workflow worker emits a command to Fluxi:
+* Sentinel promotion
+* Redis client reconnection
+* bounded failover retries in business services
+* bounded retry on ambiguous checkout result decoding
 
-* append `ActivityScheduled` to history
-* update the workflow snapshot
-* allocate a stable `activity_execution_id` for the logical side effect
-* allocate `attempt_no = 1` for the first delivery attempt
-* append an activity task to the configured activity queue
+The design goal is not zero-latency failover. The goal is:
 
-These writes must happen atomically in Redis.
+* turn many potential `500`s into slower `200`s or controlled temporary unavailability
+* avoid duplicate business effects
 
-### 4.4. Activity Consumption
+HA testing showed that after the final fixes:
 
-Activity workers use Redis Streams consumer groups:
+* `order-db-master` failover degraded mostly into slower success
+* `stock-db-master` failover degraded into slower success once the gateway was restarted after API container recreation
+* `payment-db-master` failover also degraded into slower success
+* `fluxi-redis-master` failover caused large latency spikes but no persistent failure at low load
 
-```text
-XREADGROUP GROUP activity-workers worker-1 BLOCK 5000 STREAMS queue:activity:default >
-```
+### 7.3. Readiness
 
-Important semantics:
+The services expose readiness endpoints and the Compose profiles use health checks so traffic is not sent to freshly started containers immediately.
 
-* `>` means "give this consumer only brand new entries that have never been delivered to any consumer in this group"
-* brand new entries move to the consumer's pending entries list
-* a later `XACK` acknowledges successful handling
-* pending entries are **not** returned again by another `XREADGROUP ... >`
+This matters because Redis and Fluxi components can be `Up` before they are actually ready to serve traffic safely.
 
-This means stale pending messages require recovery logic.
+## 8. Performance-Oriented Choices
 
-### 4.5. Stale Task Recovery
+The biggest performance improvements over the earlier design were:
 
-Fluxi is an at-least-once system.
+* direct Redis/store hot path for workers
+* real sticky workflow session reuse
+* local activity support
+* explicit gateway balancing for API replicas
+* tuned long-poll result waiting and connection pooling
 
-If a worker crashes after receiving a task but before acknowledging it, Fluxi handles recovery by timeout and explicit retry scheduling.
+The current synchronous external checkout still means internal queueing shows up directly as user-visible latency. That is a conscious choice because the public API contract cannot change.
 
-In the v1 design:
+## 9. Known Limitations
 
-* workers only consume brand new tasks via `XREADGROUP ... >`
-* workers do not aggressively reclaim stale pending entries themselves
-* Fluxi tracks which attempt is currently valid for each outstanding workflow task or activity
-* when an attempt times out, Fluxi marks that attempt as superseded and schedules retry attempt `n+1`
-* every completion report must include both the logical task identity and the `attempt_no`
-* Fluxi records a completion only if the reported `attempt_no` still matches the currently open attempt
-* a maintenance loop in Fluxi may inspect and clean up abandoned pending entries so the PEL does not grow forever
+The final system is materially stronger than the original baseline, but it still has real limitations:
 
-The key point is:
+* Redis Sentinel failover is not zero-error and not zero-latency in the strict sense
+* recent writes can still be lost because replication and AOF are asynchronous
+* the gateway should be restarted after API container recreation so upstream IP resolution is refreshed
+* the public checkout API is synchronous, so failover and queueing directly affect HTTP latency
+* the design is defensible for course evaluation, but not intended as a production-grade Temporal replacement
 
-* the retry decision is owned centrally by Fluxi
-* worker code stays simple because retry ownership, stale-attempt fencing, and timeout handling all live in the engine
-* stale original deliveries may still exist in the PEL even after a retry is scheduled
-* duplicate execution is still possible at the worker level if a late worker reports after the retry has started
-* Fluxi must ignore stale completions from superseded attempts instead of letting them advance the workflow twice
+## 10. Final Summary
 
-Therefore all activities must be idempotent, and Fluxi must fence stale attempts.
+The final architecture is a Temporal-inspired workflow runtime with:
 
-## 5. Failure Model and Recovery Strategy
+* durable workflow state and history in Redis
+* deterministic replay
+* direct-store worker execution
+* sticky in-memory workflow sessions
+* local and remote activities
+* attempt-based checkout start semantics
+* service and database HA for `medium` and `large`
+* explicit gateway balancing and failover behavior
+* bounded retries to convert many transient failover errors into slower successful requests
 
-### 5.1. Delivery Guarantee
-
-Fluxi assumes **at-least-once** activity delivery.
-
-Implications:
-
-* an activity may run more than once
-* a worker may commit domain state and crash before reporting completion
-* the task may later be retried
-
-So every activity must check whether `activity_execution_id` has already been applied.
-
-### 5.2. Worker Crash
-
-Scenario:
-
-1. an activity worker receives a task
-2. it updates application state
-3. it crashes before `XACK` or before Fluxi records completion
-
-Recovery:
-
-* the activity remains pending or times out
-* another worker reprocesses the same execution
-* the duplicate is detected using the execution ID
-* the worker returns the same logical result without applying the side effect twice
-* if the original timed-out attempt later reports after a newer retry has started, Fluxi rejects that stale completion because its `attempt_no` is no longer current
-
-### 5.3. Redis Crash and the AOF Window
-
-With `appendfsync everysec`, Redis may lose up to roughly one second of recent writes.
-
-This creates two different classes of failure:
-
-* **duplicate-after-recovery:** a completion event or acknowledgment is lost, so the activity is retried
-* **amnesia:** a just-started workflow or just-enqueued task disappears after crash
-
-Idempotent workers solve the first case, but not the second.
-
-Mitigation for amnesia:
-
-* workflow start uses a stable `workflow_key`
-* the caller can safely retry `StartWorkflow(workflow_key)` if the result is ambiguous
-* Fluxi must treat repeated starts of the same `workflow_key` as idempotent while still deriving a distinct internal `run_id` for each new run when policy allows
-
-This does not make the system perfect, but it makes the ambiguous-start case recoverable.
-
-### 5.4. Sentinel Failover Limitations
-
-Sentinel improves availability, but it does not provide:
-
-* zero data loss
-* synchronous replication
-* exactly-once execution
-* horizontal write scaling
-
-So the design must still tolerate:
-
-* duplicate deliveries
-* stale reads during failover windows
-* recent write loss
-
-### 5.5. Orchestrator Crash Recovery
-
-Because Fluxi servers are stateless, another server instance can continue orchestration by reading:
-
-* workflow snapshot
-* workflow history
-* pending or scheduled tasks
-* timers
-
-No in-memory workflow state is authoritative.
-
-## 6. Consistency and Atomicity
-
-Within the single logical Redis deployment, Fluxi should use `WATCH/MULTI/EXEC` or Lua scripts for operations such as:
-
-* append history event + update snapshot + enqueue next task
-* record activity result only if `attempt_no` matches the current open attempt + enqueue next workflow task
-* mark timeout, supersede attempt `n`, and schedule retry attempt `n+1`
-
-Keeping state and queues in the same datastore is the main reason we prefer this design over splitting state and broker into separate independent systems for v1.
-
-## 7. SDK Model
-
-### 7.1. Workflow Definition
-
-```python
-from fluxi_sdk import workflow
-
-@workflow.defn
-class ExampleWorkflow:
-    @workflow.run
-    async def run(self, resource_id: str):
-        metadata = await workflow.execute_activity("load_metadata", args=[resource_id])
-        result = await workflow.execute_activity("process_resource", args=[resource_id, metadata])
-        return {"status": "completed", "result": result}
-```
-
-Notes:
-
-* this code is executed by workflow workers
-* replay rebuilds the workflow's logical state
-* the workflow code must stay deterministic
-
-### 7.2. Activity Definition
-
-```python
-from fluxi_sdk import activity
-
-@activity.defn(name="process_resource", queue="queue:activity:default")
-async def process_resource(resource_id: str, metadata: dict, activity_execution_id: str):
-    if resource_repo.already_applied(activity_execution_id):
-        return resource_repo.result_for(activity_execution_id)
-
-    result = resource_repo.apply(resource_id, metadata, activity_execution_id)
-    return result
-```
-
-Notes:
-
-* activity workers may execute the same logical activity more than once
-* durable deduplication is mandatory
-* `activity_execution_id` identifies the logical side effect across retries
-* `attempt_no` identifies one delivery attempt and is used by Fluxi to fence stale late completions
-
-## 8. Deployment Shape
-
-Planned deployment roles:
-
-* `gateway`
-* `order-api`
-* `payment-api`
-* `stock-api`
-* `fluxi-server` replicas
-* `order-workflow-worker` replicas
-* `payment-activity-worker` replicas
-* `stock-activity-worker` replicas
-* Redis master
-* Redis replica(s)
-* Redis Sentinel instances
-
-This keeps the public API stable while letting worker roles scale independently from HTTP traffic.
-
-## 9. Evaluation Checklist
-
-* **Stable public API:** preserved
-* **Coordination extracted into an orchestrator:** yes
-* **Temporal-like workflow execution:** yes, via workflow workers plus replay from durable history
-* **Async internal communication:** yes, via Redis Streams
-* **Crash recovery:** yes, with replay, retries, and idempotent activities
-* **Exactly-once execution:** no, not assumed
-* **Delivery model:** at-least-once
-* **Worker scaling:** yes, multiple replicas per worker type
-* **Redis Cluster:** intentionally not used in v1
-
-## 10. Open Risks
-
-* Redis failover can still lose recent writes.
-* Sentinel-based HA in Docker Compose is still weaker than true multi-machine HA.
-* Workflow determinism rules must be enforced carefully or replay will diverge.
-* Idempotency must be implemented correctly in every activity or retries become unsafe.
-* Load testing may show that the single Redis master becomes a bottleneck at higher throughput. If that happens, cluster partitioning or a different state/broker split can be considered later.
+This is the architecture that is actually implemented and benchmarked in the repository.
