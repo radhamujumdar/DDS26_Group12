@@ -38,6 +38,7 @@ class DockerComposeBackend:
         self.startup_timeout = startup_timeout
         self.sizing = sizing
         self.compose_file = paths.compose_file
+        self.available_services = self._discover_services()
 
     def down(self) -> None:
         self._run_compose(
@@ -82,14 +83,23 @@ class DockerComposeBackend:
         if not service:
             raise RuntimeError(f"No Docker Compose kill target mapping for {target}")
 
-        result = self._run_compose(
-            self.compose_file,
-            ["kill", service],
+        if service not in self.available_services:
+            raise RuntimeError(f"Service {service} is not present in {self.compose_file.name}")
+
+        container_ids = self._compose_container_ids(service)
+        if not container_ids:
+            raise RuntimeError(f"No running container found for service {service}")
+
+        result = subprocess.run(
+            ["docker", "kill", container_ids[0]],
+            cwd=self.paths.project_dir,
+            text=True,
             capture_output=True,
+            check=False,
         )
         if result.returncode != 0:
             message = (result.stderr or result.stdout or "").strip()
-            raise RuntimeError(f"docker compose kill failed for {service}: {message}")
+            raise RuntimeError(f"docker kill failed for {service}: {message}")
 
     def collect_diagnostics(self, output_dir: Path) -> None:
         sections = [
@@ -116,10 +126,38 @@ class DockerComposeBackend:
         return env
 
     def _compose_scale_args(self) -> list[str]:
+        if self.compose_file != self.paths.default_compose_file:
+            return []
+
         args: list[str] = []
         for service, replicas in self.sizing.compose_scales().items():
             args.extend(["--scale", f"{service}={replicas}"])
         return args
+
+    def _discover_services(self) -> set[str]:
+        result = self._run_compose(
+            self.compose_file,
+            ["config", "--services"],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            message = (result.stderr or result.stdout or "").strip()
+            raise RuntimeError(f"docker compose config --services failed: {message}")
+        return {
+            line.strip()
+            for line in (result.stdout or "").splitlines()
+            if line.strip()
+        }
+
+    def _compose_container_ids(self, service: str) -> list[str]:
+        result = self._run_compose(
+            self.compose_file,
+            ["ps", "-q", service],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            return []
+        return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
 
     def _run_compose(
         self,
@@ -156,7 +194,11 @@ class DockerComposeBackend:
         return False
 
     def _pending_redis_services(self) -> list[str]:
-        return [service for service in COMPOSE_REDIS_SERVICES if not self._redis_service_ready(service)]
+        return [
+            service
+            for service in COMPOSE_REDIS_SERVICES
+            if service in self.available_services and not self._redis_service_ready(service)
+        ]
 
     def _redis_service_ready(self, service: str) -> bool:
         result = self._run_compose(
@@ -176,8 +218,12 @@ class DockerComposeBackend:
         return result.returncode == 0 and "PONG" in (result.stdout or "")
 
     def _pending_sentinel_masters(self) -> list[str]:
+        sentinel_services = [service for service in COMPOSE_SENTINEL_SERVICES if service in self.available_services]
+        if not sentinel_services:
+            return []
+
         pending: list[str] = []
-        for sentinel_service in COMPOSE_SENTINEL_SERVICES:
+        for sentinel_service in sentinel_services:
             for master_name in COMPOSE_SENTINEL_MASTERS:
                 if not self._sentinel_master_ready(sentinel_service, master_name):
                     pending.append(f"{sentinel_service}:{master_name}")

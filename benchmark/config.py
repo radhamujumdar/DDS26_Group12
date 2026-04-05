@@ -42,6 +42,7 @@ class BenchmarkPaths:
     stress_test_dir: Path
     consistency_test_dir: Path
     results_dir: Path
+    default_compose_file: Path
     compose_file: Path
     k8s_dir: Path
 
@@ -147,9 +148,14 @@ def resolve_benchmark_dir(script_dir: Path) -> Path:
     return candidates[0]
 
 
-def resolve_paths(script_dir: str | Path | None = None) -> BenchmarkPaths:
+def resolve_paths(
+    script_dir: str | Path | None = None,
+    compose_file: str | Path | None = None,
+) -> BenchmarkPaths:
     resolved_script_dir = Path(script_dir or Path(__file__).resolve().parent.parent).resolve()
     benchmark_dir = resolve_benchmark_dir(resolved_script_dir)
+    default_compose_file = resolved_script_dir / "docker-compose.yml"
+    selected_compose_file = Path(compose_file).resolve() if compose_file else default_compose_file
     return BenchmarkPaths(
         script_dir=resolved_script_dir,
         project_dir=resolved_script_dir,
@@ -157,7 +163,8 @@ def resolve_paths(script_dir: str | Path | None = None) -> BenchmarkPaths:
         stress_test_dir=benchmark_dir / "stress-test",
         consistency_test_dir=benchmark_dir / "consistency-test",
         results_dir=resolved_script_dir / "benchmark-results",
-        compose_file=resolved_script_dir / "docker-compose.yml",
+        default_compose_file=default_compose_file,
+        compose_file=selected_compose_file,
         k8s_dir=resolved_script_dir / "k8s",
     )
 
@@ -228,6 +235,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Delete previous benchmark results before starting",
     )
+    parser.add_argument(
+        "--compose-file",
+        default=os.environ.get("BENCHMARK_COMPOSE_FILE"),
+        help="Optional Docker Compose file to benchmark instead of docker-compose.yml",
+    )
     return parser
 
 
@@ -260,7 +272,7 @@ def parse_cli(argv: Sequence[str] | None = None, script_dir: str | Path | None =
         startup_timeout=args.startup_timeout,
         clean=args.clean,
         sizing=read_deployment_sizing(os.environ),
-        paths=resolve_paths(script_dir),
+        paths=resolve_paths(script_dir, compose_file=args.compose_file),
     )
 
 

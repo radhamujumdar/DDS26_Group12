@@ -119,16 +119,29 @@ These defaults demonstrate container and pod failover behavior on one machine, b
 
 ### Compose profiles
 
-For local Docker Compose runs we provide three profile env files plus three launcher scripts:
+For course-staff Docker Compose runs we provide three explicit profile files plus three launcher scripts:
 
-* `.env.small` + `compose-up-small.sh`
-* `.env.medium` + `compose-up-medium.sh`
-* `.env.large` + `compose-up-large.sh`
+* `docker-compose.small.yml`
+* `docker-compose.medium.yml`
+* `docker-compose.large.yml`
 
-The env files inject the service settings that are already parameterized in `docker-compose.yml`.
-The launcher scripts also pass the required `--scale` flags for the application services, because plain
-`docker compose up` does not consume the benchmark-only `ORDER_REPLICAS` / `PAYMENT_REPLICAS` /
-`STOCK_REPLICAS` values by itself.
+The matching `.env.small`, `.env.medium`, and `.env.large` files document the tuned runtime knobs
+(Gunicorn workers, gateway worker count, Saga MQ partitioning, and shard host lists) used by each profile.
+
+Profile intent:
+
+* `small`: one instance of each logical API, database, and queue; no Sentinel quorum or Redis replicas/shards.
+* `medium`: approximately `50` CPUs total.
+* `large`: approximately `90` CPUs total.
+
+CPU budgeting:
+
+* `medium`: `order=21`, `payment=10`, `stock=10`, `gateway=3`, `infra=6`, total `50`.
+* `large`: `order=32`, `payment=18`, `stock=18`, `gateway=3`, `infra=19`, total `90`.
+
+We bias CPU toward `order-service` because every checkout enters through order first, while `stock-service`
+and `payment-service` also scale out with Redis sharding. `order-db` remains a single master and is still
+the main architectural bottleneck once the order tier gets very hot.
 
 Examples:
 
@@ -149,12 +162,20 @@ TX_MODE=saga sh compose-up-large.sh
 Equivalent raw Docker Compose commands:
 
 ```bash
-docker compose --env-file .env.small up -d --build --remove-orphans \
-  --scale order-service=1 --scale payment-service=1 --scale stock-service=1
+docker compose -f docker-compose.small.yml up -d --build --remove-orphans
 
-docker compose --env-file .env.medium up -d --build --remove-orphans \
-  --scale order-service=4 --scale payment-service=3 --scale stock-service=3
+docker compose -f docker-compose.medium.yml up -d --build --remove-orphans
 
-docker compose --env-file .env.large up -d --build --remove-orphans \
-  --scale order-service=8 --scale payment-service=6 --scale stock-service=6
+docker compose -f docker-compose.large.yml up -d --build --remove-orphans
 ```
+
+Scaling notes:
+
+* External traffic is routed through nginx, which resolves all currently running `order-service`, `payment-service`,
+  and `stock-service` container IPs at startup and round-robins across them.
+* Internal service-to-service traffic uses the stable service URLs directly (`http://order-service:5000`,
+  `http://payment-service:5000`, `http://stock-service:5000`), which works for static Compose replica sets and
+  maps cleanly to Kubernetes Services later.
+* Saga workers scale horizontally because payment and stock consume Redis Streams through consumer groups.
+* Recovery loops are safe under replication because they use Redis lease keys, so only one worker is active per
+  recovery role at a time.

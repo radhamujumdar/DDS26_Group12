@@ -1,0 +1,143 @@
+name: dds-group12-medium
+
+services:
+  gateway:
+    extends:
+      file: ./docker-compose.yml
+      service: gateway
+    cpus: 3.0
+    environment:
+      - GATEWAY_WORKER_PROCESSES=3
+      - GATEWAY_WORKER_CONNECTIONS=16384
+      - GATEWAY_UPSTREAM_KEEPALIVE=128
+
+  order-service:
+    extends:
+      file: ./docker-compose.yml
+      service: order-service
+    scale: 7
+    cpus: 3.0
+    environment:
+      - ORDER_GUNICORN_WORKERS=3
+      - SAGA_MQ_STREAM_PARTITIONS=24
+      - SAGA_MQ_RESPONSE_TIMEOUT_MS=4000
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=200000
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=200000
+      - SAGA_MQ_POLL_INTERVAL_SECONDS=0.03
+      - SAGA_MQ_DISPATCH_BLOCK_MS=250
+
+  order-db:
+    extends:
+      file: ./docker-compose.yml
+      service: order-db
+    cpus: 1.0
+
+  order-db-replica:
+    extends:
+      file: ./docker-compose.yml
+      service: order-db-replica
+    cpus: 0.5
+
+  stock-service:
+    extends:
+      file: ./docker-compose.yml
+      service: stock-service
+    scale: 5
+    cpus: 2.0
+    environment:
+      - STOCK_GUNICORN_WORKERS=2
+      - SAGA_MQ_STREAM_PARTITIONS=24
+      - SAGA_MQ_BLOCK_MS=250
+      - SAGA_MQ_BATCH_SIZE=32
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=200000
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=200000
+      - REDIS_SHARD_HOSTS=stock-db:6379,stock-db-shard-1:6379
+
+  stock-db:
+    extends:
+      file: ./docker-compose.yml
+      service: stock-db
+    cpus: 0.5
+
+  stock-db-shard-1:
+    extends:
+      file: ./docker-compose.yml
+      service: stock-db-shard-1
+    cpus: 0.5
+
+  stock-db-replica:
+    extends:
+      file: ./docker-compose.yml
+      service: stock-db-replica
+    cpus: 0.25
+
+  payment-service:
+    extends:
+      file: ./docker-compose.yml
+      service: payment-service
+    scale: 5
+    cpus: 2.0
+    environment:
+      - PAYMENT_GUNICORN_WORKERS=2
+      - SAGA_MQ_STREAM_PARTITIONS=24
+      - SAGA_MQ_BLOCK_MS=250
+      - SAGA_MQ_BATCH_SIZE=32
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=200000
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=200000
+      - REDIS_SHARD_HOSTS=payment-db:6379,payment-db-shard-1:6379
+
+  payment-db:
+    extends:
+      file: ./docker-compose.yml
+      service: payment-db
+    cpus: 0.5
+
+  payment-db-shard-1:
+    extends:
+      file: ./docker-compose.yml
+      service: payment-db-shard-1
+    cpus: 0.5
+
+  payment-db-replica:
+    extends:
+      file: ./docker-compose.yml
+      service: payment-db-replica
+    cpus: 0.25
+
+  saga-broker:
+    extends:
+      file: ./docker-compose.yml
+      service: saga-broker
+    cpus: 0.5
+
+  saga-broker-replica:
+    extends:
+      file: ./docker-compose.yml
+      service: saga-broker-replica
+    cpus: 0.25
+
+  sentinel-1:
+    extends:
+      file: ./docker-compose.yml
+      service: sentinel-1
+    cpus: 0.25
+
+  sentinel-2:
+    extends:
+      file: ./docker-compose.yml
+      service: sentinel-2
+    cpus: 0.25
+
+  sentinel-3:
+    extends:
+      file: ./docker-compose.yml
+      service: sentinel-3
+    cpus: 0.25
+
+  watchdog:
+    extends:
+      file: ./docker-compose.yml
+      service: watchdog
+    cpus: 0.5
+    environment:
+      - WATCHDOG_SERVICES=gateway,order-service,order-db,order-db-replica,stock-service,stock-db,stock-db-shard-1,stock-db-replica,payment-service,payment-db,payment-db-shard-1,payment-db-replica,saga-broker,saga-broker-replica,sentinel-1,sentinel-2,sentinel-3

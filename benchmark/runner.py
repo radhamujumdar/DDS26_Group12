@@ -40,6 +40,7 @@ def build_metadata_payload(
         "mode": run_spec.mode,
         "backend": run_spec.backend,
         "scenario": run_spec.scenario,
+        "compose_file": str(config.paths.compose_file),
         "users": run_spec.users,
         "run_number": run_spec.run_number,
         "timestamp": run_spec.timestamp,

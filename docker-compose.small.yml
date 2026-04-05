@@ -1,0 +1,159 @@
+name: dds-group12-small
+
+services:
+  gateway:
+    extends:
+      file: ./docker-compose.yml
+      service: gateway
+    cpus: 1.0
+    environment:
+      - GATEWAY_WORKER_PROCESSES=1
+      - GATEWAY_WORKER_CONNECTIONS=8192
+      - GATEWAY_UPSTREAM_KEEPALIVE=32
+
+  order-service:
+    build: ./order
+    image: order:latest
+    restart: always
+    scale: 1
+    cpus: 2.0
+    depends_on:
+      - order-db
+      - saga-broker
+    env_file:
+      - env/order_redis.env
+    environment:
+      - STOCK_SERVICE_URL=${STOCK_SERVICE_URL:-http://stock-service:5000}
+      - PAYMENT_SERVICE_URL=${PAYMENT_SERVICE_URL:-http://payment-service:5000}
+      - TX_MODE=${TX_MODE:-2pc}
+      - ORDER_GUNICORN_WORKERS=2
+      - ENABLE_ORDER_DISPATCHER=${ENABLE_ORDER_DISPATCHER:-true}
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_STREAM_PARTITIONS=4
+      - SAGA_MQ_RESPONSE_TIMEOUT_MS=6000
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=100000
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=100000
+      - SAGA_MQ_PENDING_TTL_SECONDS=3600
+      - SAGA_MQ_PENDING_STALE_AFTER_MS=3000
+      - SAGA_MQ_POLL_INTERVAL_SECONDS=0.05
+      - SAGA_MQ_DISPATCH_BLOCK_MS=1000
+      - SAGA_MQ_DISPATCH_LEASE_TTL_SECONDS=10
+      - SAGA_MQ_DISPATCH_RENEW_INTERVAL_SECONDS=2.0
+      - REDIS_SENTINEL_HOSTS=
+      - REDIS_MASTER_NAME=
+      - SAGA_MQ_SENTINEL_HOSTS=
+      - SAGA_MQ_MASTER_NAME=
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
+      -w $${ORDER_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
+
+  order-db:
+    extends:
+      file: ./docker-compose.yml
+      service: order-db
+    cpus: 0.5
+
+  stock-service:
+    build: ./stock
+    image: stock:latest
+    restart: always
+    scale: 1
+    cpus: 1.0
+    depends_on:
+      - stock-db
+      - saga-broker
+    env_file:
+      - env/stock_redis.env
+    environment:
+      - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
+      - STOCK_GUNICORN_WORKERS=1
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
+      - ENABLE_SAGA_WORKER=${STOCK_ENABLE_SAGA_WORKER:-true}
+      - ENABLE_RECOVERY_LOOP=${STOCK_ENABLE_RECOVERY_LOOP:-true}
+      - RECOVERY_LEASE_KEY=${STOCK_RECOVERY_LEASE_KEY:-stock:recovery:lease}
+      - RECOVERY_LEASE_TTL_SECONDS=${STOCK_RECOVERY_LEASE_TTL_SECONDS:-10}
+      - SAGA_MQ_STREAM_PARTITIONS=4
+      - SAGA_MQ_CONSUMER_GROUP=${STOCK_SAGA_MQ_CONSUMER_GROUP:-saga-stock-workers}
+      - SAGA_MQ_BLOCK_MS=1000
+      - SAGA_MQ_BATCH_SIZE=16
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=100000
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=100000
+      - REDIS_SENTINEL_HOSTS=
+      - REDIS_MASTER_NAME=
+      - SAGA_MQ_SENTINEL_HOSTS=
+      - SAGA_MQ_MASTER_NAME=
+      - REDIS_SHARD_HOSTS=
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
+      -w $${STOCK_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
+
+  stock-db:
+    extends:
+      file: ./docker-compose.yml
+      service: stock-db
+    cpus: 0.5
+
+  payment-service:
+    build: ./payment
+    image: user:latest
+    restart: always
+    scale: 1
+    cpus: 1.0
+    depends_on:
+      - payment-db
+      - saga-broker
+    env_file:
+      - env/payment_redis.env
+    environment:
+      - ORDER_SERVICE_URL=${ORDER_SERVICE_URL:-http://order-service:5000}
+      - PAYMENT_GUNICORN_WORKERS=1
+      - SAGA_MQ_REDIS_HOST=saga-broker
+      - SAGA_MQ_REDIS_PORT=6379
+      - SAGA_MQ_REDIS_PASSWORD=redis
+      - SAGA_MQ_REDIS_DB=0
+      - SAGA_MQ_ENABLED=${SAGA_MQ_ENABLED:-true}
+      - ENABLE_SAGA_WORKER=${PAYMENT_ENABLE_SAGA_WORKER:-true}
+      - ENABLE_RECOVERY_LOOP=${PAYMENT_ENABLE_RECOVERY_LOOP:-true}
+      - RECOVERY_LEASE_KEY=${PAYMENT_RECOVERY_LEASE_KEY:-payment:recovery:lease}
+      - RECOVERY_LEASE_TTL_SECONDS=${PAYMENT_RECOVERY_LEASE_TTL_SECONDS:-10}
+      - SAGA_MQ_STREAM_PARTITIONS=4
+      - SAGA_MQ_CONSUMER_GROUP=${PAYMENT_SAGA_MQ_CONSUMER_GROUP:-saga-payment-workers}
+      - SAGA_MQ_BLOCK_MS=1000
+      - SAGA_MQ_BATCH_SIZE=16
+      - SAGA_MQ_COMMAND_STREAM_MAXLEN=100000
+      - SAGA_MQ_RESULT_STREAM_MAXLEN=100000
+      - REDIS_SENTINEL_HOSTS=
+      - REDIS_MASTER_NAME=
+      - SAGA_MQ_SENTINEL_HOSTS=
+      - SAGA_MQ_MASTER_NAME=
+      - REDIS_SHARD_HOSTS=
+    command: >
+      sh -c "gunicorn -k uvicorn.workers.UvicornWorker -b 0.0.0.0:5000
+      -w $${PAYMENT_GUNICORN_WORKERS} --timeout 30 --log-level=info app:app"
+
+  payment-db:
+    extends:
+      file: ./docker-compose.yml
+      service: payment-db
+    cpus: 0.5
+
+  saga-broker:
+    extends:
+      file: ./docker-compose.yml
+      service: saga-broker
+    cpus: 0.5
+
+  watchdog:
+    extends:
+      file: ./docker-compose.yml
+      service: watchdog
+    cpus: 0.25
+    environment:
+      - WATCHDOG_SERVICES=gateway,order-service,order-db,stock-service,stock-db,payment-service,payment-db,saga-broker
