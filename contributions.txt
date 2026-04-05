@@ -1,4 +1,4 @@
 Daniel: name, surname, student id, TUD email and your contributions
 Radha: Radha, Mujumdar, 6430546, r.n.mujumdar@student.tudelft.nl, worked on the participant logic for stock component in 2pc and sagas, implemented message queues in 2pc similar to sagas, but it was observed that it did not help reduce latency so was not included in the final version of 2pc.
-Anik: Aník, van Deursen, 6541046, a.deursen@student.tudelft.nl, worked on payment for 2pc and saga, and worked on part of the orchestrator (making it work with the project). 
+Aník: Aník, van Deursen, 6541046, a.deursen@student.tudelft.nl, worked on payment for 2pc and saga, and worked on part of the orchestrator (making it work with the project). 
 Elena: Elena, Mihalache, 5244242, e.mihalache@student.tudelft.nl, did some shared infrastructure, some benchmarking scripts, some performance improvement (setup tweaking), sharding (Redis Cluster not used in the end, only application level sharding), Kubernetes/Minikube setup (not used in the final benchmarking), mostly 2PC + SAGAs (no Orchestrator)
